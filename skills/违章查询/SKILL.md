@@ -119,8 +119,9 @@ description: 当用户提到查询xxx公司/xxx车的违章、违法、违规、
 | `db-insert-company`  | 增量写入/更新公司记录              | 通过 Python 脚本（stdin JSON 或 CLI 参数）       |
 | `db-insert-vehicle`  | 增量写入/更新车辆记录              | 通过 Python 脚本（stdin JSON 或 CLI 参数）       |
 | `db-insert-violation`| 增量写入/更新违章记录（按自然键匹配）    | 通过 Python 脚本（stdin JSON）                |
-| `profile-lookup`    | 查公司→Profile 映射，返回 profile 信息 | 通过 Python 脚本                              |
-| `profile-register`  | 注册/更新公司→Profile 映射（login 后写入） | 通过 Python 脚本                              |
+| `profile-lookup`    | 查公司→Profile 映射，返回 profile 信息+登录态 | 通过 Python 脚本                              |
+| `profile-register`  | 注册/更新公司→Profile 映射（login 后写入，标记 is_logged_in=1） | 通过 Python 脚本                              |
+| `profile-logout`    | 标记公司已登出（is_logged_in=0），保活脚本据此停止 | 通过 Python 脚本                              |
 | `pinchtab-path`      | 输出 pinchtab 完整路径        | Bash: `python <helper> pinchtab-path`     |
 | `lark-cli-path`      | 输出 lark-cli 完整路径        | Bash: `python <helper> lark-cli-path`     |
 | `get-login-url`      | 输出单位用户登录直连 URL          | Bash: `python <helper> get-login-url`     |
@@ -322,7 +323,9 @@ PinchTab daemon
    - `new-tab` 创建本会话标签页
    - 导航到对应 12123 平台
    - 验证登录仍有效 → 有效则直接进入查询流程，跳过扫码登录
-   - 登录过期 → 重新扫码 → 更新 `profile-register` 的 `last_login`
+   - `is_logged_in=0` → 登录态已失效，走重新登录流程
+   - `is_logged_in=1` 但登录过期 → 重新扫码 → `profile-register` 更新 `last_login`
+   - `is_logged_in=1` 且有效 → 直接进入查询流程，跳过扫码登录
 3. **未命中**（`found: false`）：
    - 走完整登录流程（第三步扫码登录）
    - 登录成功后调用 `profile-register --company <公司名> --profile-name <profile> --platform-url <url>` 写入映射
@@ -880,11 +883,18 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 
 ## 防退出保活
 
-**生命周期：** 登录成功后立即启动，查询完成后保持运行（不自动停止）。
+**生命周期：** 登录成功后立即启动保活（每 18 分钟 reload + dismiss 弹窗），查询正常完成后保活继续运行不停止。
+
+**登录态追踪：**
+- 登录成功 → `profile-register` 写入 `is_logged_in=1`
+- 用户退出登录 / 保活检测到会话过期 → `profile-logout` 写入 `is_logged_in=0`
+- 保活脚本每次 reload 前先 `profile-lookup` 检查 `is_logged_in`，若为 `false` 则停止保活
+- 新查询进程启动时，若 `is_logged_in=0` 则走完整登录流程
 
 每 18 分钟执行：
-1. `pinchtab reload` 刷新页面
-2. 自动 dismiss 弹窗（"本人已知晓"等），确保表格可访问
+1. `profile-lookup --company <公司名>` 检查 `is_logged_in` 状态，若为 `false` 则退出
+2. `pinchtab reload` 刷新页面
+3. 自动 dismiss 弹窗（"本人已知晓"等），确保表格可访问
 3. `pinchtab snap` 检测登录态：找到"退出"按钮 → 正常；否则 → 告警
 4. 若检测到登录页（"单位用户登录"），发送飞书告警通知
 
