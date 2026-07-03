@@ -209,9 +209,11 @@ CREATE TABLE IF NOT EXISTS profiles (
     platform_url TEXT NOT NULL,
     instance_port INTEGER,
     last_login TEXT,
+    is_logged_in INTEGER DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now','localtime'))
 );
 CREATE INDEX IF NOT EXISTS idx_profiles_company ON profiles(company_name);
+ALTER TABLE profiles ADD COLUMN is_logged_in INTEGER DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_violations_query_date ON violations(query_date);
 """
 
@@ -253,7 +255,18 @@ def _init_db():
     db_path = _get_db_path()
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript(DB_SCHEMA)
+    # Split schema to handle ALTER TABLE migration for existing databases
+    for stmt in DB_SCHEMA.split(";"):
+        stmt = stmt.strip()
+        if not stmt:
+            continue
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError as e:
+            if "duplicate column" in str(e) or "already exists" in str(e):
+                pass  # migration already applied
+            else:
+                raise
     conn.commit()
     conn.close()
     return db_path
@@ -1117,7 +1130,7 @@ def cmd_db_insert_violation():
 def cmd_profile_lookup():
     """Look up a company's profile mapping.
     Args: --company "公司名"
-    Returns: JSON {found: true, profile_name, profile_id, platform_url, instance_port, last_login}
+    Returns: JSON {found: true, profile_name, profile_id, platform_url, instance_port, last_login, is_logged_in}
              or {found: false} if not registered.
     """
     p = {"company": ""}
@@ -1133,7 +1146,7 @@ def cmd_profile_lookup():
     db_path = _get_db_path()
     conn = sqlite3.connect(db_path)
     cur = conn.execute(
-        "SELECT company_name, profile_name, profile_id, platform_url, instance_port, last_login FROM profiles WHERE company_name = ?",
+        "SELECT company_name, profile_name, profile_id, platform_url, instance_port, last_login, is_logged_in FROM profiles WHERE company_name = ?",
         (p["company"],))
     row = cur.fetchone()
     conn.close()
@@ -1146,7 +1159,8 @@ def cmd_profile_lookup():
             "profile_id": row[2],
             "platform_url": row[3],
             "instance_port": row[4],
-            "last_login": row[5]
+            "last_login": row[5],
+            "is_logged_in": bool(row[6])
         }, ensure_ascii=False))
     else:
         print(json.dumps({"found": False}))
@@ -1182,18 +1196,52 @@ def cmd_profile_register():
     conn = sqlite3.connect(db_path)
     now = time.strftime('%Y-%m-%d %H:%M:%S')
     conn.execute(
-        """INSERT INTO profiles (company_name, profile_name, profile_id, platform_url, instance_port, last_login)
-           VALUES (?, ?, ?, ?, ?, ?)
+        """INSERT INTO profiles (company_name, profile_name, profile_id, platform_url, instance_port, last_login, is_logged_in)
+           VALUES (?, ?, ?, ?, ?, ?, 1)
            ON CONFLICT(company_name) DO UPDATE SET
            profile_name=excluded.profile_name, profile_id=excluded.profile_id,
            platform_url=excluded.platform_url, instance_port=excluded.instance_port,
-           last_login=excluded.last_login""",
+           last_login=excluded.last_login, is_logged_in=1""",
         (p["company"], p["profile_name"], p["profile_id"],
          p["platform_url"], p["instance_port"], now))
     conn.commit()
     conn.close()
     print(json.dumps({"ok": True, "company": p["company"], "profile_name": p["profile_name"]},
                      ensure_ascii=False))
+
+# ============================================================
+# Subcommand: profile-logout
+# ============================================================
+
+def cmd_profile_logout():
+    """Mark a company profile as logged out and stop keep-alive.
+    Args: --company "公司名"
+    Called when: user explicitly logs out, keep-alive detects session expired,
+    or get-login-type detects page returned to login screen.
+    """
+    p = {"company": ""}
+    args = sys.argv[2:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--company" and i + 1 < len(args):
+            p["company"] = args[i + 1]; i += 2
+        else:
+            i += 1
+
+    _init_db()
+    db_path = _get_db_path()
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "UPDATE profiles SET is_logged_in = 0 WHERE company_name = ?",
+        (p["company"],))
+    updated = conn.total_changes
+    conn.commit()
+    conn.close()
+    print(json.dumps({
+        "ok": True,
+        "company": p["company"],
+        "logged_out": updated > 0
+    }, ensure_ascii=False))
 
 # ============================================================
 # Subcommand: search-user
@@ -3604,6 +3652,7 @@ SUBCOMMANDS = {
     "db-insert-violation": cmd_db_insert_violation,
     "profile-lookup": cmd_profile_lookup,
     "profile-register": cmd_profile_register,
+    "profile-logout": cmd_profile_logout,
     "search-user": cmd_search_user,
     "search-chat": cmd_search_chat,
     "batch-get-id": cmd_batch_get_id,
