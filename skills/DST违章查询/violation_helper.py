@@ -326,14 +326,36 @@ RESPONSE_CODE_MAP = {
 
 LOGIN_KEYWORDS = ["已登录", "登录成功", "好了", "ok", "OK", "好的"]
 
-# Browser login indicators — keyword matches from pinchtab text/snap output
-# that indicate the 12123 page has been logged in successfully.
-# After scanning QR, 12123 lands on a company selection list page.
-LOGIN_INDICATORS = [
-    "公司列表", "公司名称", "请选择", "选择单位",
-    "租赁车辆", "机动车", "违法", "业务办理",
-    "退出", "首页", "确定",
+# ── Unified login state detection constants ────────────────────
+# Two-tier approach:
+#   Tier 1 (URL+DOM): initial "are we logged in?" check — reliable, no false positives
+#   Tier 2 (keyword): QR scan poll detection — "did the user scan?" transition check
+#
+# Post-login business indicators (Tier 2, also used as confirmation in Tier 1).
+# Ordered by reliability: "退出" is the strongest signal.
+POST_LOGIN_KEYWORDS = [
+    "退出",
+    "公司列表", "公司名称", "选择单位",
+    "车辆管理", "租赁车辆",
+    "业务办理", "违法查询",
+    "机动车", "违法", "首页",
 ]
+
+# Login page indicators — signals that we're NOT logged in (or session expired).
+# Note: "单位用户登录"/"个人用户登录" may appear on logged-in pages as
+# account-switch links in nav bars. They are only treated as login-page signals
+# when NO post-login indicators are present.
+LOGIN_PAGE_KEYWORDS = [
+    "单位用户登录", "个人用户登录", "扫码登录",
+    "请使用交管12123", "请打开交管12123",
+]
+
+# Legacy alias for backward compatibility with poll-login
+LOGIN_INDICATORS = POST_LOGIN_KEYWORDS
+
+# URL pattern for login page detection (Tier 1)
+LOGIN_PAGE_URL_PATTERN = "gab.122.gov.cn/m/login"
+
 QR_EXPIRED_KEYWORDS = ["过期", "失效", "重新"]
 
 # ============================================================
@@ -1861,7 +1883,7 @@ def cmd_open_vehicle():
             info = {"ok": False, "error": result.stdout.strip()}
 
         if info.get("ok"):
-            time.sleep(random.uniform(3, 8))
+            time.sleep(random.uniform(2, 5))
             # Verify navigation to detail page
             check = _run(["pinchtab", "eval",
                 "(function(){return window.location.href.indexOf('vehdetail')!==-1?'detail':'other'})()"])
@@ -2147,7 +2169,7 @@ def cmd_collect_violations():
                 time.sleep(random.uniform(1, 2))
 
                 if idx < len(violations) - 1:
-                    time.sleep(random.uniform(3, 8))
+                    time.sleep(random.uniform(2, 5))
 
         else:
             # Snap for refs
@@ -2243,7 +2265,7 @@ def cmd_collect_violations():
                     })
 
                 if idx < len(violations) - 1:
-                    time.sleep(random.uniform(3, 8))
+                    time.sleep(random.uniform(2, 5))
 
         # Check if more detail pages exist - skip if no unprocessed on this page
         has_unprocessed = any(v.get('unprocessed') or v.get('status') == '未处理' for v in violations)
@@ -2252,7 +2274,7 @@ def cmd_collect_violations():
             break
 
         # Smart pagination: navigate to the next detail page
-        time.sleep(random.uniform(3, 8))
+        time.sleep(random.uniform(2, 5))
         ok = _click_detail_page(str(detail_page + 1))  # 1-based page number
         if not ok:
             break
@@ -2934,32 +2956,45 @@ def _get_pagination_state():
     """Extract current pagination state from the page: current, min, max pages."""
     js = """
 (function() {
-  var links = document.querySelectorAll('a');
+  // Find pagination container
+  var pager = document.querySelector('.pagination');
+  if (!pager) return JSON.stringify({error: 'no pagination found'});
+
+  // Get current page from li.active > a
+  var current = 1;
+  var activeLink = pager.querySelector('li.active a');
+  if (activeLink) {
+    var ct = activeLink.textContent.trim();
+    if (/^\\d+$/.test(ct)) current = parseInt(ct);
+  }
+
+  // Get visible page numbers from pagination links (exclude 首页/上一页/下一页/末页)
+  var pageLinks = pager.querySelectorAll('a[data-page]');
   var pages = [];
-  for (var i = 0; i < links.length; i++) {
-    var t = links[i].textContent.trim();
-    if (/^\\d+$/.test(t)) {
+  var skipNames = { '首页':1, '上一页':1, '下一页':1, '末页':1 };
+  for (var i = 0; i < pageLinks.length; i++) {
+    var t = pageLinks[i].textContent.trim();
+    if (/^\\d+$/.test(t) && !skipNames[t]) {
       pages.push(parseInt(t));
     }
   }
-  if (pages.length === 0) return JSON.stringify({error: 'no page numbers found'});
   pages.sort(function(a,b) { return a - b; });
 
-  // Find current page (non-link page number, usually highlighted)
-  var current = pages[0];
-  var allElements = document.querySelectorAll('a, span, li, strong, b, em');
-  for (var j = 0; j < allElements.length; j++) {
-    var t = allElements[j].textContent.trim();
-    if (/^\\d+$/.test(t) && allElements[j].tagName !== 'A') {
-      current = parseInt(t);
-      break;
+  // Get total pages from "末页" link's data-page attribute
+  var total = pages.length > 0 ? pages[pages.length - 1] : 1;
+  var allAnchors = pager.querySelectorAll('a');
+  for (var k = 0; k < allAnchors.length; k++) {
+    if (allAnchors[k].textContent.trim() === '末页') {
+      var dp = allAnchors[k].getAttribute('data-page');
+      if (dp) total = parseInt(dp);
     }
   }
 
   return JSON.stringify({
     current: current,
-    min_page: pages[0],
-    max_page: pages[pages.length - 1],
+    min_page: pages.length > 0 ? pages[0] : 1,
+    max_page: pages.length > 0 ? pages[pages.length - 1] : 1,
+    total_pages: total,
     visible_pages: pages
   });
 })()
@@ -3265,12 +3300,12 @@ def cmd_get_page_vehicles():
     # Get pagination
     page_state = _get_pagination_state()
     current_page = page_state.get("current", 1) if page_state else 1
-    max_page = page_state.get("max_page", 1) if page_state else 1
+    total_pages = page_state.get("total_pages", page_state.get("max_page", 1)) if page_state else 1
 
     result = {
         "vehicles": vehicles,
         "page": current_page,
-        "total_pages": max_page
+        "total_pages": total_pages
     }
     print(json.dumps(result, ensure_ascii=False))
 
@@ -3396,11 +3431,10 @@ def cmd_get_login_type():
 
     result = {"type": "none", "details": ""}
 
-    # Check for unit user indicators
-    unit_indicators = ["公司列表", "公司名称", "单位信息", "租赁车辆", "企业用户",
-                       "unit", "company", "enterprise"]
-    personal_indicators = ["个人用户", "个人中心", "我的车辆", "驾驶人",
-                           "personal", "individual"]
+    # Unified unit indicators (aligned with POST_LOGIN_KEYWORDS)
+    unit_indicators = ["公司列表", "公司名称", "单位信息", "租赁车辆", "车辆管理",
+                       "企业用户"]
+    personal_indicators = ["个人用户", "个人中心", "我的车辆", "驾驶人"]
 
     for kw in unit_indicators:
         if kw in text or kw in snap:
@@ -3415,10 +3449,9 @@ def cmd_get_login_type():
                 result["details"] = f"found personal indicator: {kw}"
                 break
 
-    # Check if any text at all (login state detection)
+    # Check if any text at all (login state detection) — use unified set
     if result["type"] == "none":
-        login_kw = ["首页", "业务办理", "违法", "机动车", "home", "logout", "退出"]
-        for kw in login_kw:
+        for kw in POST_LOGIN_KEYWORDS:
             if kw in text or kw in snap:
                 result["type"] = "unknown"
                 result["details"] = "logged in but cannot determine type"
@@ -3534,21 +3567,147 @@ def cmd_dismiss_popup():
 
 
 # ============================================================
-# Subcommand: check-login-valid
+# Subcommand: check-login-state (unified)
+# ============================================================
+
+def cmd_check_login_state():
+    """Unified login state detection combining URL+DOM (Tier 1) with
+    keyword matching (Tier 2).
+
+    Tier 1 (URL+DOM) — initial "are we logged in?" check:
+      - Gets current URL via JS
+      - If on gab.122.gov.cn/m/login → directly returns "login_page"
+      - If on xx.122.gov.cn platform → checks DOM for logged-in indicators
+      - URL+DOM is the authoritative method for initial state detection
+
+    Tier 2 (keyword fallback) — QR scan poll detection:
+      - Uses text+snap keyword matching
+      - "退出"/"车辆管理"/"公司列表" etc. = logged in
+      - "单位用户登录"/"个人用户登录" etc. = login page (only if NO logged-in keywords)
+
+    Options:
+      --mode url        URL+DOM only (default, for initial state check)
+      --mode keyword    Keyword matching only (for QR poll detection)
+      --mode auto       URL+DOM first, fallback to keyword (most thorough)
+
+    Returns JSON: {
+      state: "logged_in" | "login_page" | "rate_limited" | "unknown",
+      method: "url" | "keyword" | "url+keyword",
+      url: str | null,
+      details: str,
+      indicators: [str]  // which indicators matched
+    }
+    Exit code: 0=logged_in, 1=login_page/expired, 2=rate_limited, 3=unknown
+    """
+    mode = "auto"
+    args = sys.argv[2:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--mode" and i + 1 < len(args):
+            mode = args[i + 1]; i += 2
+        else:
+            i += 1
+
+    result = {
+        "state": "unknown",
+        "method": mode,
+        "url": None,
+        "details": "",
+        "indicators": []
+    }
+
+    # ── Tier 1: URL+DOM ──
+    if mode in ("url", "auto"):
+        # Get current URL
+        url_js = "(function(){return window.location.href;})()"
+        url_result = _run(["pinchtab", "eval", url_js])
+        current_url = url_result.stdout.strip()
+        result["url"] = current_url
+
+        if LOGIN_PAGE_URL_PATTERN in current_url:
+            result["state"] = "login_page"
+            result["method"] = "url"
+            result["details"] = f"on login page: {current_url[:80]}"
+            result["indicators"] = ["url:gab.122.gov.cn/m/login"]
+            print(json.dumps(result, ensure_ascii=False))
+            sys.exit(1)
+
+        if "122.gov.cn" in current_url:
+            result["method"] = "url"
+            result["details"] = f"on platform: {current_url[:80]}"
+
+    # ── Tier 2: keyword matching ──
+    if mode == "keyword" or (mode == "auto" and result["state"] == "unknown"):
+        text = _run(["pinchtab", "text"]).stdout
+        snap = _run(["pinchtab", "snap"]).stdout
+        combined = text + " " + snap
+
+        # Check rate-limit first (highest priority)
+        rate_hits = [kw for kw in RATE_LIMIT_KEYWORDS if kw in combined]
+        if rate_hits:
+            result["state"] = "rate_limited"
+            result["method"] = "keyword" if mode == "keyword" else "url+keyword"
+            result["details"] = f"rate-limit keywords: {rate_hits}"
+            result["indicators"] = rate_hits
+            print(json.dumps(result, ensure_ascii=False))
+            sys.exit(2)
+
+        # Check for logged-in indicators
+        logged_in_hits = [kw for kw in POST_LOGIN_KEYWORDS if kw in combined]
+        login_page_hits = [kw for kw in LOGIN_PAGE_KEYWORDS if kw in combined]
+
+        if logged_in_hits:
+            result["state"] = "logged_in"
+            result["method"] = "keyword" if mode == "keyword" else "url+keyword"
+            result["details"] = f"logged-in indicators: {logged_in_hits}"
+            result["indicators"] = logged_in_hits
+            print(json.dumps(result, ensure_ascii=False))
+            sys.exit(0)
+
+        # Only treat login-page keywords as "login_page" if NO logged-in
+        # indicators are present (nav bars may show "单位用户登录" as
+        # account-switch links even when logged in)
+        if login_page_hits and not logged_in_hits:
+            result["state"] = "login_page"
+            result["method"] = "keyword" if mode == "keyword" else "url+keyword"
+            result["details"] = f"login page indicators: {login_page_hits}"
+            result["indicators"] = login_page_hits
+            print(json.dumps(result, ensure_ascii=False))
+            sys.exit(1)
+
+        result["method"] = "keyword" if mode == "keyword" else "url+keyword"
+
+    # ── Still unknown ──
+    text_preview = (text + snap)[:200].replace("\n", " ") if ('text' in dir() and 'snap' in dir()) else ""
+    result["details"] = result["details"] or f"no indicators matched. preview: {text_preview}"
+    result["state"] = "unknown"
+    print(json.dumps(result, ensure_ascii=False))
+    sys.exit(3)
+
+
+# ============================================================
+# Subcommand: check-login-valid (legacy, delegates to check-login-state)
 # ============================================================
 
 def cmd_check_login_valid():
     """Check if current login is valid for the target province/company.
+    Legacy wrapper — delegates to the unified check-login-state.
     Does NOT logout - only verifies. Returns JSON with login state.
     """
     snap = _run(["pinchtab", "snap"]).stdout
     text = _run(["pinchtab", "text"]).stdout
     combined = text + " " + snap
 
+    # Use unified keyword sets
+    logged_in_hits = [kw for kw in POST_LOGIN_KEYWORDS if kw in combined]
+    login_page_hits = [kw for kw in LOGIN_PAGE_KEYWORDS if kw in combined]
+
     has_logout = "退出" in combined
-    has_unit = "公司列表" in combined or "租赁车" in combined
+    has_unit = "公司列表" in combined or "租赁车" in combined or "租赁车辆" in combined
     has_personal = "个人用户" in combined
-    is_logged_in = has_logout and not "单位用户登录" in snap and not "个人用户登录" in snap
+    is_logged_in = bool(logged_in_hits) and not (
+        bool(login_page_hits) and not logged_in_hits
+    )
 
     result = {
         "logged_in": is_logged_in,
@@ -3677,6 +3836,7 @@ SUBCOMMANDS = {
     "get-login-type": cmd_get_login_type,
     "detect-rate-limit": cmd_detect_rate_limit,
     "dismiss-popup": cmd_dismiss_popup,
+    "check-login-state": cmd_check_login_state,
     "check-login-valid": cmd_check_login_valid,
     "find-plate-page": cmd_find_plate_page,
 }

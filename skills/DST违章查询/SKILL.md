@@ -56,7 +56,7 @@ description: 当用户提到查询xxx公司/xxx车的违章、违法、违规、
 ## 核心铁律
 
 1. **只查未处理违章：** 只对"未处理"或"未缴费"状态的违章记录点击"查看详情"获取罚款金额和记分。"已处理且已缴费"的记录直接跳过。查询前先对比 SQLite 数据库：已存在且状态未变的跳过；状态变更的（从未处理→已处理）更新记录。
-2. **随机延迟反爬：** 每条违章记录查询之间间隔 3-8 秒随机，每台车之间间隔 3-8 秒随机，点击操作间隔 1-2 秒随机。触发风控时立即停止所有操作。
+2. **随机延迟反爬：** 每条违章记录查询之间间隔 2-5 秒随机，每台车之间间隔 2-5 秒随机，点击操作间隔 1-2 秒随机。触发风控时立即停止所有操作。
 3. **中文参数兼容：** Linux 终端原生支持 UTF-8，含中文路径/参数可直接传入 Bash。复杂中文参数操作（如 pinchtab find/wait 含中文描述）建议通过 helper 子命令（`pt-find` / `pt-wait`）完成以确保稳妥。
 4. **文件操作建议：** Linux 可直接在 Bash 中使用中文路径。为提高可靠性，推荐使用 helper 的 `get-dir` / `get-screenshot-dir` 等子命令获取路径后操作。
 5. **风控熔断：** 三种触发条件：(1) 页面含"频繁"、"异常操作"、"黑名单"等关键词；(2) open_vehicle 连续 3 台车全部失败；(3) 查看详情 XHR 返回 `{"code":500,"message":"查询过于频繁"}`。任一触发立即终止所有进程并告警。XHR 监控由 `_setup_xhr_monitor()` 注入，`_check_xhr_rate_limit()` 轮询。
@@ -138,6 +138,7 @@ description: 当用户提到查询xxx公司/xxx车的违章、违法、违规、
 | `reset-detail-progress`| 安全重置详情进度（--company + --query-date） | 通过 Python 脚本                              |
 | `get-page-vehicles`    | 获取当前页车辆列表+页码+总页数         | 通过 Python 脚本                              |
 | `get-login-type`       | 检测登录类型（单位/个人/未登录）        | 通过 Python 脚本                              |
+| `check-login-state`    | **统一登录状态检测**：URL+DOM (Tier 1) 初始检查 + 关键字匹配 (Tier 2) 扫码轮询检测 | 通过 Python 脚本                              |
 | `find-plate-page`      | 在断点页找不到上次车辆时向前搜索（最多3页） | 通过 Python 脚本                              |
 | `new-tab`              | 创建新浏览器标签页，返回 tab ID（会话隔离） | 通过 Python 脚本                              |
 | `switch-tab`           | 切换到指定标签页 --id \<tab_id\> | 通过 Python 脚本                              |
@@ -373,11 +374,36 @@ PinchTab daemon
 
 ### 第二步：判断登录状态与登录类型
 
-1. `pinchtab snap` 获取快照，`pinchtab text` 获取页面文本
-2. **未登录**（无公司列表/业务菜单/退出按钮等）→ **继续第三步**
-3. **已登录** → 直接跳到第四步，执行查询流程
+**统一使用 `check-login-state` 子命令**（两层检测）：
+
+| 层级 | 方法 | 用途 | 说明 |
+| --- | --- | --- | --- |
+| **Tier 1** | URL + DOM | 初始登录状态检查 | 通过 `window.location.href` 判断是否在登录页 (`gab.122.gov.cn/m/login`)；已登录时通过 DOM 确认业务菜单存在 |
+| **Tier 2** | 关键字匹配 | 扫码轮询检测 | 检测 "退出"/"车辆管理"/"公司列表" 等业务关键词确认扫码成功；此层仅在 Tier 1 不确定时作为补充 |
+
+```bash
+# 初始检查（默认 URL+DOM，失败时自动回退关键字）
+python3 /tmp/violation_helper.py check-login-state
+
+# 仅 URL+DOM（初始检查，推荐）
+python3 /tmp/violation_helper.py check-login-state --mode url
+
+# 仅关键字匹配（扫码轮询检测用）
+python3 /tmp/violation_helper.py check-login-state --mode keyword
+```
+
+**返回值**：`state: "logged_in" | "login_page" | "rate_limited" | "unknown"`，exit code 对应 0/1/2/3。
+
+**登录状态判断流程**：
+1. 调用 `check-login-state --mode url` 做初始检查
+2. **state=logged_in** → 直接跳到第四步，执行查询流程
+3. **state=login_page** → 继续第三步扫码登录
+4. **state=rate_limited** → 立即终止所有操作并告警
+5. **state=unknown** → 回退到 `--mode keyword` 关键字匹配再判断
 
 > **核心原则**：本 skill 只针对单位用户。省份页面已登录且为单位用户时直接执行后续步骤，不要误判为个人登录后退出重登，严禁随意退出登录，尽量保持登录状态。只有实际查询时遇到非单位用户报错，才采取重新登陆策略。
+>
+> **关于登录检测的两层设计**：Tier 1 (URL+DOM) 用于判断"当前是否已登录"——稳定、无误判。Tier 2 (关键字匹配 "公司列表"/"退出") 用于扫码轮询中检测"用户是否已扫"——灵敏、响应快。两层各司其职，不混用。
 
 ### 第三步：扫码登录（含飞书通知）
 
@@ -550,9 +576,9 @@ print(f"QR_MSG_ID={msg_id}")
 | `--qr-sent-as` | user | 谁发的 QR 消息：`bot`（bot-用户 P2P，跳过 reply_to 匹配）或 `user`（群聊，需 reply_to 匹配） |
 | `--max-duration` | 300 | 总轮询时长（秒） |
 | `--check-qr` | false | 启用浏览器 QR 失效检测 |
-| `--check-login` | false | 启用浏览器自动检测登录。每约 30s 通过 pinchtab 检测页面是否已登录（公司列表标识），检测到即退出 0，无需等飞书回复 |
+| `--check-login` | false | 启用浏览器自动检测登录。每约 30s 通过 `check-login-state --mode keyword` 检测页面是否已登录（"公司列表"/"退出"/"车辆管理"），检测到即退出 0，无需等飞书回复 |
 | `--qr-refresh-count` | 0 | 当前已刷新次数 |
-| `--max-qr-refreshes` | 3 | 最大刷新次数，超限后 QR 过期不再刷新，只等待用户回复 |
+| `--max-qr-refreshes` | 3 | 最大刷新次数（整个 skill 统一：首次 + 2 次重发 = 3 次），超限后 QR 过期不再刷新，只等待用户回复 |
 
 **轮询间隔策略：**
 
@@ -728,7 +754,7 @@ if resume_page > 1:
             h(['click-page', '--target', '1'])
             resume_page = 1; resume_idx = 0; break
         time.sleep(random.uniform(1, 2))
-    time.sleep(random.uniform(3, 8))
+    time.sleep(random.uniform(2, 5))
 
     if resume_page > 1 and resume_plate:
         find = json.loads(h(['find-plate-page', '--plate', resume_plate, '--max-forward', '3']))
@@ -791,7 +817,7 @@ while True:
             print(f"    -> parse error: {violations_out[:100]}")
 
         h(['go-back'])
-        time.sleep(random.uniform(3, 8))
+        time.sleep(random.uniform(2, 5))
 
         h(['save-detail-progress', '--page', str(current_page),
             '--vehicle-index', str(i + 1), '--plate', plate,
@@ -804,7 +830,7 @@ while True:
 
     print(f"\nPage {current_page} done, next...")
     h(['click-page', '--target', 'next'])
-    time.sleep(random.uniform(3, 8))
+    time.sleep(random.uniform(2, 5))
     vehicle_offset = 0
 
 print(f"\nDone. Vehicles with violations processed: {len(processed)}")
@@ -815,7 +841,7 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 - **只查未处理记录**：`collect-violations` 只对状态为"未处理"的违章逐条点击"查看详情"。状态为"已处理"、"已缴费"、"无需缴费"的记录直接从列表提取基本信息，不点击详情（已处理记录无需获取罚款记分调整）
 - **🔴 逐条落库**：`collect-violations` 返回结果后，必须逐条立即调 `db-insert-violation` 写入 SQLite。禁止攒批、禁止中间 JSON 暂存
 - **🔴 车辆即时入库**：`get-page-vehicles` 获取每台车信息后，立即调 `db-insert-vehicle` 写入 vehicles 表（含未处理违章数的车也要写）。禁止等到 Step 7 再批量补写
-- **随机延迟**：每条违章记录查询之间 `time.sleep(random.uniform(3, 8))`，每次点击操作之间 `time.sleep(random.uniform(1, 2))`
+- **随机延迟**：每条违章记录查询之间 `time.sleep(random.uniform(2, 5))`，每次点击操作之间 `time.sleep(random.uniform(1, 2))`
 - **`collect-violations` 已验证**：逐条点击"查看详情"提取真实罚款金额和记分，关闭弹窗后继续下一条，不 reload 页面
 - **每台车保存进度**：`save-detail-progress` 记录页码+序号+车牌+详情页+违章序号，支持车辆级和违章级两级断点续跑
 - **翻页智能跳转**：`click-page --target N` 内置智能翻页算法（目标页>当前显示最大页→先跳最大页→再找）。详情页翻页使用相同算法
@@ -866,121 +892,224 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 
 ## 防退出保活
 
-### 架构：独立守护进程
+### 架构：四层保活 + systemd 守护
 
-保活由 **`keepalive_daemon.py`** 实现，通过 `nohup` + `disown` 启动后**完全独立于 Claude 会话**。Claude 会话结束时保活进程继续在后台运行，不受影响。
-
-**每个公司一个独立守护进程**，不同公司的保活完全隔离：
+保活由 **systemd user service** 管理，配合 **四层保活架构** 实现崩溃自动恢复、免扫码持久化。完全独立于 Claude 会话，机器重启也能自动拉起。
 
 ```
-多公司保活架构:
+四层保活架构（从快到慢、从轻到重）:
 
-公司A「北京安桉」                          公司B「成都某某」
-      │                                        │
-      ├── PID: 违章查询/data/keepalive_北京安桉.pid
-      ├── 日志: 违章查询/data/keepalive_北京安桉.log
-      ├── Tab: keepalive tab (id 记录在 keepalive_tab_*.txt)
-      ├── Instance: profiles.instance_port → PinchTab daemon A
-      │
-      └── 互不影响: --stop / --status 各自独立
+┌─────────────────────────────────────────────────────┐
+│ L0  心跳层 (60-120s)                                 │
+│     随机 scroll + DOM ping + 偶发 popup dismiss      │
+│     作用: 保持页面活跃，避免服务端 idle 超时             │
+│     检测: 连续 5 次心跳失败 → 提前触发 L1 reload       │
+├─────────────────────────────────────────────────────┤
+│ L1  周期 Reload 层 (18min)                           │
+│     pinchtab reload → dismiss popup → 页面状态检查     │
+│     作用: 全量刷新保持 session 活跃                     │
+│     检测: 登录态/风控关键词/登录页回退                    │
+├─────────────────────────────────────────────────────┤
+│ L2  Cookie 持久化层                                  │
+│     cookie_persist.py: 修改 Chrome SQLite Cookies DB │
+│     将 12123 域名的 session cookie → persistent       │
+│     设置 is_persistent=1, has_expires=1, 30天过期     │
+│     每次 keepalive cycle + 每次 pinchtab 重启时执行    │
+├─────────────────────────────────────────────────────┤
+│ L3  systemd 自动重启层                                │
+│     pinchtab.service: Restart=always, RestartSec=5   │
+│     keepalive-12123.service: Restart=always,          │
+│       RestartSec=10                                   │
+│     ExecStartPre: cookie_persist.py (Chrome 启动前)   │
+│     ExecStopPost: cookie_persist.py (Chrome 停止后)   │
+│     作用: 崩溃自动拉起 + 重启后免扫码                    │
+└─────────────────────────────────────────────────────┘
 ```
 
+**每个公司一个独立 systemd 服务**（`keepalive-<公司简称>.service`），不同公司的保活完全隔离。
+
+### systemd 服务架构
+
 ```
-Claude 会话 ──(nohup + disown)──▶ keepalive_daemon.py (PID: 12345)
-                                      │
-                                      ├── 启动时从 profiles 表读取 instance_port + platform_url
-                                      ├── 创建专属 keepalive Tab 并导航（首次）/ 复用已有 Tab
-                                      ├── 每 18 分钟: switch-tab → reload → dismiss → check state
-                                      ├── 读写 profiles.is_logged_in (SQLite)，变 0 自动退出
-                                      └── 支持多 PinchTab 实例（通过 PINCHTAB_PORT 环境变量）
+systemd user services
+├── pinchtab.service                    ← Chrome 浏览器 + PinchTab daemon
+│   ├── Restart=always, RestartSec=5
+│   └── drop-in: cookie-persist.conf
+│       ├── ExecStartPre=cookie_persist.py   ← Chrome 启动前修 DB
+│       └── ExecStopPost=cookie_persist.py   ← Chrome 停止后修 DB（应对 clean shutdown 回写）
+│
+└── keepalive-12123.service             ← 保活守护进程（以厦门地上铁为例）
+    ├── After=pinchtab.service
+    ├── Restart=always, RestartSec=10
+    ├── ExecStartPre=cookie_persist.py       ← 保活启动前确认 cookie 持久化
+    └── ExecStart=keepalive_daemon.py --auto-recover
 ```
 
-**生命周期：**
-- 登录成功后由 Claude 会话启动守护进程 → 写入 PID 文件 + 后台运行
-- 守护进程每 18 分钟 reload + dismiss 弹窗，检查登录态 + 风控
-- Claude 会话结束后守护进程**继续运行**，不随会话终止
-- 仅当 `is_logged_in` 变为 0、检测到登录过期、或风控触发时才自动退出
+### Cookie 持久化机制 (`cookie_persist.py`)
 
-**登录态追踪：**
-- 登录成功 → `profile-register` 写入 `is_logged_in=1` → 启动守护进程
-- 用户退出 / 会话过期 / 风控触发 → `profile-logout` 写入 `is_logged_in=0` → 守护进程下个周期检测到自动退出
-- 新查询进程启动时，若 `is_logged_in=0` 则走完整登录流程
+**原理：** Chrome 将 cookie 存储在 `~/.pinchtab/profiles/default/Default/Cookies` SQLite 数据库中。12123 平台的 JSESSIONID 等关键 cookie 被标记为 `is_persistent=0`（session-only），Chrome 重启时丢弃。通过直接修改 SQLite 元数据即可让它们跨重启存活。
 
-### 启动保活（登录成功后执行）
+**关键字段：**
+- `is_persistent`: 0 → 1（标记为持久化 cookie）
+- `has_expires`: 0 → 1（启用过期时间）
+- `expires_utc`: 0 → 当前时间 + 30 天（微秒时间戳）
+- `encrypted_value`: **不动**（v10 加密，Linux `--password-store=basic` 下为固定密钥，无需解密）
 
-守护脚本已内置在 skill 目录，通过 `nohup` 发射为独立进程：
+**作用范围：** 只匹配 12123 平台域名（`%122.gov.cn%`, `%12123%`, `%gab.122%`），不影响其他 cookie。
+
+**执行时机：**
+1. **pinchtab 重启时**：ExecStartPre（Chrome 启动前读）+ ExecStopPost（Chrome 停止后写），应对 Chrome clean shutdown 可能回写 `is_persistent=0`
+2. **keepalive 每个周期结束时**：reload 后可能有新 session cookie 产生，立即持久化
+3. **keepalive 启动时**：ExecStartPre 确认所有 cookie 已持久化
 
 ```bash
-# 1. 复制脚本到 /tmp（每次执行例行）
-cp /home/openclaw/.claude/skills/DST违章查询/keepalive_daemon.py /tmp/keepalive_daemon.py
+# 查看当前状态
+python3 /home/openclaw/.claude/skills/DST违章查询/cookie_persist.py \
+  --profile /home/openclaw/.pinchtab/profiles/default --verify
 
-# 2. 以 nohup 启动，脱离会话
-nohup python3 /tmp/keepalive_daemon.py \
-  --company "<公司名>" \
-  --project-root "<项目根目录>" \
-  > /dev/null 2>&1 &
+# 执行持久化
+python3 /home/openclaw/.claude/skills/DST违章查询/cookie_persist.py \
+  --profile /home/openclaw/.pinchtab/profiles/default
 
-# 3. disown 确保不被 bash 作业控制追踪
-disown
+# 预览（不实际修改）
+python3 /home/openclaw/.claude/skills/DST违章查询/cookie_persist.py \
+  --profile /home/openclaw/.pinchtab/profiles/default --dry-run
+```
 
-# 4. 验证启动成功
-python3 /tmp/keepalive_daemon.py \
-  --company "<公司名>" \
-  --project-root "<项目根目录>" \
-  --status
+### 心跳层 (`keepalive_daemon.py` 内置)
+
+在主循环的 sleep 间隙插入心跳，保持页面活跃：
+
+```python
+# 配置
+HEARTBEAT_MIN_SEC = 60   # 最小间隔
+HEARTBEAT_MAX_SEC = 120  # 最大间隔（随机化）
+MAX_CONSECUTIVE_HEARTBEAT_FAILS = 5  # 连续失败阈值
+
+# 每次心跳执行:
+# 1. 随机 scroll (100-1200px) — 模拟用户查看页面
+# 2. DOM ping (提取 navbar-brand/h1/title 文本) — 验证页面存活
+# 3. 1/5 概率 dismiss popup — 清理意外弹窗
+```
+
+**心跳在 18 分钟 sleep 期间以 60-120s 随机间隔执行**，每次心跳耗时 ~0.1-3 秒。连续 5 次失败则提前触发 L1 reload（不等 18 分钟）。
+
+### 部署保活（首次登录成功后执行）
+
+为每个公司创建 systemd 服务。以「厦门市地上铁新创绿能汽车服务有限公司」为例：
+
+**1. 创建 pinchtab drop-in（cookie 持久化钩子）：**
+
+```ini
+# ~/.config/systemd/user/pinchtab.service.d/cookie-persist.conf
+[Service]
+ExecStartPre=/opt/aiext/bin/python3 /home/openclaw/.claude/skills/DST违章查询/cookie_persist.py --profile /home/openclaw/.pinchtab/profiles/default
+ExecStopPost=/opt/aiext/bin/python3 /home/openclaw/.claude/skills/DST违章查询/cookie_persist.py --profile /home/openclaw/.pinchtab/profiles/default
+```
+
+**2. 创建 keepalive 服务：**
+
+```ini
+# ~/.config/systemd/user/keepalive-12123.service
+[Unit]
+Description=12123 Keepalive Daemon (厦门地上铁)
+After=pinchtab.service
+Wants=pinchtab.service
+
+[Service]
+Type=simple
+Environment="PATH=/home/openclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStartPre=/opt/aiext/bin/python3 /home/openclaw/.claude/skills/DST违章查询/cookie_persist.py --profile /home/openclaw/.pinchtab/profiles/default
+ExecStart=/opt/aiext/bin/python3 /home/openclaw/.claude/skills/DST违章查询/keepalive_daemon.py \
+    --company "<公司名>" \
+    --project-root <项目根目录> \
+    --auto-recover
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+**3. 启用并启动：**
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable keepalive-12123.service
+systemctl --user start keepalive-12123.service
+
+# 确保用户服务在会话退出后继续运行（只需执行一次）
+loginctl enable-linger
 ```
 
 ### 查看保活状态
 
 ```bash
-python3 /tmp/keepalive_daemon.py \
-  --company "<公司名>" \
-  --project-root "<项目根目录>" \
-  --status
-```
+# 查看 keepalive 服务状态
+systemctl --user status keepalive-12123.service --no-pager
 
-返回 JSON：
-```json
-{
-  "running": true,
-  "pid": 12345,
-  "company": "北京安桉",
-  "is_logged_in": true,
-  "pid_file": "违章查询/data/keepalive_北京安桉.pid",
-  "log_file": "违章查询/data/keepalive_北京安桉.log",
-  "last_log": ["... 最近5行日志 ..."]
-}
+# 查看 pinchtab 服务状态
+systemctl --user status pinchtab.service --no-pager
+
+# 实时日志
+tail -f 违章查询/data/keepalive_<公司名>.log
+
+# Cookie 持久化状态
+python3 /home/openclaw/.claude/skills/DST违章查询/cookie_persist.py \
+  --profile /home/openclaw/.pinchtab/profiles/default --verify
 ```
 
 ### 停止保活
 
 ```bash
-python3 /tmp/keepalive_daemon.py \
-  --company "<公司名>" \
-  --project-root "<项目根目录>" \
-  --stop
+systemctl --user stop keepalive-12123.service
+# 如需彻底禁用:
+systemctl --user disable keepalive-12123.service
 ```
 
-或直接：`kill $(cat 违章查询/data/keepalive_<公司>.pid)`
+如需停止整个保活栈（含 pinchtab）：
+
+```bash
+systemctl --user stop keepalive-12123.service pinchtab.service
+```
 
 ### 守护进程行为
 
-每个守护进程每 18 分钟循环执行：
+`keepalive_daemon.py` 每 18 分钟循环执行：
 
-0. `pinchtab tab <id>` 切换到本公司的 keepalive 标签页（防止其他会话覆盖当前页）
-1. 读取 SQLite `profiles.is_logged_in`，若为 0 则退出
+0. 读取 SQLite `profiles.is_logged_in`，若为 0 则退出
+1. `pinchtab tab <id>` 切换到本公司的 keepalive 标签页
 2. `pinchtab reload` 刷新页面（连续 3 次失败 → `profile-logout` → 退出）
 3. JS dispatchEvent 关闭弹窗（"本人已知晓"等），4 层策略
-4. `pinchtab text` + `snap` 检测页面状态：
-   - 找到"退出"/"车辆管理" → 正常，进入下个周期
-   - 检测到"单位用户登录"/"扫码登录" → 登录过期 → `profile-logout` → 退出
-   - 检测到"频繁"/"异常操作"/"黑名单"等 → 风控 → `profile-logout` → 退出
-   - 状态模糊 → 通过 snap 二次确认，仍模糊则记录日志继续（容错）
-5. 日志写入 `违章查询/data/keepalive_<公司>.log`（含时间戳）
+4. 页面状态检查：
+   - 检测到"退出"按钮 → 登录态正常
+   - 检测到"频繁"/"异常操作"/"黑名单"等 → 风控熔断 → `profile-logout` → 退出
+   - 检测到登录页（"单位用户登录"等）且无已登录标识 → 若启用 `--auto-recover` 则触发 QR 恢复
+5. 调用 `cookie_persist.py` 持久化本周期产生的新 session cookie
+6. 日志写入 `违章查询/data/keepalive_<公司>.log`（含时间戳）
+
+**18 分钟 sleep 期间：** 心跳以 60-120s 随机间隔执行 random scroll + DOM ping，保持页面活跃。
 
 **标签页持久化：** Tab ID 保存在 `违章查询/data/keepalive_tab_<公司>.txt`。守护进程重启时复用已有 Tab（不重复创建），Tab 失效时自动创建新 Tab 并导航到 `platform_url`。
 
-**多实例支持：** 如果 profiles 表中 `instance_port` 非空，守护进程通过 `PINCHTAB_PORT` 环境变量连接对应的 PinchTab daemon 实例，不同公司可运行在不同 Chrome 实例上。
+**自动恢复策略（`--auto-recover`）：**
+- 每次保活会话最多触发 **1 次** 自动恢复
+- 那次恢复内最多发送 **3 次** QR 码（应对二维码过期自动刷新）
+- 3 次 QR 均超时或恢复失败 → 静默退出，等待下次查询任务自然触发重新登录
+
+**崩溃恢复完整链路（已验证）：**
+
+```
+SIGKILL pinchtab
+  → systemd RestartSec=5s
+  → ExecStartPre: cookie_persist.py 修复 DB
+  → Chrome 启动，加载持久化 cookie
+  → keepalive 检测 pinchtab 恢复
+  → 复用 keepalive tab → reload → Page state OK
+  → 免扫码，恢复正常保活循环
+```
+
+**Linger 保障：** `loginctl enable-linger` 确保 systemd user 服务在 SSH/会话退出后不被 kill。服务已 enabled 则在机器重启后自动拉起。
 
 ***
 
@@ -1014,14 +1143,14 @@ python3 /tmp/keepalive_daemon.py \
 - **车牌自动识别：** `查粤B12345违章` → 粤→广东→导航 gab.122.gov.cn → 登录 → 输入车牌 → 生成报告
 - **批量：** `查成都公司违章` → 成都→四川→导航 gab.122.gov.cn → 登录 → 选择公司 → 车辆列表 → 逐台查 → 三重输出
 - **群通知（@指定人）：** `查成都公司违章，发到违章通知群，@任晏平` → 四川→截图→搜群→发群+@→轮询监听→查询→通知结果
-- **保活：** 登录成功后自动 `nohup` 启动 `keepalive_daemon.py`，完全独立于 Claude 会话持续保活
+- **保活：** 登录成功后通过 systemd user service 启动 `keepalive_daemon.py`，四层保活（心跳 + 周期 reload + Cookie 持久化 + systemd 自动重启），完全独立于 Claude 会话持续保活
 
 ***
 
 ## 注意事项
 
 1. 仅查授权车辆，车架号默认只显示后6位
-2. 批量查询间隔 3-8 秒随机，点击操作间隔 1-2 秒随机（模拟人工操作，避免触发反爬）
+2. 批量查询间隔 2-5 秒随机，点击操作间隔 1-2 秒随机（模拟人工操作，避免触发反爬）
 3. 飞书不可用自动降级本地展示，不阻塞
 4. 二维码约5分钟有效，尽快发送
 5. **lark-cli 身份：** 发消息 `--as bot` | 查用户ID（手机号）`--as bot` | 查用户ID（姓名）`--as user`（通过 lark-contact）| 上传图片 `--as bot`
@@ -1052,7 +1181,7 @@ python3 /tmp/keepalive_daemon.py \
 30. **弹窗遮挡（Issue #4 修复）：** `_close_popup()` 四层策略：(1) JavaScript `dispatchEvent` 点击关闭/×/取消按钮（绕过 pinchtab occlusion 检查）；(2) pinchtab click 关闭按钮（occlusion 失败时自动降级为 JS dispatchEvent）；(3) Escape 键事件（KeyEvent + activeElement）；(4) 直接 DOM 隐藏 modal/overlay/fixed 元素（最后的保险）。确保查看违章详情后能可靠关闭弹窗返回列表页。
 31. **禁止随意退出登录：** 检测到已登录（有"退出"按钮、公司列表菜单）时严禁退出。只需验证省份和公司匹配当前任务即可继续。只有实际查询时遇到非单位用户报错，才重新登录。
 32. **风控熔断机制：** `detect-rate-limit` 检测页面关键词（频繁/异常操作/黑名单/第三方软件等）。`open-vehicle` 连续 3 次失败也触发熔断。触发后立即终止所有查询进程，保留进度，发送飞书告警。
-33. **保活生命周期：** 登录成功后通过 `nohup` + `disown` 启动 `keepalive_daemon.py`，完全独立于 Claude 会话（会话终止后继续运行）。守护进程每 18 分钟 reload + dismiss popup 并检测登录态和风控。`is_logged_in=0` 或检测到异常时自动退出。可通过 `--status` / `--stop` 查看状态和停止。
+33. **保活生命周期：** 登录成功后创建 systemd user service（`keepalive-<公司>.service`），通过 `systemctl --user start/enable` 启动。服务通过 `Restart=always` 保活，完全独立于 Claude 会话（会话终止后继续运行，机器重启后自动拉起）。守护进程每 18 分钟 reload + dismiss popup，心跳 60-120s 随机 scroll + ping 保持页面活跃。`is_logged_in=0` 或检测到异常时自动退出。通过 `systemctl --user status/stop` 查看状态和停止。
 34. **图片上传方式：** `lark-cli im images create --file` 无法读取含中文路径文件。改用 stdin 管道：`cat /path/to/img.png | lark-cli im images create --as bot --file "image=-" --data '{"image_type":"message"}'`
 35. **总页数动态获取：** 不强制一开始获取全量页数。每页查询时通过可见分页链接获取当前 total_pages，动态更新。翻页后验证 URL 是否变化（防止假翻页）。连续 2 页检测到 0 辆车时认为到达末尾。
 36. **SQLite 增量对比：** `collect-violations` 查询前先读取 SQLite 中该车牌已有记录。已存在且状态未变的跳过；状态变更的（未处理→已处理）重新查询详情并更新。
@@ -1064,5 +1193,5 @@ python3 /tmp/keepalive_daemon.py \
 42. **标签页会话隔离：** 多个 Claude 进程共用同一 PinchTab daemon（同一 Chrome 实例）。每次执行必须通过 `new-tab` 创建专属标签页，后续所有操作前先 `switch-tab --id <tab_id>` 切回本会话标签页。Cookie/session 在所有标签页间共享，一次登录即可，但页面导航互不干扰。
 43. **多进程文件隔离：** 临时 Python 脚本路径含 `{pid}` 后缀（`batch_query_{pid}.py` 等），不同进程互不覆盖。进度文件按公司+日期隔离（`details_progress_<公司>_<日期>.json`），支持多进程并行查不同公司，且 Claude 上下文满重启后同一天自动续跑。SQLite 开启 WAL 模式支持多进程并发读写。
 44. **Profile 隔离与登录复用：** 每个公司绑定一个 PinchTab Profile（`profiles` 表）。同一公司的多个查询进程复用同一 Profile（共享 cookie/登录态），通过 `new-tab` 隔离页面导航。不同公司使用不同 Profile。每次执行前先 `profile-lookup` 查映射表，命中则跳过登录直接查询。首次登录成功后 `profile-register` 写入映射表。
-45. **保活守护进程：** `keepalive_daemon.py` 通过 `nohup` + `disown` 启动后完全独立于 Claude 会话。PID 文件在 `违章查询/data/keepalive_<公司>.pid`，日志在 `违章查询/data/keepalive_<公司>.log`。启动前先 `--status` 检查是否已有实例运行（防止重复启动）。Claude 会话结束时守护进程不受影响，继续在后台每 18 分钟执行保活周期。
+45. **保活守护进程：** `keepalive_daemon.py` 通过 systemd user service 管理（`keepalive-<公司>.service`），配合 pinchtab drop-in `cookie-persist.conf` 实现四层保活架构（L0 心跳 → L1 周期 reload → L2 Cookie 持久化 → L3 systemd 自动重启）。服务通过 `Restart=always` 自动恢复崩溃，`loginctl enable-linger` 确保会话退出后不终止。PID 文件在 `违章查询/data/keepalive_<公司>.pid`，日志在 `违章查询/data/keepalive_<公司>.log`。Cookie 持久化由 `cookie_persist.py` 实现（修改 Chrome SQLite Cookies DB 的 `is_persistent`/`has_expires`/`expires_utc` 字段）。启动前先检查是否已有实例运行（防止重复启动）。Claude 会话结束时守护进程不受影响，继续在后台每 18 分钟执行保活周期。
 
