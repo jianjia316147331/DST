@@ -25,27 +25,27 @@ description: 当用户提到查询xxx公司/xxx车的违章、违法、违规、
 
 首次执行 `init` 时自动创建所有子文件夹。
 
-### 🔧 Windows/MINGW64 命令执行模型
+### 🔧 Linux 命令执行模型
 
-**核心规则：禁止在 bash eval 字符串中直接出现中文字符（会被 Claude Code 的 bash wrapper 拦截）。通过** **`python.exe`** **直接执行（不用** **`cmd.exe`** **中转）避免 GBK/UTF-8 编码损坏。**
+**核心规则：`python3` / `lark-cli` / `pinchtab` 均在 PATH 上，直接调用即可。含中文路径或中文参数的操作推荐通过 Python 脚本的 subprocess（list 形式）完成以确保稳妥。**
 
 ```
 执行流程：
-1. Write tool 将 Python 脚本写入 C:\Users\zhanglei2145\<script>_{pid}.py
-2. Bash 直接执行（不走 cmd.exe！）：python C:\Users\zhanglei2145\<script>_{pid}.py
+1. Write tool 将 Python 脚本写入 /home/openclaw/<script>_{pid}.py
+2. Bash 直接执行：python3 /home/openclaw/<script>_{pid}.py
 3. Python 内部通过 subprocess（list 形式，不走 shell）调用 pinchtab / lark-cli
 4. 结果通过 helper 的 --output FILE 写入 UTF-8 文件，外部脚本读取文件获取结果
 ```
 
-**固定路径（硬编码，不走编码敏感通道）：**
+**工具路径（均在 PATH 上，无需硬编码）：**
 
-| 工具          | 路径                                                                         |
+| 工具          | 调用方式                                                                     |
 | ----------- | -------------------------------------------------------------------------- |
-| Python      | `C:\Users\zhanglei2145\AppData\Local\Programs\Python\Python313\python.exe` |
-| lark-cli    | `C:\Users\zhanglei2145\AppData\Roaming\npm\lark-cli.cmd`                   |
-| pinchtab    | `C:\Users\zhanglei2145\AppData\Roaming\npm\pinchtab.cmd`                   |
-| TEMP helper | `C:\Users\zhanglei2145\AppData\Local\Temp\violation_helper.py`             |
-| 输出目录        | `<cwd>/违章查询/`（通过 helper `get-dir -o <file>` 安全获取，读取文件得到正确路径）               |
+| Python      | `python3`（`/opt/aiext/bin/python3`） |
+| lark-cli    | `lark-cli`（`/home/openclaw/.npm-global/bin/lark-cli`） |
+| pinchtab    | `pinchtab`（`/home/openclaw/.npm-global/bin/pinchtab`） |
+| TEMP helper | `/tmp/violation_helper.py`（首次 init 时从 skill 目录复制） |
+| 输出目录        | `<cwd>/违章查询/`（通过 helper `get-dir -o <file>` 安全获取）               |
 
 ## 适用场景
 
@@ -57,8 +57,8 @@ description: 当用户提到查询xxx公司/xxx车的违章、违法、违规、
 
 1. **只查未处理违章：** 只对"未处理"或"未缴费"状态的违章记录点击"查看详情"获取罚款金额和记分。"已处理且已缴费"的记录直接跳过。查询前先对比 SQLite 数据库：已存在且状态未变的跳过；状态变更的（从未处理→已处理）更新记录。
 2. **随机延迟反爬：** 每条违章记录查询之间间隔 3-8 秒随机，每台车之间间隔 3-8 秒随机，点击操作间隔 1-2 秒随机。触发风控时立即停止所有操作。
-3. **中文隔离：** 禁止在 bash eval 字符串中直接出现中文字符。含中文参数的操作通过 Python 脚本调用 helper 子命令，脚本内用 subprocess list 形式传递参数，不走 shell。
-4. **文件操作必须走 Python：** 任何涉及含中文路径的读写操作（截图、复制文件、创建目录等）必须通过 Python 脚本完成，禁止手写 Bash 命令。
+3. **中文参数兼容：** Linux 终端原生支持 UTF-8，含中文路径/参数可直接传入 Bash。复杂中文参数操作（如 pinchtab find/wait 含中文描述）建议通过 helper 子命令（`pt-find` / `pt-wait`）完成以确保稳妥。
+4. **文件操作建议：** Linux 可直接在 Bash 中使用中文路径。为提高可靠性，推荐使用 helper 的 `get-dir` / `get-screenshot-dir` 等子命令获取路径后操作。
 5. **风控熔断：** 三种触发条件：(1) 页面含"频繁"、"异常操作"、"黑名单"等关键词；(2) open_vehicle 连续 3 台车全部失败；(3) 查看详情 XHR 返回 `{"code":500,"message":"查询过于频繁"}`。任一触发立即终止所有进程并告警。XHR 监控由 `_setup_xhr_monitor()` 注入，`_check_xhr_rate_limit()` 轮询。
 6. **禁止随意退出登录：** 检测到已登录状态（单位用户）时严禁退出。只需确认省份和公司匹配当前任务即可继续。只有实际查询遇到非单位用户报错时才重新登录。
 7. **保活生命周期：** 登录成功后立即启动保活（每 18 分钟 reload + dismiss 弹窗）。查询正常完成后保活继续运行不停止，除非用户明确要求或会话自然过期。
@@ -68,26 +68,12 @@ description: 当用户提到查询xxx公司/xxx车的违章、违法、违规、
 11. **🔴 铁律：违章详情必须逐个查询（不可跳过）：** 车辆列表上显示有未处理违章的车辆，**必须进入详情页 + 逐条点击"查看详情"获取真实罚款金额和记分**。禁止只读列表数据不查详情、禁止仅凭列表摘要生成报告。此条为最高优先级铁律，违反即为查询失败。
 12. **🔴 数据落库策略：查一条落库一条 → 逐条即时写入：** `collect-violations` 每提取完一条违章详情，调用方应立即通过 `db-insert-violation` 写入 SQLite。不使用中间 JSON/JS 文件暂存、不攒到最后批量落库。这样即使中途崩溃，已查询的违章数据不会丢失。helper `db-insert-violation` 支持按自然键 upsert（车牌+时间+地点+行为），重复写入不会产生脏数据。
 
-### 中文隔离违规对照表
+### 中文参数兼容说明
 
-以下操作虽然脚本已写好，但手写 Bash 传入中文路径会被 wrapper 拦截（exit 127），必须改用右侧方式：
-
-| ❌ 禁止（Bash 手写中文路径） | ✅ 正确（Python 脚本） |
-|---|---|
-| `pinchtab screenshot -o ".../违章查询/..."` | 用 `screenshot_qr.py`（`os.path.join` 构造路径 + `subprocess` list 传参） |
-| `cp ".../DST违章查询/..." ".../Temp/..."` | 用 `init_violation.py`（`shutil.copy2` 复制） |
-| `mkdir ".../违章查询/..."` | 用 `init_violation.py`（`os.makedirs` 已内建） |
-| `cat ".../违章查询/..."` | 用 helper `get-dir -o <ASCII_FILE>` 绕过，读取 ASCII 文件 |
-| `pinchtab find "中文描述"` | 用 Python 脚本调 helper `pt-find` |
-| `pinchtab wait --text "中文"` | 用 Python 脚本调 helper `pt-wait` |
-
-**检查清单（执行前自查）：**
-- [ ] Bash 命令字符串中是否直接包含中文？→ 重写为 Python 脚本
-- [ ] 文件路径是否包含中文目录（如 `违章查询`、`DST违章查询`）？→ 走 helper 或 Python
-- [ ] pinchtab 参数是否含中文？→ 走 `pt-find` / `pt-wait` / `run-js` helper
-- [ ] lark-cli 参数是否含中文？→ helper 内部 `_run()` 已处理，但 Python 脚本仍需 `encoding='utf-8'`
-
-> **调试技巧：** `init_violation.py` 已固化所有路径初始化（复制 helper、创建子目录），每次执行第一步运行即可。后续脚本只引用固定路径变量，不重复构造中文路径。
+> **注意：** Linux 终端原生支持 UTF-8，含中文路径/参数可直接在 Bash 中使用。
+> 为保持最大兼容性，复杂中文参数操作（如 pinchtab find/wait 含中文描述）仍建议通过
+> helper 子命令（`pt-find` / `pt-wait`）完成，确保编码安全。文件路径含中文时推荐
+> 使用 helper 的 `get-dir` / `get-screenshot-dir` 等子命令获取路径。
 
 ## 前置条件
 
@@ -99,14 +85,14 @@ description: 当用户提到查询xxx公司/xxx车的违章、违法、违规、
   pinchtab health
   ```
   注：PinchTab 自动管理 Chrome 实例，无需手动启动 Chrome 调试端口。
-- `lark-cli` 已安装并完成 `config init`（路径：`C:\Users\zhanglei2145\AppData\Roaming\npm\lark-cli.cmd`）
+- `lark-cli` 已安装并完成 `config init`（路径：`lark-cli`）
 - `lark-contact`、`lark-im`、`lark-shared` 官方 skill 已安装（`npx skills add larksuite/cli -y -g`）
 - 用户持有12123单位用户账号（扫码登录用）
 - 飞书操作统一用 `lark-cli` CLI（不用 MCP），发消息用 `--as bot`
 
 ### ⚡ `violation_helper.py` 子命令速查
 
-> 通过 Python 脚本调用 helper（不走 cmd.exe）。所有子命令支持 `-o FILE` 将结果写入 UTF-8 文件。
+> 通过 Python 脚本调用 helper。所有子命令支持 `-o FILE` 将结果写入 UTF-8 文件。
 
 | 子命令                  | 用途                      | 调用方式                                      |
 | -------------------- | ----------------------- | ----------------------------------------- |
@@ -201,7 +187,6 @@ description: 当用户提到查询xxx公司/xxx车的违章、违法、违规、
       "Bash(mkdir:*)",
       "Bash(cd:*)",
       "Bash(cat:*)",
-      "Bash(cmd.exe:*)",
       "Bash(lark-cli:*)",
       "Bash(lark-cli contact *)",
       "Bash(lark-cli im *)",
@@ -228,10 +213,10 @@ description: 当用户提到查询xxx公司/xxx车的违章、违法、违规、
 
 ### 环境初始化（每次执行第一步）
 
-用 Write 工具写入以下脚本到 `C:\Users\zhanglei2145\init_violation_{pid}.py`，然后执行：
+用 Write 工具写入以下脚本到 `/home/openclaw/init_violation_{pid}.py`，然后执行：
 
 ```bash
-C:/Users/zhanglei2145/AppData/Local/Programs/Python/Python313/python.exe C:/Users/zhanglei2145/init_violation.py
+python3 /home/openclaw/init_violation_{pid}.py
 ```
 
 脚本内容：
@@ -239,15 +224,13 @@ C:/Users/zhanglei2145/AppData/Local/Programs/Python/Python313/python.exe C:/User
 ```python
 import shutil, os, json, subprocess, sys
 
-src = r'C:\Users\zhanglei2145\.claude\skills\DST违章查询\violation_helper.py'
-temp_dir = os.environ.get('TEMP', r'C:\Users\zhanglei2145\AppData\Local\Temp')
-dst = os.path.join(temp_dir, 'violation_helper.py')
+src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(sys.argv[0]))),
+    '.claude', 'skills', 'DST违章查询', 'violation_helper.py')
+dst = '/tmp/violation_helper.py'
 shutil.copy2(src, dst)
 
-# detect lark-cli
-lark = r'C:\Users\zhanglei2145\AppData\Roaming\npm\lark-cli.cmd'
-if not os.path.exists(lark):
-    lark = 'lark-cli'
+# detect lark-cli (on PATH)
+lark = shutil.which('lark-cli') or 'lark-cli'
 
 # create output dir
 query_dir = os.path.join(os.getcwd(), '违章查询')
@@ -262,7 +245,7 @@ result = {
 print(json.dumps(result, ensure_ascii=False))
 ```
 
-> 初始化完成后，后续 Python 调用使用 `python <HELPER路径>` 执行（不用 cmd.exe）。关键数据通过 `-o <file>` 写入文件获取。
+> 初始化完成后，后续 Python 调用使用 `python3 <HELPER路径>` 执行。关键数据通过 `-o <file>` 写入文件获取。
 
 ### 会话标签页隔离（每次执行必做）
 
@@ -275,11 +258,11 @@ print(json.dumps(result, ensure_ascii=False))
 3. 本会话结束时不关闭标签页（保活可能还在用）
 
 ```python
-# 写入 C:\Users\zhanglei2145\session_tab_{pid}.py
+# 写入 /home/openclaw/session_tab_{pid}.py
 import subprocess, json
 
-py = r'C:\Users\zhanglei2145\AppData\Local\Programs\Python\Python313\python.exe'
-helper = r'C:\Users\zhanglei2145\AppData\Local\Temp\violation_helper.py'
+py = r'python3'
+helper = r'/tmp/violation_helper.py'
 
 result = subprocess.run([py, helper, 'new-tab'],
     capture_output=True, text=True, encoding='utf-8')
@@ -391,7 +374,7 @@ PinchTab daemon
 ### 第二步：判断登录状态与登录类型
 
 1. `pinchtab snap` 获取快照，`pinchtab text` 获取页面文本
-2. **未登录**（无单位名称/业务菜单/退出按钮等）→ **继续第三步**
+2. **未登录**（无公司列表/业务菜单/退出按钮等）→ **继续第三步**
 3. **已登录** → 直接跳到第四步，执行查询流程
 
 > **核心原则**：本 skill 只针对单位用户。省份页面已登录且为单位用户时直接执行后续步骤，不要误判为个人登录后退出重登，严禁随意退出登录，尽量保持登录状态。只有实际查询时遇到非单位用户报错，才采取重新登陆策略。
@@ -417,10 +400,10 @@ PinchTab daemon
 用户提供姓名时，调用 `lark-contact` skill 查找飞书用户 open\_id。或通过 Python 脚本调用 helper 的 `search-user` 子命令：
 
 ```python
-# 写入 C:\Users\zhanglei2145\search_user_{pid}.py
+# 写入 /home/openclaw/search_user_{pid}.py
 import subprocess, sys
-py = r'C:\Users\zhanglei2145\AppData\Local\Programs\Python\Python313\python.exe'
-helper = r'C:\Users\zhanglei2145\AppData\Local\Temp\violation_helper.py'
+py = r'python3'
+helper = r'/tmp/violation_helper.py'
 result = subprocess.run(
     [py, helper, 'search-user', '--query', '用户姓名'],
     capture_output=True, text=True, encoding='utf-8')
@@ -441,7 +424,7 @@ print(result.stdout)
 
 ```bash
 # 直接使用固定路径截图，文件名用 ASCII
-pinchtab screenshot -o "C:/Users/zhanglei2145/违章查询/login_qrcode_YYYYMMDD.png"
+pinchtab screenshot -o "/home/openclaw/违章查询/login_qrcode_YYYYMMDD.png"
 ```
 
 用 Python 脚本确认文件存在（避免中文路径在 bash 中损坏）。
@@ -453,12 +436,12 @@ pinchtab screenshot -o "C:/Users/zhanglei2145/违章查询/login_qrcode_YYYYMMDD
 通过 Python 脚本调用 helper 的 `upload-image` 子命令：
 
 ```python
-# 写入 C:\Users\zhanglei2145\upload_qr_{pid}.py
+# 写入 /home/openclaw/upload_qr_{pid}.py
 import subprocess
-py = r'C:\Users\zhanglei2145\AppData\Local\Programs\Python\Python313\python.exe'
-helper = r'C:\Users\zhanglei2145\AppData\Local\Temp\violation_helper.py'
+py = r'python3'
+helper = r'/tmp/violation_helper.py'
 result = subprocess.run([py, helper, 'upload-image',
-    '--dir', r'C:\Users\zhanglei2145\违章查询',
+    '--dir', r'/home/openclaw/违章查询',
     '--file', 'login_qrcode_YYYYMMDD.png'],
     capture_output=True, text=True, encoding='utf-8')
 print(result.stdout.strip())
@@ -484,11 +467,11 @@ print(result.stdout.strip())
 **发给群聊（@指定人 + 记录 message\_id）：**
 
 ```python
-# 写入 C:\Users\zhanglei2145\send_qr_msg_{pid}.py
+# 写入 /home/openclaw/send_qr_msg_{pid}.py
 import subprocess, json
 
-py = r'C:\Users\zhanglei2145\AppData\Local\Programs\Python\Python313\python.exe'
-helper = r'C:\Users\zhanglei2145\AppData\Local\Temp\violation_helper.py'
+py = r'python3'
+helper = r'/tmp/violation_helper.py'
 
 qr_params = {
     "image_key": "<IMAGE_KEY>",
@@ -504,12 +487,12 @@ msg_json = subprocess.run(
     input=json.dumps(qr_params, ensure_ascii=False),
     capture_output=True, text=True, encoding='utf-8').stdout
 
-with open(r'C:\Users\zhanglei2145\lark_login_msg_{pid}.json', 'w', encoding='utf-8') as f:
+with open(r'/home/openclaw/lark_login_msg_{pid}.json', 'w', encoding='utf-8') as f:
     f.write(msg_json)
 
 result = subprocess.run(
     [py, helper, 'send-msg',
-     '--msg-file', r'C:\Users\zhanglei2145\lark_login_msg_{pid}.json',
+     '--msg-file', r'/home/openclaw/lark_login_msg_{pid}.json',
      '--chat-id', 'oc_xxx'],
     capture_output=True, text=True, encoding='utf-8')
 print(result.stdout)
@@ -553,7 +536,7 @@ print(f"QR_MSG_ID={msg_id}")
 ```
 
 **3.7 轮询登录回执 + QR 失效自动刷新**
-> `send-msg` 内部通过 node.exe 直接调用 lark-cli（绕过 cmd.exe），图文合并消息不会出现编码损坏。
+> `send-msg` 内部通过 `shutil.which()` 解析 lark-cli 路径后直接调用，Linux 上无编码问题。
 
 通过 Python 脚本调用 `poll-login`，动态轮询间隔 + 浏览器 QR 失效检测 + 最多 3 次自动刷新。
 
@@ -567,7 +550,7 @@ print(f"QR_MSG_ID={msg_id}")
 | `--qr-sent-as` | user | 谁发的 QR 消息：`bot`（bot-用户 P2P，跳过 reply_to 匹配）或 `user`（群聊，需 reply_to 匹配） |
 | `--max-duration` | 300 | 总轮询时长（秒） |
 | `--check-qr` | false | 启用浏览器 QR 失效检测 |
-| `--check-login` | false | 启用浏览器自动检测登录。每约 30s 通过 pinchtab 检测页面是否已登录（单位用户标识），检测到即退出 0，无需等飞书回复 |
+| `--check-login` | false | 启用浏览器自动检测登录。每约 30s 通过 pinchtab 检测页面是否已登录（公司列表标识），检测到即退出 0，无需等飞书回复 |
 | `--qr-refresh-count` | 0 | 当前已刷新次数 |
 | `--max-qr-refreshes` | 3 | 最大刷新次数，超限后 QR 过期不再刷新，只等待用户回复 |
 
@@ -591,10 +574,10 @@ print(f"QR_MSG_ID={msg_id}")
 **基础调用：**
 
 ```python
-# 写入 C:\Users\zhanglei2145\poll_login_{pid}.py
+# 写入 /home/openclaw/poll_login_{pid}.py
 import subprocess, sys
-py = r'C:\Users\zhanglei2145\AppData\Local\Programs\Python\Python313\python.exe'
-helper = r'C:\Users\zhanglei2145\AppData\Local\Temp\violation_helper.py'
+py = r'python3'
+helper = r'/tmp/violation_helper.py'
 result = subprocess.run(
     [py, helper, 'poll-login',
      '--chat-id', 'oc_xxx',
@@ -613,11 +596,11 @@ sys.exit(result.returncode)
 **带 QR 自动刷新的循环调用（exit 2/3 时刷新 QR 重试）：**
 
 ```python
-# 写入 C:\Users\zhanglei2145\poll_with_refresh_{pid}.py
+# 写入 /home/openclaw/poll_with_refresh_{pid}.py
 import subprocess, sys, time
 
-py = r'C:\Users\zhanglei2145\AppData\Local\Programs\Python\Python313\python.exe'
-helper = r'C:\Users\zhanglei2145\AppData\Local\Temp\violation_helper.py'
+py = r'python3'
+helper = r'/tmp/violation_helper.py'
 
 MAX_REFRESHES = 3
 
@@ -707,7 +690,7 @@ for refresh_count in range(MAX_REFRESHES + 1):
 > - `resume_violation_time`: 最后一条已处理违章的时间戳（用于跨页交叉校验）
 > - `processed_plates`: 已处理车牌列表（用于增量去重）
 >
-> **逐页处理循环（极简包装，只调 helper 子命令，写入 `C:\Users\zhanglei2145\batch_query_{pid}.py` 后执行）：**
+> **逐页处理循环（极简包装，只调 helper 子命令，写入 `/home/openclaw/batch_query_{pid}.py` 后执行）：**
 
 ```python
 """
@@ -716,8 +699,8 @@ for refresh_count in range(MAX_REFRESHES + 1):
 """
 import subprocess, json, time, random, sys
 
-py = r'C:\Users\zhanglei2145\AppData\Local\Programs\Python\Python313\python.exe'
-helper = r'C:\Users\zhanglei2145\AppData\Local\Temp\violation_helper.py'
+py = r'python3'
+helper = r'/tmp/violation_helper.py'
 date = time.strftime('%Y-%m-%d')
 company = '<公司名称>'  # set by caller based on selected company
 
@@ -883,22 +866,121 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 
 ## 防退出保活
 
-**生命周期：** 登录成功后立即启动保活（每 18 分钟 reload + dismiss 弹窗），查询正常完成后保活继续运行不停止。
+### 架构：独立守护进程
+
+保活由 **`keepalive_daemon.py`** 实现，通过 `nohup` + `disown` 启动后**完全独立于 Claude 会话**。Claude 会话结束时保活进程继续在后台运行，不受影响。
+
+**每个公司一个独立守护进程**，不同公司的保活完全隔离：
+
+```
+多公司保活架构:
+
+公司A「北京安桉」                          公司B「成都某某」
+      │                                        │
+      ├── PID: 违章查询/data/keepalive_北京安桉.pid
+      ├── 日志: 违章查询/data/keepalive_北京安桉.log
+      ├── Tab: keepalive tab (id 记录在 keepalive_tab_*.txt)
+      ├── Instance: profiles.instance_port → PinchTab daemon A
+      │
+      └── 互不影响: --stop / --status 各自独立
+```
+
+```
+Claude 会话 ──(nohup + disown)──▶ keepalive_daemon.py (PID: 12345)
+                                      │
+                                      ├── 启动时从 profiles 表读取 instance_port + platform_url
+                                      ├── 创建专属 keepalive Tab 并导航（首次）/ 复用已有 Tab
+                                      ├── 每 18 分钟: switch-tab → reload → dismiss → check state
+                                      ├── 读写 profiles.is_logged_in (SQLite)，变 0 自动退出
+                                      └── 支持多 PinchTab 实例（通过 PINCHTAB_PORT 环境变量）
+```
+
+**生命周期：**
+- 登录成功后由 Claude 会话启动守护进程 → 写入 PID 文件 + 后台运行
+- 守护进程每 18 分钟 reload + dismiss 弹窗，检查登录态 + 风控
+- Claude 会话结束后守护进程**继续运行**，不随会话终止
+- 仅当 `is_logged_in` 变为 0、检测到登录过期、或风控触发时才自动退出
 
 **登录态追踪：**
-- 登录成功 → `profile-register` 写入 `is_logged_in=1`
-- 用户退出登录 / 保活检测到会话过期 → `profile-logout` 写入 `is_logged_in=0`
-- 保活脚本每次 reload 前先 `profile-lookup` 检查 `is_logged_in`，若为 `false` 则停止保活
+- 登录成功 → `profile-register` 写入 `is_logged_in=1` → 启动守护进程
+- 用户退出 / 会话过期 / 风控触发 → `profile-logout` 写入 `is_logged_in=0` → 守护进程下个周期检测到自动退出
 - 新查询进程启动时，若 `is_logged_in=0` 则走完整登录流程
 
-每 18 分钟执行：
-1. `profile-lookup --company <公司名>` 检查 `is_logged_in` 状态，若为 `false` 则退出
-2. `pinchtab reload` 刷新页面
-3. 自动 dismiss 弹窗（"本人已知晓"等），确保表格可访问
-3. `pinchtab snap` 检测登录态：找到"退出"按钮 → 正常；否则 → 告警
-4. 若检测到登录页（"单位用户登录"），发送飞书告警通知
+### 启动保活（登录成功后执行）
 
-**风控熔断：** 保活过程中若 snap/text 检测到风控关键词（"频繁"、"异常操作"、"黑名单"等），立即停止保活并告警。
+守护脚本已内置在 skill 目录，通过 `nohup` 发射为独立进程：
+
+```bash
+# 1. 复制脚本到 /tmp（每次执行例行）
+cp /home/openclaw/.claude/skills/DST违章查询/keepalive_daemon.py /tmp/keepalive_daemon.py
+
+# 2. 以 nohup 启动，脱离会话
+nohup python3 /tmp/keepalive_daemon.py \
+  --company "<公司名>" \
+  --project-root "<项目根目录>" \
+  > /dev/null 2>&1 &
+
+# 3. disown 确保不被 bash 作业控制追踪
+disown
+
+# 4. 验证启动成功
+python3 /tmp/keepalive_daemon.py \
+  --company "<公司名>" \
+  --project-root "<项目根目录>" \
+  --status
+```
+
+### 查看保活状态
+
+```bash
+python3 /tmp/keepalive_daemon.py \
+  --company "<公司名>" \
+  --project-root "<项目根目录>" \
+  --status
+```
+
+返回 JSON：
+```json
+{
+  "running": true,
+  "pid": 12345,
+  "company": "北京安桉",
+  "is_logged_in": true,
+  "pid_file": "违章查询/data/keepalive_北京安桉.pid",
+  "log_file": "违章查询/data/keepalive_北京安桉.log",
+  "last_log": ["... 最近5行日志 ..."]
+}
+```
+
+### 停止保活
+
+```bash
+python3 /tmp/keepalive_daemon.py \
+  --company "<公司名>" \
+  --project-root "<项目根目录>" \
+  --stop
+```
+
+或直接：`kill $(cat 违章查询/data/keepalive_<公司>.pid)`
+
+### 守护进程行为
+
+每个守护进程每 18 分钟循环执行：
+
+0. `pinchtab tab <id>` 切换到本公司的 keepalive 标签页（防止其他会话覆盖当前页）
+1. 读取 SQLite `profiles.is_logged_in`，若为 0 则退出
+2. `pinchtab reload` 刷新页面（连续 3 次失败 → `profile-logout` → 退出）
+3. JS dispatchEvent 关闭弹窗（"本人已知晓"等），4 层策略
+4. `pinchtab text` + `snap` 检测页面状态：
+   - 找到"退出"/"车辆管理" → 正常，进入下个周期
+   - 检测到"单位用户登录"/"扫码登录" → 登录过期 → `profile-logout` → 退出
+   - 检测到"频繁"/"异常操作"/"黑名单"等 → 风控 → `profile-logout` → 退出
+   - 状态模糊 → 通过 snap 二次确认，仍模糊则记录日志继续（容错）
+5. 日志写入 `违章查询/data/keepalive_<公司>.log`（含时间戳）
+
+**标签页持久化：** Tab ID 保存在 `违章查询/data/keepalive_tab_<公司>.txt`。守护进程重启时复用已有 Tab（不重复创建），Tab 失效时自动创建新 Tab 并导航到 `platform_url`。
+
+**多实例支持：** 如果 profiles 表中 `instance_port` 非空，守护进程通过 `PINCHTAB_PORT` 环境变量连接对应的 PinchTab daemon 实例，不同公司可运行在不同 Chrome 实例上。
 
 ***
 
@@ -910,7 +992,7 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 | 风控/限流检测            | `detect-rate-limit` 检测到关键词或连续3台 open_vehicle 失败 → 立即终止所有进程，发送飞书告警，保留进度 |
 | 二维码过期              | `poll-login --check-qr` 自动检测 → `pinchtab reload` 当前登录页直接刷新（不退回首页重进）→ 重新截图 → 重新发送飞书通知（最多 3 次）               |
 | 截图保存失败             | 重试一次；两次均失败提示用户手动截图                                                            |
-| 图片上传/发送失败          | `send-msg` 已通过 node.exe 直调（绕过 cmd.exe），图文合并正常；仍失败时降级独立图片+文字                      |
+| 图片上传/发送失败          | `send-msg` 通过 `shutil.which()` 解析 lark-cli 直接调用；仍失败时降级独立图片+文字                      |
 | 飞书消息发送失败           | 报告原因，回退本地展示，不阻塞主流程                                                            |
 | 姓名查不到飞书用户          | 间隔2秒最多重试3次；3次均失败降级为请求用户提供手机号                                                  |
 | 用户ID/群名查不到         | 间隔2秒最多重试3次；3次均失败提示用户换用手机号或直接提供 open\_id/chat\_id                              |
@@ -923,7 +1005,7 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 | 会话过期               | 重新登录（含飞书通知）                                                                   |
 | PinchTab daemon 断开 | `pinchtab health` 检查状态 → `pinchtab daemon restart` 重启                         |
 | lark-cli 权限错误      | 按 lark-shared skill 引导授权                                                      |
-| poll-login 消息发送损坏  | helper 内部 `_run()` 自动将 lark-cli.cmd → node.exe 直调，绕过 cmd.exe 避免参数编码损坏          |
+| poll-login 消息发送损坏  | helper 内部 `_run()` 强制 UTF-8 编码（PYTHONUTF8=1 + PYTHONIOENCODING=utf-8），Linux 上无编码问题 |
 
 ***
 
@@ -932,7 +1014,7 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 - **车牌自动识别：** `查粤B12345违章` → 粤→广东→导航 gab.122.gov.cn → 登录 → 输入车牌 → 生成报告
 - **批量：** `查成都公司违章` → 成都→四川→导航 gab.122.gov.cn → 登录 → 选择公司 → 车辆列表 → 逐台查 → 三重输出
 - **群通知（@指定人）：** `查成都公司违章，发到违章通知群，@任晏平` → 四川→截图→搜群→发群+@→轮询监听→查询→通知结果
-- **保活：** `保持12123登录` → 每18分钟刷新
+- **保活：** 登录成功后自动 `nohup` 启动 `keepalive_daemon.py`，完全独立于 Claude 会话持续保活
 
 ***
 
@@ -944,7 +1026,7 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 4. 二维码约5分钟有效，尽快发送
 5. **lark-cli 身份：** 发消息 `--as bot` | 查用户ID（手机号）`--as bot` | 查用户ID（姓名）`--as user`（通过 lark-contact）| 上传图片 `--as bot`
 6. **姓名查人优先：** 用户提供姓名时，优先通过 `lark-contact` skill 查找，失败时降级为请求手机号
-7. **Windows/MINGW64 中文兼容：** 详见「核心铁律 §2 中文隔离违规对照表」。禁止在 bash eval 中直接使用中文路径或中文参数。所有含中文的路径操作（截图、复制文件、创建目录）必须通过 Python 脚本。Python 路径：`C:\Users\zhanglei2145\AppData\Local\Programs\Python\Python313\python.exe`。脚本写入 `C:\Users\zhanglei2145\` 目录。
+7. **Linux UTF-8 兼容：** Linux 终端原生支持 UTF-8，可直接在 Bash 命令中使用中文路径和中文参数。Python 已自动配置 UTF-8 编码（PYTHONUTF8=1）。关键输出仍可通过 `-o FILE` 写入 UTF-8 文件确保跨进程正确读取。临时脚本写入 `/home/openclaw/` 目录。
 8. **本地回复（3.6.3）：** 发送飞书通知后，必须同时在当前对话中输出截图 `file:///` 链接和登录信息
 9. **登录入口统一：** 所有省份扫码登录使用 `https://gab.122.gov.cn/m/login?t=2`。省份 URL 用于登录后导航（车辆列表等）和报告展示
 10. **车牌自动识别：** 用户输入车牌号时，提取首字符匹配省份，用于确定省份上下文
@@ -953,7 +1035,7 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 13. **元素定位：** 通过 `pinchtab snap` 获取 ref 编号（如 `e5`、`e12`）。**每次页面导航后 ref 编号会重新分配**，必须重新 snap 获取新 ref 后再操作。翻页相关操作优先使用 `click-page` helper（内部用 JavaScript，不依赖 ref）
 14. **禁止推算：** 有违章车辆必须 `collect-violations` 逐条获取真实罚款和记分
 15. **跳过无违章车辆：** `unprocessed == 0` 且 `status == "正常"` 的车辆无需进入详情页
-16. **lark-cli 直调绕过 cmd.exe（Issue #8 修复）：** helper `_run()` 将 `lark-cli.cmd` 解析为 `[node.exe, run.js]` 直调，避免 `--content` JSON 中 emoji/中文被 cmd.exe 损坏。`_node_path()` 多路径搜索（npm 全局目录 > PATH > Program Files > nvm/fnm），`_lark_cli_base_cmd()` 搜多个 run.js 候选位置 + `npm ls -g` 包路径解析，永不静默回退到 .cmd（回退时有 stderr 警告）
+16. **lark-cli 直调：** helper `_run()` 直接使用 PATH 上的 `lark-cli` 二进制（或通过 `shutil.which()` 解析的完整路径），Linux 上不经过任何中间包裹器。`_node_path()` 优先使用 `shutil.which('node')` 搜索 PATH。
 17. **Python stdout 编码（Issue #2 三重保障修复）：** helper 启动时：(1) 强制覆盖 `PYTHONUTF8=1` + `PYTHONIOENCODING=utf-8`（非 setdefault）；(2) `TextIOWrapper` 先包裹原始 buffer（绕过控制台编码）；(3) `reconfigure(encoding='utf-8')` 兜底。子进程 `_run()` env 也强制覆盖。同时包裹 `sys.stdin` 确保 piped 输入为 UTF-8
 18. **路径输出乱码：** 通过 `-o FILE` 将含中文路径写入 UTF-8 文件，外部脚本读取文件获取正确路径
 19. **poll-login 退出码：** 0=已登录（飞书回复或浏览器自动检测） / 1=超时或达刷新上限 / 2=用户反馈 QR 过期 / 3=浏览器检测 QR 过期
@@ -968,9 +1050,9 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 28. **终端编码：** 终端显示中文乱码是已知问题，文件内数据正常。关键输出走 `-o FILE` 写入 UTF-8 文件获取正确内容。
 29. **单位用户优先：** 判断已登录状态后，调用 `get-login-type` 检测。单位用户直接继续；只有实际查询遇到非单位报错时才重新登录。不要因为不确定就退出重登。
 30. **弹窗遮挡（Issue #4 修复）：** `_close_popup()` 四层策略：(1) JavaScript `dispatchEvent` 点击关闭/×/取消按钮（绕过 pinchtab occlusion 检查）；(2) pinchtab click 关闭按钮（occlusion 失败时自动降级为 JS dispatchEvent）；(3) Escape 键事件（KeyEvent + activeElement）；(4) 直接 DOM 隐藏 modal/overlay/fixed 元素（最后的保险）。确保查看违章详情后能可靠关闭弹窗返回列表页。
-31. **禁止随意退出登录：** 检测到已登录（有"退出"按钮、单位用户菜单）时严禁退出。只需验证省份和公司匹配当前任务即可继续。只有实际查询时遇到非单位用户报错，才重新登录。
+31. **禁止随意退出登录：** 检测到已登录（有"退出"按钮、公司列表菜单）时严禁退出。只需验证省份和公司匹配当前任务即可继续。只有实际查询时遇到非单位用户报错，才重新登录。
 32. **风控熔断机制：** `detect-rate-limit` 检测页面关键词（频繁/异常操作/黑名单/第三方软件等）。`open-vehicle` 连续 3 次失败也触发熔断。触发后立即终止所有查询进程，保留进度，发送飞书告警。
-33. **保活生命周期：** 登录成功后启动保活（每 18 分钟 reload + dismiss popup）；查询正常完成后保活继续运行不停止。保活也需检测风控，发现异常立即停止。
+33. **保活生命周期：** 登录成功后通过 `nohup` + `disown` 启动 `keepalive_daemon.py`，完全独立于 Claude 会话（会话终止后继续运行）。守护进程每 18 分钟 reload + dismiss popup 并检测登录态和风控。`is_logged_in=0` 或检测到异常时自动退出。可通过 `--status` / `--stop` 查看状态和停止。
 34. **图片上传方式：** `lark-cli im images create --file` 无法读取含中文路径文件。改用 stdin 管道：`cat /path/to/img.png | lark-cli im images create --as bot --file "image=-" --data '{"image_type":"message"}'`
 35. **总页数动态获取：** 不强制一开始获取全量页数。每页查询时通过可见分页链接获取当前 total_pages，动态更新。翻页后验证 URL 是否变化（防止假翻页）。连续 2 页检测到 0 辆车时认为到达末尾。
 36. **SQLite 增量对比：** `collect-violations` 查询前先读取 SQLite 中该车牌已有记录。已存在且状态未变的跳过；状态变更的（未处理→已处理）重新查询详情并更新。
@@ -982,4 +1064,5 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 42. **标签页会话隔离：** 多个 Claude 进程共用同一 PinchTab daemon（同一 Chrome 实例）。每次执行必须通过 `new-tab` 创建专属标签页，后续所有操作前先 `switch-tab --id <tab_id>` 切回本会话标签页。Cookie/session 在所有标签页间共享，一次登录即可，但页面导航互不干扰。
 43. **多进程文件隔离：** 临时 Python 脚本路径含 `{pid}` 后缀（`batch_query_{pid}.py` 等），不同进程互不覆盖。进度文件按公司+日期隔离（`details_progress_<公司>_<日期>.json`），支持多进程并行查不同公司，且 Claude 上下文满重启后同一天自动续跑。SQLite 开启 WAL 模式支持多进程并发读写。
 44. **Profile 隔离与登录复用：** 每个公司绑定一个 PinchTab Profile（`profiles` 表）。同一公司的多个查询进程复用同一 Profile（共享 cookie/登录态），通过 `new-tab` 隔离页面导航。不同公司使用不同 Profile。每次执行前先 `profile-lookup` 查映射表，命中则跳过登录直接查询。首次登录成功后 `profile-register` 写入映射表。
+45. **保活守护进程：** `keepalive_daemon.py` 通过 `nohup` + `disown` 启动后完全独立于 Claude 会话。PID 文件在 `违章查询/data/keepalive_<公司>.pid`，日志在 `违章查询/data/keepalive_<公司>.log`。启动前先 `--status` 检查是否已有实例运行（防止重复启动）。Claude 会话结束时守护进程不受影响，继续在后台每 18 分钟执行保活周期。
 

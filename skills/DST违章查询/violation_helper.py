@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 DST违章查询 — 12123 车辆违章查询辅助工具。
-Windows/MINGW64 兼容：通过 Python 直接调用（不走 cmd.exe），中文参数通过脚本文件或 stdin 传入。
-所有 bash 调用使用 `python /path/to/violation_helper.py <subcommand>`，不使用 cmd.exe 中转。
+跨平台（Windows/Linux）：通过 Python 直接调用，中文参数通过脚本文件或 stdin 传入。
+所有 bash 调用使用 `python /path/to/violation_helper.py <subcommand>`。
 
 全局选项（所有子命令共享，必须在子命令之前）：
   --output FILE, -o FILE  将标准输出同时写入文件（UTF-8），绕过终端编码问题
@@ -330,7 +330,7 @@ LOGIN_KEYWORDS = ["已登录", "登录成功", "好了", "ok", "OK", "好的"]
 # that indicate the 12123 page has been logged in successfully.
 # After scanning QR, 12123 lands on a company selection list page.
 LOGIN_INDICATORS = [
-    "单位用户", "单位名称", "请选择", "选择单位",
+    "公司列表", "公司名称", "请选择", "选择单位",
     "租赁车辆", "机动车", "违法", "业务办理",
     "退出", "首页", "确定",
 ]
@@ -1656,7 +1656,7 @@ def cmd_init():
     """
     # 1. Copy self to temp dir atomically (write to tmp file then rename)
     src = os.path.abspath(sys.argv[0])
-    temp_dir = os.environ.get("TEMP", os.environ.get("TMP", os.path.dirname(src)))
+    temp_dir = os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp"
     dst = os.path.join(temp_dir, "violation_helper.py")
     tmp_dst = dst + f".{os.getpid()}.tmp"
     shutil.copy2(src, tmp_dst)
@@ -3397,7 +3397,7 @@ def cmd_get_login_type():
     result = {"type": "none", "details": ""}
 
     # Check for unit user indicators
-    unit_indicators = ["单位用户", "单位名称", "单位信息", "租赁车辆", "企业用户",
+    unit_indicators = ["公司列表", "公司名称", "单位信息", "租赁车辆", "企业用户",
                        "unit", "company", "enterprise"]
     personal_indicators = ["个人用户", "个人中心", "我的车辆", "驾驶人",
                            "personal", "individual"]
@@ -3546,7 +3546,7 @@ def cmd_check_login_valid():
     combined = text + " " + snap
 
     has_logout = "退出" in combined
-    has_unit = "单位用户" in combined or "租赁车" in combined
+    has_unit = "公司列表" in combined or "租赁车" in combined
     has_personal = "个人用户" in combined
     is_logged_in = has_logout and not "单位用户登录" in snap and not "个人用户登录" in snap
 
