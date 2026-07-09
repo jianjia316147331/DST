@@ -18,6 +18,8 @@ import sys
 import time
 import re
 import io
+import urllib.request
+from datetime import datetime
 
 # ============================================================
 # Global: output file (set before subcommand dispatch)
@@ -231,7 +233,7 @@ def _find_project_root():
     return os.getcwd()
 
 def _get_query_dir():
-    return _find_project_root()
+    return os.path.join(_find_project_root(), "violation_query")
 
 def _get_screenshot_dir():
     d = os.path.join(_get_query_dir(), "screenshots")
@@ -334,11 +336,13 @@ LOGIN_KEYWORDS = ["已登录", "登录成功", "好了", "ok", "OK", "好的"]
 # Post-login business indicators (Tier 2, also used as confirmation in Tier 1).
 # Ordered by reliability: "退出" is the strongest signal.
 POST_LOGIN_KEYWORDS = [
+    # Only keywords that are ONLY visible when logged in.
+    # Public nav items like "业务办理"/"违法查询"/"首页" are visible to
+    # everyone and must NOT be here — they cause false positives.
     "退出",
+    "我的主页",
     "公司列表", "公司名称", "选择单位",
     "车辆管理", "租赁车辆",
-    "业务办理", "违法查询",
-    "机动车", "违法", "首页",
 ]
 
 # Login page indicators — signals that we're NOT logged in (or session expired).
@@ -562,21 +566,69 @@ def _run(args, **kwargs):
     Automatically resolves pinchtab/lark-cli paths:
     - Sentinel strings "pinchtab"/"lark-cli" → resolved
     - Pre-resolved .cmd paths → replaced with direct node invocation (bypasses cmd.exe)
-    Sets PYTHONIOENCODING=utf-8 and PYTHONUTF8=1 for subprocess."""
+    Sets PYTHONIOENCODING=utf-8 and PYTHONUTF8=1 for subprocess.
+
+    Tab isolation: if VIOLATION_TAB_ID env var is set, automatically injects
+    --tab <id> into pinchtab commands that support it (nav, eval, click, snap,
+    text, find, wait, screenshot, reload, back).  Commands like 'tab' and
+    daemon-level commands are excluded.  This allows multiple sessions to
+    operate on different tabs within the same browser instance without
+    interfering with each other."""
     # Only check sentinel strings - cached path getters cause infinite recursion
     # when called during initialization (lark_cli_path -> run_silent -> run -> get_lark_cached...)
     if args and args[0] == "pinchtab":
         args = _pinchtab_base_cmd() + list(args[1:])
     if args and args[0] == "lark-cli":
         args = _lark_cli_base_cmd() + list(args[1:])
+
+    # ── Instance isolation: inject --server <url> for pinchtab commands ──
+    instance_port = os.environ.get("VIOLATION_INSTANCE_PORT", "")
+    _is_pt = args and args[0] and ("pinchtab" in os.path.basename(str(args[0])).lower())
+    if instance_port and _is_pt and len(args) > 1:
+        args = list(args)
+        args.insert(1, "--server")
+        args.insert(2, f"http://127.0.0.1:{instance_port}")
+
+    # ── Tab isolation: inject --tab <id> for tab-aware pinchtab commands ──
+    _TAB_AWARE = frozenset({
+        "nav", "eval", "click", "dblclick", "snap", "text", "find", "wait",
+        "screenshot", "reload", "back", "attr", "box", "capture", "check",
+        "checked", "console", "count", "enabled", "fill", "hover",
+    })
+    tab_id = os.environ.get("VIOLATION_TAB_ID", "")
+    if tab_id and _is_pt and len(args) > 1:
+        # Find subcommand position: scan for the first arg matching a known
+        # subcommand name (skipping global flags like --server and their values).
+        cmd_idx = None
+        for i in range(1, len(args)):
+            if args[i] in _TAB_AWARE:
+                cmd_idx = i
+                break
+        if cmd_idx is not None:
+            args.insert(cmd_idx + 1, "--tab")
+            args.insert(cmd_idx + 2, tab_id)
+
     env = kwargs.pop("env", os.environ.copy())
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     timeout = kwargs.pop("timeout", 30)
-    return subprocess.run(
-        args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+    p = subprocess.run(
+        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         env=env, timeout=timeout, **kwargs
     )
+    # Python 3.6 compat: decode manually
+    p.stdout = p.stdout.decode("utf-8", errors="replace") if isinstance(p.stdout, bytes) else p.stdout
+    p.stderr = p.stderr.decode("utf-8", errors="replace") if isinstance(p.stderr, bytes) else p.stderr
+    return p
+
+def _parse_tab_ids(tab_output):
+    """Extract tab IDs from pinchtab tab JSON output.
+    Returns list of hex tab IDs (strings)."""
+    try:
+        data = json.loads(tab_output)
+        return [t["id"] for t in data.get("tabs", []) if "id" in t]
+    except (json.JSONDecodeError, KeyError):
+        return []
 
 def _run_silent(args, **kwargs):
     """Run and return CompletedProcess, suppressing errors."""
@@ -786,29 +838,44 @@ def cmd_gen_qr_fallback():
 # ============================================================
 
 def cmd_gen_result_msg():
-    """Generate query completion notification post message JSON."""
+    """Generate query completion notification post message JSON.
+    Only includes a simple summary — no report/db paths, no Feishu docs."""
     p = {
         "company": "", "date": "", "vehicle_count": "0",
-        "violation_count": "0", "fine_amount": "0",
-        "db_path": "", "report_path": "",
+        "scanned_count": "0", "new_vehicle_count": "0",
+        "new_violation_count": "0", "new_points": "0", "new_unpaid_fine": "0",
+        "resolved_count": "0",
         "target_type": "personal", "user_id": "", "user_name": ""
     }
     _read_stdin_json(p)
     args = sys.argv[2:]
     i = 0
     while i < len(args):
-        for key in ["company", "date", "vehicle_count", "violation_count",
-                     "fine_amount", "db_path", "report_path", "target_type",
-                     "user_id", "user_name"]:
+        for key in ["company", "date", "vehicle_count", "scanned_count",
+                     "new_vehicle_count",
+                     "new_violation_count", "new_points", "new_unpaid_fine",
+                     "resolved_count",
+                     "target_type", "user_id", "user_name"]:
             if args[i] == f"--{key.replace('_', '-')}" and i + 1 < len(args):
                 p[key] = args[i + 1]; i += 2; break
         else:
             i += 1
 
     title = "✅ 12123违章查询完成"
-    summary = f"📊 查询完成\n🏢 {p['company']} 🕐 {p['date']}\n🚗 {p['vehicle_count']}台 ⚠️ {p['violation_count']}条 💰 {p['fine_amount']}元"
+    # Simple summary: 7 key metrics
+    lines = [
+        f"🏢 {p['company']}  🕐 {p['date']}",
+        f"📋 扫描车辆：{p['scanned_count']} 台  🚗 查询车辆：{p['vehicle_count']} 台  🆕 新入库：{p['new_vehicle_count']} 台",
+        f"⚠️ 新增违章：{p['new_violation_count']} 条",
+        f"📛 新增扣分：{p['new_points']} 分",
+        f"💰 新增待缴费：{p['new_unpaid_fine']} 元",
+    ]
+    # Show resolved count only if > 0
+    if p.get("resolved_count") and p["resolved_count"] != "0":
+        lines.append(f"✅ 对比历史已处理：{p['resolved_count']} 条")
+    summary = "\n".join(lines)
 
-    content_blocks = [[{"tag": "text", "text": f"{summary}\n\n📄 报告已保存至本地：\n{p.get('report_path', '')}\n\n🗄️ 数据库已保存至：\n{p.get('db_path', '')}\n\n数据来源于12123平台，仅供参考。"}]]
+    content_blocks = [[{"tag": "text", "text": f"{summary}\n\n数据来源于12123平台，仅供参考。"}]]
 
     msg = {"zh_cn": {"title": title, "content": content_blocks}}
     print(json.dumps(msg, ensure_ascii=False))
@@ -1148,12 +1215,15 @@ def cmd_db_insert_violation():
 # ============================================================
 # Subcommand: profile-lookup
 # ============================================================
+# Subcommand: keepalive-health
+# ============================================================
 
-def cmd_profile_lookup():
-    """Look up a company's profile mapping.
+def cmd_keepalive_health():
+    """Check keepalive daemon health for a company.
     Args: --company "公司名"
-    Returns: JSON {found: true, profile_name, profile_id, platform_url, instance_port, last_login, is_logged_in}
-             or {found: false} if not registered.
+    Returns JSON: {alive: bool, state: str, last_check: str, cycle_count: int, pid: int}
+    alive=true only if: health file exists AND < 5 min stale AND a process with
+    the matching PID is running.
     """
     p = {"company": ""}
     args = sys.argv[2:]
@@ -1164,28 +1234,406 @@ def cmd_profile_lookup():
         else:
             i += 1
 
+    if not p["company"]:
+        print(json.dumps({"alive": False, "error": "missing --company"}, ensure_ascii=False))
+        sys.exit(1)
+
+    # Build health file path (same convention as keepalive daemon)
+    safe = p["company"].replace("/", "_").replace(" ", "_")
+    data_dir = _get_data_dir()
+    health_file = os.path.join(data_dir, f"keepalive_health_{safe}.json")
+
+    if not os.path.exists(health_file):
+        # Fuzzy fallback: scan data dir for matching health files
+        data_dir = _get_data_dir()
+        candidates = []
+        try:
+            for fname in os.listdir(data_dir):
+                if fname.startswith("keepalive_health_") and p["company"] in fname:
+                    candidates.append(os.path.join(data_dir, fname))
+        except OSError:
+            pass
+        if len(candidates) == 1:
+            health_file = candidates[0]
+        elif len(candidates) > 1:
+            print(json.dumps({
+                "alive": False,
+                "reason": "ambiguous health file",
+                "company": p["company"],
+                "candidates": [os.path.basename(c) for c in candidates],
+                "hint": f"找到 {len(candidates)} 个匹配的 health file，请用完整公司名重试"
+            }, ensure_ascii=False))
+            return
+        else:
+            print(json.dumps({"alive": False, "reason": "no health file", "company": p["company"],
+                "hint": "用 profile-lookup --company 或 profile-list 确认完整公司名"}, ensure_ascii=False))
+            return
+
+    try:
+        with open(health_file, "r", encoding="utf-8") as f:
+            health = json.load(f)
+    except Exception:
+        print(json.dumps({"alive": False, "reason": "health file unreadable", "company": p["company"]}, ensure_ascii=False))
+        return
+
+    state = health.get("state", "unknown")
+    last_check = health.get("last_check", "")
+
+    # Freshness check: health file must be < 5 min stale
+    try:
+        last_dt = datetime.strptime(last_check, "%Y-%m-%d %H:%M:%S")
+        stale_seconds = (datetime.now() - last_dt).total_seconds()
+    except Exception:
+        stale_seconds = 9999
+
+    alive = stale_seconds < 300  # 5 minutes
+
+    # Also check PID if available (daemon may have died without updating health)
+    pid_file = os.path.join(data_dir, f"keepalive_{safe}.pid")
+    pid_from_file = None
+    if os.path.exists(pid_file):
+        try:
+            with open(pid_file, "r") as f:
+                pid_from_file = int(f.read().strip())
+            # Check if process is running
+            os.kill(pid_from_file, 0)
+        except (ValueError, OSError):
+            alive = False
+
+    print(json.dumps({
+        "alive": alive,
+        "state": state,
+        "last_check": last_check,
+        "stale_seconds": round(stale_seconds, 1),
+        "cycle_count": health.get("cycle_count", 0),
+        "tab_id": health.get("tab_id", ""),
+        "instance_port": health.get("instance_port"),
+        "pid": pid_from_file,
+        "company": p["company"]
+    }, ensure_ascii=False))
+
+
+# ============================================================
+# Subcommand: ensure-keepalive
+# ============================================================
+
+def cmd_ensure_keepalive():
+    """Auto-start keepalive daemon for a company if not already running.
+    Designed to be called after successful login (profile-register).
+    Prevents duplicate keepalive processes.
+
+    Args:
+      --company NAME          Company name (required)
+      --project-root DIR      Project root directory (required)
+      --notify-user NAME       (optional) Person to notify for QR recovery
+      --notify-phone PHONE     (optional) Phone number for QR recovery
+      --notify-chat CHAT       (optional) Group name for QR recovery
+
+    Returns JSON:
+      {ok: true, action: "started"|"already_running"|"skipped", ...}
+    """
+    p = {"company": "", "project_root": "", "notify_user": "", "notify_phone": "", "notify_chat": ""}
+    args = sys.argv[2:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--company" and i + 1 < len(args):
+            p["company"] = args[i + 1]; i += 2
+        elif args[i] == "--project-root" and i + 1 < len(args):
+            p["project_root"] = args[i + 1]; i += 2
+        elif args[i] == "--notify-user" and i + 1 < len(args):
+            p["notify_user"] = args[i + 1]; i += 2
+        elif args[i] == "--notify-phone" and i + 1 < len(args):
+            p["notify_phone"] = args[i + 1]; i += 2
+        elif args[i] == "--notify-chat" and i + 1 < len(args):
+            p["notify_chat"] = args[i + 1]; i += 2
+        else:
+            i += 1
+
+    company = p["company"]
+    project_root = p["project_root"]
+
+    if not company or not project_root:
+        print(json.dumps({"ok": False, "error": "missing --company or --project-root"}, ensure_ascii=False))
+        sys.exit(1)
+
+    # Step 1: Check if is_logged_in
     _init_db()
     db_path = _get_db_path()
     conn = sqlite3.connect(db_path)
     cur = conn.execute(
-        "SELECT company_name, profile_name, profile_id, platform_url, instance_port, last_login, is_logged_in FROM profiles WHERE company_name = ?",
-        (p["company"],))
+        "SELECT is_logged_in FROM profiles WHERE company_name = ?", (company,))
     row = cur.fetchone()
     conn.close()
 
-    if row:
+    if not row or not row[0]:
         print(json.dumps({
-            "found": True,
-            "company_name": row[0],
-            "profile_name": row[1],
-            "profile_id": row[2],
-            "platform_url": row[3],
-            "instance_port": row[4],
-            "last_login": row[5],
-            "is_logged_in": bool(row[6])
+            "ok": False, "action": "skipped",
+            "reason": "is_logged_in is 0 or company not found — not starting keepalive"
         }, ensure_ascii=False))
+        return
+
+    # Step 2: Check if keepalive daemon is already running
+    # 2a: Check PID file + process
+    safe = company.replace("/", "_").replace(" ", "_")
+    data_dir = _get_data_dir()
+    pid_file = os.path.join(data_dir, f"keepalive_{safe}.pid")
+    already_running = False
+    existing_pid = None
+
+    if os.path.exists(pid_file):
+        try:
+            with open(pid_file, "r") as f:
+                existing_pid = int(f.read().strip())
+            os.kill(existing_pid, 0)  # signal 0 = check if process exists
+            already_running = True
+        except (ValueError, OSError):
+            pass
+
+    # 2b: Check systemd user service
+    if not already_running:
+        service_name = f"keepalive-{safe}.service"
+        try:
+            result = _run(["systemctl", "--user", "is-active", service_name], timeout=5)
+            if result.stdout.strip() == "active":
+                already_running = True
+        except Exception:
+            pass
+
+    if already_running:
+        # Already running — just update notify config if provided
+        if p["notify_user"] or p["notify_phone"] or p["notify_chat"]:
+            _save_notify_config(company, project_root, p)
+        print(json.dumps({
+            "ok": True, "action": "already_running",
+            "pid": existing_pid, "company": company
+        }, ensure_ascii=False))
+        return
+
+    # Step 3: Start systemd service
+    service_name = f"keepalive-{safe}.service"
+
+    # Persist notify config before starting (so daemon picks it up)
+    if p["notify_user"] or p["notify_phone"] or p["notify_chat"]:
+        _save_notify_config(company, project_root, p)
+
+    try:
+        # Enable linger (one-time setup, idempotent)
+        _run_silent(["loginctl", "enable-linger"], timeout=5)
+
+        # Start and enable the service
+        start_result = _run(["systemctl", "--user", "start", service_name], timeout=10)
+        if start_result.returncode != 0:
+            print(json.dumps({
+                "ok": False, "action": "failed",
+                "reason": f"systemctl start failed: {start_result.stderr.strip()[:200]}",
+                "service": service_name
+            }, ensure_ascii=False))
+            sys.exit(1)
+
+        enable_result = _run(["systemctl", "--user", "enable", service_name], timeout=10)
+        if enable_result.returncode != 0:
+            print(json.dumps({
+                "ok": True, "action": "started",
+                "warning": f"service started but enable failed: {enable_result.stderr.strip()[:200]}",
+                "service": service_name, "company": company
+            }, ensure_ascii=False))
+            return
+
+        print(json.dumps({
+            "ok": True, "action": "started",
+            "service": service_name, "company": company
+        }, ensure_ascii=False))
+    except Exception as e:
+        print(json.dumps({
+            "ok": False, "action": "failed",
+            "reason": str(e), "service": service_name
+        }, ensure_ascii=False))
+        sys.exit(1)
+
+
+def _save_notify_config(company, project_root, p):
+    """Persist notify target config for keepalive daemon auto-recovery.
+    Writes keepalive_notify_<company>.json in violation_query/data/."""
+    safe = company.replace("/", "_").replace(" ", "_")
+    data_dir = os.path.join(project_root, "violation_query", "data")
+    os.makedirs(data_dir, exist_ok=True)
+    notify_file = os.path.join(data_dir, f"keepalive_notify_{safe}.json")
+
+    notify = {}
+    if p.get("notify_chat"):
+        # For chat notify, we'd need to search for chat_id. For now, save raw info.
+        notify["type"] = "chat"
+        notify["chat_name"] = p["notify_chat"]
+        notify["label"] = p["notify_chat"]
+    elif p.get("notify_user"):
+        notify["type"] = "user"
+        notify["label"] = p["notify_user"]
+    elif p.get("notify_phone"):
+        notify["type"] = "phone"
+        notify["label"] = p["notify_phone"]
+
+    if notify:
+        notify["company"] = company
+        notify["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(notify_file, "w", encoding="utf-8") as f:
+            json.dump(notify, f, ensure_ascii=False, indent=2)
+
+
+# ============================================================
+
+def _build_profile_result(row):
+    """Build profile result dict from a DB row. Also attaches keepalive health."""
+    company_name = row[0]
+    result = {
+        "found": True,
+        "company_name": company_name,
+        "profile_name": row[1],
+        "profile_id": row[2],
+        "platform_url": row[3],
+        "instance_port": row[4],
+        "last_login": row[5],
+        "is_logged_in": bool(row[6])
+    }
+    # Check keepalive health file freshness
+    safe = company_name.replace("/", "_").replace(" ", "_")
+    health_file = os.path.join(_get_data_dir(), f"keepalive_health_{safe}.json")
+    keepalive_alive = False
+    keepalive_state = "unknown"
+    if os.path.exists(health_file):
+        try:
+            with open(health_file, "r", encoding="utf-8") as f:
+                health = json.load(f)
+            last_check = health.get("last_check", "")
+            if last_check:
+                last_dt = datetime.strptime(last_check, "%Y-%m-%d %H:%M:%S")
+                stale_seconds = (datetime.now() - last_dt).total_seconds()
+                keepalive_alive = stale_seconds < 300
+                keepalive_state = health.get("state", "unknown")
+        except Exception:
+            pass
+
+    # Verify PinchTab instance is actually running (when instance_port is set)
+    instance_running = False
+    instance_port = row[4]
+    if instance_port:
+        try:
+            pt = _pinchtab_base_cmd()
+            r = _run([pt[0], "instances", "--json"], timeout=10)
+            instances = json.loads(r.stdout)
+            for inst in instances:
+                if (str(inst.get("port", "")) == str(instance_port)
+                        and inst.get("status") == "running"):
+                    instance_running = True
+                    break
+        except Exception:
+            pass
+
+    # Instance down overrides keepalive health
+    if instance_port and not instance_running:
+        keepalive_alive = False
+        keepalive_state = "instance_down"
+
+    result["keepalive_alive"] = keepalive_alive
+    result["keepalive_state"] = keepalive_state
+    result["instance_running"] = instance_running
+    return result
+
+
+def cmd_profile_lookup():
+    """Look up a company's profile mapping with fuzzy fallback.
+    Args: --company "公司名"
+    - First tries exact match (WHERE company_name = ?)
+    - If not found, tries fuzzy match (WHERE company_name LIKE '%keyword%')
+    - Single fuzzy result: auto-returns with match_type: "fuzzy"
+    - Multiple fuzzy results: returns candidates for user confirmation
+    Returns: JSON {found: true, match_type: "exact"|"fuzzy", ...profile fields}
+             or {found: false, candidates: [...], need_confirm: true} when ambiguous
+             or {found: false} when no match at all.
+    """
+    p = {"company": ""}
+    args = sys.argv[2:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--company" and i + 1 < len(args):
+            p["company"] = args[i + 1]; i += 2
+        else:
+            i += 1
+
+    keyword = p["company"]
+    if not keyword:
+        print(json.dumps({"found": False, "error": "missing --company"}, ensure_ascii=False))
+        sys.exit(1)
+
+    _init_db()
+    db_path = _get_db_path()
+    conn = sqlite3.connect(db_path)
+
+    # --- Tier 1: exact match ---
+    cur = conn.execute(
+        "SELECT company_name, profile_name, profile_id, platform_url, instance_port, last_login, is_logged_in FROM profiles WHERE company_name = ?",
+        (keyword,))
+    row = cur.fetchone()
+    if row:
+        conn.close()
+        result = _build_profile_result(row)
+        result["match_type"] = "exact"
+        print(json.dumps(result, ensure_ascii=False))
+        return
+
+    # --- Tier 2: fuzzy match (LIKE) ---
+    cur = conn.execute(
+        "SELECT company_name, profile_name, profile_id, platform_url, instance_port, last_login, is_logged_in FROM profiles WHERE company_name LIKE ?",
+        (f"%{keyword}%",))
+    rows = cur.fetchall()
+    conn.close()
+
+    if len(rows) == 0:
+        # No match at all — include diagnostic hints
+        print(json.dumps({"found": False}, ensure_ascii=False))
+    elif len(rows) == 1:
+        # Single fuzzy match — auto-select
+        result = _build_profile_result(rows[0])
+        result["match_type"] = "fuzzy"
+        print(json.dumps(result, ensure_ascii=False))
     else:
-        print(json.dumps({"found": False}))
+        # Multiple fuzzy matches — return candidates for user confirmation
+        candidates = []
+        for r in rows:
+            candidates.append({
+                "company_name": r[0],
+                "profile_name": r[1],
+                "platform_url": r[3],
+                "is_logged_in": bool(r[6])
+            })
+        print(json.dumps({
+            "found": False,
+            "need_confirm": True,
+            "candidates": candidates,
+            "hint": f"找到 {len(candidates)} 家含「{keyword}」的公司，请确认是哪一家"
+        }, ensure_ascii=False))
+
+
+def cmd_profile_list():
+    """List all registered company profiles.
+    Returns: JSON {profiles: [{company_name, profile_name, platform_url, is_logged_in, last_login}, ...], count: N}
+    """
+    _init_db()
+    db_path = _get_db_path()
+    conn = sqlite3.connect(db_path)
+    cur = conn.execute(
+        "SELECT company_name, profile_name, platform_url, is_logged_in, last_login FROM profiles ORDER BY company_name")
+    rows = cur.fetchall()
+    conn.close()
+    profiles = []
+    for r in rows:
+        profiles.append({
+            "company_name": r[0],
+            "profile_name": r[1],
+            "platform_url": r[2],
+            "is_logged_in": bool(r[3]),
+            "last_login": r[4]
+        })
+    print(json.dumps({"profiles": profiles, "count": len(profiles)}, ensure_ascii=False))
 
 # ============================================================
 # Subcommand: profile-register
@@ -1228,8 +1676,35 @@ def cmd_profile_register():
          p["platform_url"], p["instance_port"], now))
     conn.commit()
     conn.close()
-    print(json.dumps({"ok": True, "company": p["company"], "profile_name": p["profile_name"]},
-                     ensure_ascii=False))
+
+    # Auto-discover instance port (unless already explicitly provided)
+    session_mgr = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "session_manager.py")
+    # Also check in skill directory
+    if not os.path.exists(session_mgr):
+        skill_dir = os.path.join(os.path.expanduser("~"), ".claude", "skills",
+                                 "DST违章查询", "session_manager.py")
+        if os.path.exists(skill_dir):
+            session_mgr = skill_dir
+
+    discover_result = {"ran": False}
+    if os.path.exists(session_mgr) and not p.get("instance_port"):
+        try:
+            r = subprocess.run(
+                [sys.executable, session_mgr, "instance-discover"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, timeout=15
+            )
+            if r.returncode == 0:
+                discover_result = json.loads(r.stdout)
+                discover_result["ran"] = True
+        except Exception:
+            pass
+
+    result = {"ok": True, "company": p["company"], "profile_name": p["profile_name"]}
+    if discover_result.get("ran"):
+        result["instance_discover"] = discover_result
+    print(json.dumps(result, ensure_ascii=False))
 
 # ============================================================
 # Subcommand: profile-logout
@@ -1343,6 +1818,65 @@ def cmd_batch_get_id():
     print(result.stdout, end="")
 
 # ============================================================
+# Subcommand: save-notify
+# ============================================================
+
+def cmd_save_notify():
+    """Persist auto-recovery notify target for keepalive daemon.
+    Called by the query flow after successful login so the daemon knows
+    who to notify for future auto-recovery QR codes.
+
+    When type=chat, optional --at-user-id and --at-user-name can be provided
+    so the keepalive recovery QR @mentions the same person as the query flow.
+
+    Args: --company "公司名" --project-root DIR --type user|chat --id <open_id|chat_id> --label "姓名/群名"
+          [--at-user-id ou_xxx] [--at-user-name "姓名"]  (group @mention target)
+    """
+    p = {"company": "", "project_root": "", "type": "", "id": "", "label": "",
+         "at_user_id": "", "at_user_name": ""}
+    args = sys.argv[2:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--company" and i + 1 < len(args):
+            p["company"] = args[i + 1]; i += 2
+        elif args[i] == "--project-root" and i + 1 < len(args):
+            p["project_root"] = args[i + 1]; i += 2
+        elif args[i] == "--type" and i + 1 < len(args):
+            p["type"] = args[i + 1]; i += 2
+        elif args[i] == "--id" and i + 1 < len(args):
+            p["id"] = args[i + 1]; i += 2
+        elif args[i] == "--label" and i + 1 < len(args):
+            p["label"] = args[i + 1]; i += 2
+        elif args[i] == "--at-user-id" and i + 1 < len(args):
+            p["at_user_id"] = args[i + 1]; i += 2
+        elif args[i] == "--at-user-name" and i + 1 < len(args):
+            p["at_user_name"] = args[i + 1]; i += 2
+        else:
+            i += 1
+
+    if not p["company"] or not p["project_root"] or not p["type"] or not p["id"]:
+        print(json.dumps({"ok": False, "error": "missing required args (--company, --project-root, --type, --id)"}))
+        sys.exit(1)
+
+    safe = p["company"].replace("/", "_").replace(" ", "_")
+    data_dir = os.path.join(p["project_root"], "violation_query", "data")
+    os.makedirs(data_dir, exist_ok=True)
+    notify_file = os.path.join(data_dir, f"keepalive_notify_{safe}.json")
+
+    notify = {"type": p["type"], "id": p["id"], "label": p["label"]}
+    if p["at_user_id"]:
+        notify["at_user_id"] = p["at_user_id"]
+    if p["at_user_name"]:
+        notify["at_user_name"] = p["at_user_name"]
+    try:
+        with open(notify_file, "w", encoding="utf-8") as f:
+            json.dump(notify, f, ensure_ascii=False)
+        print(json.dumps({"ok": True, "file": notify_file}))
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        sys.exit(1)
+
+# ============================================================
 # Subcommand: get-screenshot-dir
 # ============================================================
 
@@ -1390,17 +1924,23 @@ def cmd_pt_wait():
 # Subcommand: poll-login
 # ============================================================
 #
-# Exit codes:
-#   0 = LOGIN_CONFIRMED (user replied with 已登录/OK/etc)
-#   1 = TIMEOUT (no reply in time window, QR may or may not be expired)
-#   2 = QR_EXPIRED (user explicitly reported QR expired in chat)
-#   3 = QR_EXPIRED_DETECTED (polling exhausted, browser check confirmed QR expired)
+# Two modes:
+#   browser-only  — Pure browser detection, NO Feishu API calls.
+#                    Login: pinchtab text+snap keyword match every interval.
+#                    QR expiry: pinchtab eval JS every ~60s.
+#   legacy         — Feishu message polling + optional browser auto-detect.
+#                    (Kept for backward compatibility with group-chat scenarios.)
 #
-# Interval strategy:
-#   0-60s:   10s interval (6 polls/min, casual wait)
-#   60-180s:  5s interval (24 polls in 2min, aggressive—user may have missed notification)
-#   180-300s: 15s interval (8 polls in 2min, tapering off)
-#   Total: ~38 polls over 5 minutes
+# Exit codes:
+#   0 = LOGIN_CONFIRMED (browser detected login, or user replied 已登录/OK)
+#   1 = TIMEOUT (no confirmation in time window)
+#   2 = QR_EXPIRED (user explicitly reported QR expired in chat; legacy only)
+#   3 = QR_EXPIRED_DETECTED (browser check confirmed QR expired)
+#
+# Interval strategy (both modes):
+#   0-60s:   10s interval
+#   60-180s:  5s interval (aggressive — QR may be expiring soon)
+#   180-300s: 15s interval (tapering off)
 # ============================================================
 
 # QR expiration indicators to check in browser page
@@ -1410,54 +1950,69 @@ QR_EXPIRED_PAGE_INDICATORS = [
 
 _QR_CHECK_JS = """
 (function() {
-  var body = document.body.textContent || '';
+  // Use innerText (not textContent) — innerText respects CSS visibility
+  // so "二维码已过期" hidden via display:none won't cause false positives.
+  var body = document.body.innerText || '';
   var indicators = ['二维码已过期', '已失效', '请重新刷新', '二维码失效'];
   for (var i = 0; i < indicators.length; i++) {
     if (body.indexOf(indicators[i]) !== -1) return 'expired:' + indicators[i];
   }
-  // Check if QR image is still present and not a stale/error placeholder
+  // Check if QR image is still present (base64 data URI is the live QR)
   var imgs = document.querySelectorAll('img');
   var hasQR = false;
   for (var j = 0; j < imgs.length; j++) {
     var src = imgs[j].src || '';
-    if (src.indexOf('qr') !== -1 || src.indexOf('code') !== -1 || src.indexOf('login') !== -1) {
+    // Match both named QR images and base64 data URIs (live QR codes)
+    if (src.indexOf('qr') !== -1 || src.indexOf('code') !== -1 || src.indexOf('login') !== -1 ||
+        src.indexOf('data:image') === 0) {
       hasQR = true;
       break;
     }
   }
-  // If no QR-related images found at all, consider it expired
-  if (!hasQR && imgs.length === 0) return 'expired:no_images';
+  // Also check canvas elements (some QR implementations use canvas)
+  if (!hasQR) {
+    var canvases = document.querySelectorAll('canvas');
+    if (canvases.length > 0) hasQR = true;
+  }
+  if (!hasQR && imgs.length === 0 && document.querySelectorAll('canvas').length === 0) {
+    return 'expired:no_qr_element';
+  }
   return 'ok';
 })()
 """
 
 def cmd_poll_login():
-    """Poll Feishu messages waiting for login receipt.
-    Dynamic polling intervals + browser QR expiration check on timeout.
+    """Wait for login completion via browser detection or Feishu replies.
+
+    Two modes:
+      browser-only — Pure browser detection (pinchtab text+snap for login,
+                     pinchtab eval JS for QR expiry). NO Feishu API calls.
+                     Recommended default for all query flows.
+      legacy       — Feishu message polling + optional browser auto-detect
+                     (--check-login). Kept for group-chat scenarios where
+                     user may reply "QR expired".
 
     Args:
-      --chat-id CHAT_ID         Feishu chat to poll (required)
-      --target-user-id OU_XXX   Target user open_id (required)
-      --qr-msg-id OM_XXX        QR notification message_id (required)
-      --qr-sent-as bot|user     Who sent the QR message. When 'bot', skip reply_to
-                                matching (in bot-user P2P chats, user messages are
-                                always directed at the bot). When 'user' (group chat),
-                                require reply_to == qr_msg_id. Default: user.
-      --max-duration SECONDS    (default 300 = 5min). Replaces --max-retries.
-      --check-qr                Enable browser QR expiration check after polling exhausted.
-      --check-login             Enable browser auto-detect login. Every ~30s, runs pinchtab
-                                text+snap to check if page shows logged-in state (unit user
-                                indicators). If detected, exits 0 immediately without waiting
-                                for Feishu reply. Default: false.
+      --chat-id CHAT_ID         Feishu chat (required unless --browser-only)
+      --target-user-id OU_XXX   Target user open_id (required unless --browser-only)
+      --qr-msg-id OM_XXX        QR notification message_id (required unless --browser-only)
+      --qr-sent-as bot|user     Who sent the QR message. Default: user.
+      --max-duration SECONDS    (default 300 = 5min).
+      --browser-only            Pure browser detection: skip ALL Feishu API calls.
+                                Login detected via pinchtab text+snap keyword match.
+                                QR expiry detected via pinchtab eval JS every ~60s.
+                                When set, --chat-id/--target-user-id/--qr-msg-id
+                                are optional. Default: false.
+      --check-qr                [legacy] Browser QR expiration check after polling exhausted.
+      --check-login             [legacy] Browser auto-detect login every ~30s during Feishu polling.
       --qr-refresh-count N      Current QR refresh count (0-indexed). Default 0.
       --max-qr-refreshes N      Max QR refreshes before giving up. Default 3.
-                                When refresh count >= max, expired QR returns exit 1 (TIMEOUT)
-                                instead of exit 3 (QR_EXPIRED_DETECTED).
-    Deprecated but still parsed: --max-retries (mapped to --max-duration)."""
+    Deprecated: --max-retries (mapped to --max-duration)."""
     p = {"chat_id": "", "target_user_id": "", "qr_msg_id": "",
          "qr_sent_as": "user", "max_duration": "300",
          "lark_cli": _lark_cli_path(), "pt_path": _pinchtab_path(),
          "check_qr": "false", "check_login": "false",
+         "browser_only": "false",
          "qr_refresh_count": "0", "max_qr_refreshes": "3"}
     args = sys.argv[2:]
     i = 0
@@ -1487,6 +2042,8 @@ def cmd_poll_login():
             p["check_qr"] = "true"; i += 1
         elif args[i] == "--check-login":
             p["check_login"] = "true"; i += 1
+        elif args[i] == "--browser-only":
+            p["browser_only"] = "true"; i += 1
         else:
             i += 1
 
@@ -1498,6 +2055,7 @@ def cmd_poll_login():
     qr_sent_as = p["qr_sent_as"]
     check_qr = p["check_qr"] == "true"
     check_login = p["check_login"] == "true"
+    browser_only = p["browser_only"] == "true"
     max_duration = int(p["max_duration"])
     qr_refresh_count = int(p["qr_refresh_count"])
     max_qr_refreshes = int(p["max_qr_refreshes"])
@@ -1505,6 +2063,76 @@ def cmd_poll_login():
     start_time = time.time()
     poll_count = 0
 
+    # ═══════════════════════════════════════════════════════════════
+    # MODE 1: browser-only — pure browser detection, NO Feishu API
+    # ═══════════════════════════════════════════════════════════════
+    if browser_only:
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed > max_duration:
+                break
+
+            poll_count += 1
+            now = time.strftime("%H:%M:%S")
+
+            # Check browser login state every interval
+            try:
+                page_text = (_run_silent([pt, "text"]).stdout or "") + \
+                            (_run_silent([pt, "snap"]).stdout or "")
+                for kw in LOGIN_INDICATORS:
+                    if kw in page_text:
+                        print(f"  [{now}] browser login detected: {kw}", flush=True)
+                        print("LOGIN_DETECTED_BROWSER", flush=True)
+                        sys.exit(0)
+            except Exception as e:
+                print(f"  [{now}] browser check skipped: {e}", flush=True)
+
+            # Check QR expiry via browser JS every ~60s
+            if poll_count % 6 == 0:
+                try:
+                    qr_result = _run_silent([pt, "eval", _QR_CHECK_JS])
+                    qr_status = (qr_result.stdout or "").strip()
+                    print(f"  [{now}] QR status: {qr_status}", flush=True)
+                    if qr_status.startswith("expired"):
+                        if qr_refresh_count >= max_qr_refreshes:
+                            print(f"  QR expired, max refreshes ({max_qr_refreshes}) reached", flush=True)
+                            print("TIMEOUT", flush=True)
+                            sys.exit(1)
+                        print("QR_EXPIRED_DETECTED", flush=True)
+                        sys.exit(3)
+                except Exception as e:
+                    print(f"  [{now}] QR check skipped: {e}", flush=True)
+
+            # Dynamic interval
+            if elapsed < 60:
+                interval = 10
+            elif elapsed < 180:
+                interval = 5
+            else:
+                interval = 15
+            time.sleep(interval)
+
+        # --- browser-only polling exhausted ---
+        # Final QR expiration check
+        try:
+            qr_result = _run([pt, "eval", _QR_CHECK_JS])
+            qr_status = qr_result.stdout.strip()
+            print(f"  [{time.strftime('%H:%M:%S')}] Final QR check: {qr_status}", flush=True)
+            if qr_status.startswith("expired"):
+                if qr_refresh_count >= max_qr_refreshes:
+                    print("TIMEOUT", flush=True)
+                    sys.exit(1)
+                print("QR_EXPIRED_DETECTED", flush=True)
+                sys.exit(3)
+        except Exception:
+            pass
+
+        print("TIMEOUT", flush=True)
+        sys.exit(1)
+
+    # ═══════════════════════════════════════════════════════════════
+    # MODE 2: legacy — Feishu message polling + optional browser checks
+    # ═══════════════════════════════════════════════════════════════
     while True:
         elapsed = time.time() - start_time
         if elapsed > max_duration:
@@ -1538,7 +2166,6 @@ def cmd_poll_login():
                     msg_time = msg.get("create_time", "")
                     if msg_time:
                         try:
-                            from datetime import datetime
                             msg_ts = datetime.strptime(msg_time, "%Y-%m-%d %H:%M:%S").timestamp()
                             if msg_ts < start_time - 10:  # 10s grace
                                 continue
@@ -2032,9 +2659,10 @@ def cmd_collect_violations():
     - Random delays: 1-2s clicks, 3-8s between violations
     - Resume support: --resume-from N to continue from Nth detail page
 
-    Args: --plate PLATE (for DB lookup), --query-date DATE, --auto-insert (write each violation to SQLite immediately)
+    Args: --plate PLATE (for DB lookup), --query-date DATE, --auto-insert (write each violation to SQLite immediately),
+          --query-mode auto|full (default auto; full = scan all detail pages without early break)
     """
-    p = {"plate": "", "query_date": time.strftime("%Y-%m-%d"), "resume_from": "0", "auto_insert": False}
+    p = {"plate": "", "query_date": time.strftime("%Y-%m-%d"), "resume_from": "0", "auto_insert": False, "query_mode": "auto"}
     args = sys.argv[2:]
     i = 0
     while i < len(args):
@@ -2046,6 +2674,8 @@ def cmd_collect_violations():
             p["resume_from"] = args[i + 1]; i += 2
         elif args[i] == "--auto-insert":
             p["auto_insert"] = True; i += 1
+        elif args[i] == "--query-mode" and i + 1 < len(args):
+            p["query_mode"] = args[i + 1]; i += 2
         else:
             i += 1
 
@@ -2053,6 +2683,7 @@ def cmd_collect_violations():
     query_date = p["query_date"]
     resume_from = int(p["resume_from"])
     auto_insert = p["auto_insert"]
+    query_mode = p["query_mode"]
 
     # Open DB connection if auto-insert mode
     db_conn = None
@@ -2267,10 +2898,15 @@ def cmd_collect_violations():
                 if idx < len(violations) - 1:
                     time.sleep(random.uniform(2, 5))
 
-        # Check if more detail pages exist - skip if no unprocessed on this page
+        # Check if more detail pages exist.
+        # In auto mode: skip remaining detail pages if no unprocessed on this page
+        #   (platform sorts unprocessed first — clean page means all remaining clean).
+        # In full mode: scan every detail page regardless.
         has_unprocessed = any(v.get('unprocessed') or v.get('status') == '未处理' for v in violations)
         detail_page += 1
-        if detail_page >= total_pages or total_pages <= 1 or not has_unprocessed:
+        if detail_page >= total_pages or total_pages <= 1:
+            break
+        if query_mode == 'auto' and not has_unprocessed:
             break
 
         # Smart pagination: navigate to the next detail page
@@ -3426,7 +4062,6 @@ def cmd_get_login_type():
     Returns JSON: {type: 'unit'|'personal'|'none'}
     Used to verify we're logged in as unit user before proceeding.
     """
-    text = _run(["pinchtab", "text"]).stdout
     snap = _run(["pinchtab", "snap"]).stdout
 
     result = {"type": "none", "details": ""}
@@ -3437,14 +4072,14 @@ def cmd_get_login_type():
     personal_indicators = ["个人用户", "个人中心", "我的车辆", "驾驶人"]
 
     for kw in unit_indicators:
-        if kw in text or kw in snap:
+        if kw in snap:
             result["type"] = "unit"
             result["details"] = f"found unit indicator: {kw}"
             break
 
     if result["type"] == "none":
         for kw in personal_indicators:
-            if kw in text or kw in snap:
+            if kw in snap:
                 result["type"] = "personal"
                 result["details"] = f"found personal indicator: {kw}"
                 break
@@ -3452,7 +4087,7 @@ def cmd_get_login_type():
     # Check if any text at all (login state detection) — use unified set
     if result["type"] == "none":
         for kw in POST_LOGIN_KEYWORDS:
-            if kw in text or kw in snap:
+            if kw in snap:
                 result["type"] = "unknown"
                 result["details"] = "logged in but cannot determine type"
                 break
@@ -3637,13 +4272,14 @@ def cmd_check_login_state():
             result["details"] = f"on platform: {current_url[:80]}"
 
     # ── Tier 2: keyword matching ──
+    # Use snap (accessibility tree) only — NOT text. text includes
+    # CSS-hidden DOM elements ("退出"/"我的主页" exist in HTML source even
+    # when logged out), causing false positives.
     if mode == "keyword" or (mode == "auto" and result["state"] == "unknown"):
-        text = _run(["pinchtab", "text"]).stdout
         snap = _run(["pinchtab", "snap"]).stdout
-        combined = text + " " + snap
 
         # Check rate-limit first (highest priority)
-        rate_hits = [kw for kw in RATE_LIMIT_KEYWORDS if kw in combined]
+        rate_hits = [kw for kw in RATE_LIMIT_KEYWORDS if kw in snap]
         if rate_hits:
             result["state"] = "rate_limited"
             result["method"] = "keyword" if mode == "keyword" else "url+keyword"
@@ -3653,8 +4289,8 @@ def cmd_check_login_state():
             sys.exit(2)
 
         # Check for logged-in indicators
-        logged_in_hits = [kw for kw in POST_LOGIN_KEYWORDS if kw in combined]
-        login_page_hits = [kw for kw in LOGIN_PAGE_KEYWORDS if kw in combined]
+        logged_in_hits = [kw for kw in POST_LOGIN_KEYWORDS if kw in snap]
+        login_page_hits = [kw for kw in LOGIN_PAGE_KEYWORDS if kw in snap]
 
         if logged_in_hits:
             result["state"] = "logged_in"
@@ -3695,16 +4331,15 @@ def cmd_check_login_valid():
     Does NOT logout - only verifies. Returns JSON with login state.
     """
     snap = _run(["pinchtab", "snap"]).stdout
-    text = _run(["pinchtab", "text"]).stdout
-    combined = text + " " + snap
 
-    # Use unified keyword sets
-    logged_in_hits = [kw for kw in POST_LOGIN_KEYWORDS if kw in combined]
-    login_page_hits = [kw for kw in LOGIN_PAGE_KEYWORDS if kw in combined]
+    # Use snap (accessibility tree) only — text includes hidden DOM
+    # elements causing false positives for "退出"/"我的主页" when logged out.
+    logged_in_hits = [kw for kw in POST_LOGIN_KEYWORDS if kw in snap]
+    login_page_hits = [kw for kw in LOGIN_PAGE_KEYWORDS if kw in snap]
 
-    has_logout = "退出" in combined
-    has_unit = "公司列表" in combined or "租赁车" in combined or "租赁车辆" in combined
-    has_personal = "个人用户" in combined
+    has_logout = "退出" in snap
+    has_unit = "公司列表" in snap or "租赁车" in snap or "租赁车辆" in snap
+    has_personal = "个人用户" in snap
     is_logged_in = bool(logged_in_hits) and not (
         bool(login_page_hits) and not logged_in_hits
     )
@@ -3723,67 +4358,21 @@ def cmd_check_login_valid():
 # Subcommand: new-tab
 # ============================================================
 
-def cmd_new_tab():
-    """Create a new browser tab and return its ID. Used for session isolation
-    so multiple Claude processes can share the same Chrome login session
-    without interfering with each other's page navigation.
-
-    Returns JSON: {tab_id: str, ok: bool}
-    """
-    # Get existing tab IDs before creating new one
-    before_result = _run(["pinchtab", "tab"])
-    before_ids = set(re.findall(r'\b(\d+)\b', before_result.stdout))
-
-    # Open a new blank tab via JS
-    _run(["pinchtab", "eval", "window.open('about:blank')"])
-    time.sleep(1)
-
-    # Get tab IDs after
-    after_result = _run(["pinchtab", "tab"])
-    after_ids = set(re.findall(r'\b(\d+)\b', after_result.stdout))
-
-    new_ids = after_ids - before_ids
-    if new_ids:
-        tab_id = sorted(new_ids, key=int)[-1]
-    else:
-        # Fallback: take the highest numeric ID from after
-        all_ids = sorted(after_ids, key=int)
-        tab_id = all_ids[-1] if all_ids else "0"
-
-    # Switch to the new tab so it's active
-    _run(["pinchtab", "tab", tab_id])
-
-    print(json.dumps({"tab_id": tab_id, "ok": True}, ensure_ascii=False))
+def _read_pinchtab_config():
+    """Read PinchTab server config from ~/.pinchtab/config.json.
+    Returns {port: str, token: str}."""
+    config_path = os.path.join(os.path.expanduser('~'), '.pinchtab', 'config.json')
+    with open(config_path, 'r') as f:
+        cfg = json.load(f)
+    return {
+        'port': cfg.get('server', {}).get('port', '9867'),
+        'token': cfg.get('server', {}).get('token', ''),
+    }
 
 
-# ============================================================
-# Subcommand: switch-tab
-# ============================================================
-
-def cmd_switch_tab():
-    """Switch to a specific browser tab by ID.
-
-    Args: --id TAB_ID
-    Returns JSON: {tab_id: str, ok: bool}
-    """
-    p = {"id": ""}
-    args = sys.argv[2:]
-    i = 0
-    while i < len(args):
-        if args[i] == "--id" and i + 1 < len(args):
-            p["id"] = args[i + 1]; i += 2
-        else:
-            i += 1
-
-    if not p["id"]:
-        print(json.dumps({"ok": False, "error": "missing --id"}, ensure_ascii=False))
-        sys.exit(1)
-
-    result = _run(["pinchtab", "tab", p["id"]])
-    success = result.returncode == 0
-    print(json.dumps({"tab_id": p["id"], "ok": success}, ensure_ascii=False))
-    if not success:
-        sys.exit(1)
+# cmd_new_tab and cmd_switch_tab moved to tab_session.py
+# Use: eval $(python3 tab_session.py init --label "name")
+#      eval $(python3 tab_session.py bind --tab-id <id> --label "name")
 
 
 
@@ -3804,17 +4393,20 @@ SUBCOMMANDS = {
     "upload-image": cmd_upload_image,
     "send-msg": cmd_send_msg,
     "send-image-msg": cmd_send_image_msg,
-    "switch-tab": cmd_switch_tab,
     "init-db": cmd_init_db,
     "db-insert-company": cmd_db_insert_company,
     "db-insert-vehicle": cmd_db_insert_vehicle,
     "db-insert-violation": cmd_db_insert_violation,
+    "keepalive-health": cmd_keepalive_health,
+    "ensure-keepalive": cmd_ensure_keepalive,
     "profile-lookup": cmd_profile_lookup,
+    "profile-list": cmd_profile_list,
     "profile-register": cmd_profile_register,
     "profile-logout": cmd_profile_logout,
     "search-user": cmd_search_user,
     "search-chat": cmd_search_chat,
     "batch-get-id": cmd_batch_get_id,
+    "save-notify": cmd_save_notify,
     "pt-find": cmd_pt_find,
     "pt-wait": cmd_pt_wait,
     "poll-login": cmd_poll_login,
@@ -3824,7 +4416,6 @@ SUBCOMMANDS = {
     "init": cmd_init,
     "run-js": cmd_run_js,
     "list-vehicles": cmd_list_vehicles,
-    "new-tab": cmd_new_tab,
     "open-vehicle": cmd_open_vehicle,
     "collect-violations": cmd_collect_violations,
     "go-back": cmd_go_back,
