@@ -1,0 +1,6 @@
+[Unit]
+Description=Keepalive Pull-Watchdog (深圳倚申)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /home/openclaw/.claude/skills/DST违章查询/keepalive_watchdog.sh "/home/openclaw/violation_query/data/keepalive_health_深圳市倚申新能源汽车服务有限公司.json" "keepalive-profile_006.service"

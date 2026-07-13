@@ -1,0 +1,6 @@
+[Unit]
+Description=Keepalive Pull-Watchdog (成都新创绿能)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /home/openclaw/.claude/skills/DST违章查询/keepalive_watchdog.sh "/home/openclaw/violation_query/data/keepalive_health_成都新创绿能汽车租赁有限公司.json" "keepalive-profile_003.service"

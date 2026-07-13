@@ -1,0 +1,6 @@
+[Unit]
+Description=Keepalive Pull-Watchdog (厦门地上铁)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /home/openclaw/.claude/skills/DST违章查询/keepalive_watchdog.sh "/home/openclaw/violation_query/data/keepalive_health_厦门市地上铁新创绿能汽车服务有限公司.json" "keepalive-profile_005.service"
