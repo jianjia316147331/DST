@@ -1030,7 +1030,8 @@ def cmd_go_back():
 
 def cmd_click_page():
     """Click pagination on the vehicle list page.
-    Args: --target next|prev|N (page number)
+    Args: --target next|prev|N (page number), also accepts --page as alias
+          or a bare page number as positional argument.
     For page number targets, uses smart pagination:
     - If target > max displayed page, click max page to shift window right
     - If target < min displayed page, click min page to shift window left
@@ -1046,8 +1047,10 @@ def cmd_click_page():
     args = sys.argv[2:]
     i = 0
     while i < len(args):
-        if args[i] == "--target" and i + 1 < len(args):
+        if args[i] in ("--target", "--page") and i + 1 < len(args):
             p["target"] = args[i + 1]; i += 2
+        elif args[i].isdigit():
+            p["target"] = args[i]; i += 1
         else:
             i += 1
 
