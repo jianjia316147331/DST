@@ -14,7 +14,9 @@ from lib.core     import (_fix_encoding, _setup_output_file,
                           cmd_get_data_dir, cmd_license_lookup, cmd_province_url,
                           cmd_province_login_url, cmd_pinchtab_path, cmd_lark_cli_path,
                           cmd_get_login_url, cmd_pt_find, cmd_pt_wait, cmd_run_js,
-                          cmd_prepare_dir, cmd_init)
+                          cmd_prepare_dir, cmd_init, cmd_release_tab,
+                          cmd_mark_task_done, cmd_check_task_done,
+                          cmd_cleanup_stale_tabs, cmd_cleanup)
 from lib.db       import (cmd_init_db, cmd_db_insert_company, cmd_db_insert_vehicle,
                           cmd_db_insert_violation)
 from lib.feishu   import (cmd_gen_qr_msg, cmd_gen_qr_fallback, cmd_gen_result_msg,
@@ -39,6 +41,11 @@ SUBCOMMANDS = {
     "license-lookup": cmd_license_lookup, "province-url": cmd_province_url,
     "province-login-url": cmd_province_login_url, "pinchtab-path": cmd_pinchtab_path,
     "lark-cli-path": cmd_lark_cli_path, "get-login-url": cmd_get_login_url,
+    "release-tab": cmd_release_tab,
+    "mark-task-done": cmd_mark_task_done,
+    "check-task-done": cmd_check_task_done,
+    "cleanup-stale-tabs": cmd_cleanup_stale_tabs,
+    "cleanup": cmd_cleanup,
     "pt-find": cmd_pt_find, "pt-wait": cmd_pt_wait, "run-js": cmd_run_js,
     "prepare-dir": cmd_prepare_dir, "init": cmd_init,
     # db

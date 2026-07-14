@@ -5,7 +5,8 @@ from datetime import datetime
 
 from .core import (_run, _run_silent, _read_stdin_text, _read_stdin_json,
                    _find_project_root, _get_data_dir, _pinchtab_path,
-                   _pinchtab_base_cmd, RATE_LIMIT_KEYWORDS)
+                   _pinchtab_base_cmd, RATE_LIMIT_KEYWORDS,
+                   _touch_tab_activity)
 from .db import (_init_db, _get_db_path, _get_db_conn, _upsert_violation,
                  _collect_detail_to_db_record, _load_violations_from_db)
 
@@ -98,6 +99,7 @@ def cmd_open_vehicle():
 
     # Dismiss any popup first
     _dismiss_popup_js()
+    _touch_tab_activity(os.environ.get("VIOLATION_TAB_ID", ""))
 
     # Vehicle plate pattern: province prefix + letter
     plate_js = f"""
@@ -280,10 +282,10 @@ def cmd_collect_violations():
     - Random delays: 1-2s clicks, 3-8s between violations
     - Resume support: --resume-from N to continue from Nth detail page
 
-    Args: --plate PLATE (for DB lookup), --query-date DATE, --auto-insert (write each violation to SQLite immediately),
-          --query-mode auto|full (default auto; full = scan all detail pages without early break)
+    Args: --plate PLATE (for DB lookup), --query-date DATE, --auto-insert (write each violation to SQLite immediately)
+          --single (auto cleanup: mark-task-done + release-tab after completion)
     """
-    p = {"plate": "", "query_date": time.strftime("%Y-%m-%d"), "resume_from": "0", "auto_insert": False, "query_mode": "auto"}
+    p = {"plate": "", "query_date": time.strftime("%Y-%m-%d"), "resume_from": "0", "auto_insert": False, "single": False}
     args = sys.argv[2:]
     i = 0
     while i < len(args):
@@ -295,8 +297,12 @@ def cmd_collect_violations():
             p["resume_from"] = args[i + 1]; i += 2
         elif args[i] == "--auto-insert":
             p["auto_insert"] = True; i += 1
-        elif args[i] == "--query-mode" and i + 1 < len(args):
-            p["query_mode"] = args[i + 1]; i += 2
+        elif args[i] == "--single":
+            p["single"] = True; i += 1
+        elif args[i] == "--company" and i + 1 < len(args):
+            p["company"] = args[i + 1]; i += 2
+        elif args[i] == "--batch-id" and i + 1 < len(args):
+            p["batch_id"] = args[i + 1]; i += 2
         else:
             i += 1
 
@@ -304,7 +310,7 @@ def cmd_collect_violations():
     query_date = p["query_date"]
     resume_from = int(p["resume_from"])
     auto_insert = p["auto_insert"]
-    query_mode = p["query_mode"]
+    single_mode = p["single"]
 
     # Open DB connection if auto-insert mode
     db_conn = None
@@ -332,6 +338,13 @@ def cmd_collect_violations():
 
     all_results = []
     detail_page = max(resume_from, 0)
+
+    # B1 fix: pre-navigate to resume page if resuming from a later detail page.
+    # Without this, _extract_detail_page_violations() extracts page 1 data
+    # but labels it as page N, skipping the real pages 1..N-1 entirely.
+    if detail_page > 0:
+        _click_detail_page(str(detail_page + 1))  # 1-based page number
+        time.sleep(random.uniform(1, 2))
 
     while True:
         # Extract violations from current detail page
@@ -372,10 +385,21 @@ def cmd_collect_violations():
                     })
                     continue
 
-                time.sleep(random.uniform(1, 2))
-                _run(["pinchtab", "eval",
+                time.sleep(random.uniform(1, 2.5))
+                click_result = _run(["pinchtab", "eval",
                     f"(function(){{var links=document.querySelectorAll('a.view');if(links.length>{idx}){{links[{idx}].click();return'ok'}}return'fail'}})()"])
-                time.sleep(random.uniform(2, 3))
+
+                # Check click succeeded (Bug #2 fix)
+                if 'fail' in (click_result.stdout or ''):
+                    all_results.append({
+                        "time": v['time'], "location": v['location'],
+                        "behavior": v['behavior'], "status": v['status'],
+                        "payment": v['payment'], "fine": 0, "points": 0,
+                        "authority": "", "unprocessed": v['unprocessed'],
+                        "skipped": True, "_detail_page": detail_page, "_index": idx,
+                        "_skip_reason": "click_failed"
+                    })
+                    continue
 
                 # Check XHR rate-limiting
                 xhr_blocked, xhr_reason = _check_xhr_rate_limit()
@@ -391,9 +415,22 @@ def cmd_collect_violations():
                 for retry in range(3):
                     time.sleep(1)
                     dialog_text = _run(["pinchtab", "eval",
-                        """(function(){var d=document.querySelector('.aui_dialog');if(!d||window.getComputedStyle(d).display==='none')return'';var t=d.textContent.trim();return t.length>20?t:'';})()"""]).stdout
-                    if dialog_text and len(dialog_text) > 50:
+                        """(function(){var d=document.querySelector('.aui_dialog');if(!d||window.getComputedStyle(d).display==='none')return'';var t=d.textContent.trim();return t.length>50?t:'';})()"""]).stdout
+                    if dialog_text:
                         break
+
+                # Bug #1 fix: skip if dialog failed to load (avoid inserting garbage data)
+                if not dialog_text:
+                    all_results.append({
+                        "time": v['time'], "location": v['location'],
+                        "behavior": v['behavior'], "status": v['status'],
+                        "payment": v['payment'], "fine": 0, "points": 0,
+                        "authority": "", "unprocessed": v['unprocessed'],
+                        "skipped": True, "_detail_page": detail_page, "_index": idx,
+                        "_skip_reason": "dialog_load_failed"
+                    })
+                    continue
+
                 detail = _parse_detail_popup(dialog_text)
                 detail["_index"] = idx
                 detail["time"] = v["time"]
@@ -418,10 +455,10 @@ def cmd_collect_violations():
                 # Close dialog via JS
                 _run(["pinchtab", "eval",
                     """(function(){var el=document.querySelector('.aui_dialog');if(!el)return'none';var btns=el.querySelectorAll('button,a,span');for(var i=0;i<btns.length;i++){if(btns[i].textContent.trim()==='取消'){btns[i].click();return'closed';}}document.body.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',keyCode:27}));return'escape';})()"""])
-                time.sleep(random.uniform(1, 2))
+                time.sleep(random.uniform(0.5, 1))
 
                 if idx < len(violations) - 1:
-                    time.sleep(random.uniform(2, 5))
+                    time.sleep(random.uniform(1.5, 3.5))
 
         else:
             # Detect if this platform uses <a class="view"> links (same as Beijing)
@@ -572,18 +609,32 @@ def cmd_collect_violations():
                     time.sleep(random.uniform(2, 5))
 
         # Check if more detail pages exist.
-        # In auto mode: skip remaining detail pages if no unprocessed on this page
-        #   (platform sorts unprocessed first — clean page means all remaining clean).
-        # In full mode: scan every detail page regardless.
-        has_unprocessed = any(v.get('unprocessed') or v.get('status') == '未处理' for v in violations)
         detail_page += 1
+
+        # Save intermediate breakpoint after each detail page
+        if p.get("company") and p.get("batch_id"):
+            try:
+                data_dir = _get_data_dir()
+                safe_company = re.sub(r'[<>:"/\\|?*]', '_', p["company"])
+                instance_port = os.environ.get("VIOLATION_INSTANCE_PORT", "").strip()
+                suffix = f"{p['batch_id']}_{instance_port}" if instance_port else p["batch_id"]
+                prog_file = os.path.join(data_dir, f"details_progress_{safe_company}_{suffix}.json")
+                progress = {}
+                if os.path.exists(prog_file):
+                    with open(prog_file, "r", encoding="utf-8") as f:
+                        progress = json.load(f)
+                progress["last_detail_page"] = detail_page
+                progress["last_plate"] = plate
+                with open(prog_file, "w", encoding="utf-8") as f:
+                    json.dump(progress, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass  # Best-effort, don't crash the main flow
+
         if detail_page >= total_pages or total_pages <= 1:
-            break
-        if query_mode == 'auto' and not has_unprocessed:
             break
 
         # Smart pagination: navigate to the next detail page
-        time.sleep(random.uniform(2, 5))
+        time.sleep(random.uniform(1.5, 3.5))
         ok = _click_detail_page(str(detail_page + 1))  # 1-based page number
         if not ok:
             break
@@ -597,7 +648,51 @@ def cmd_collect_violations():
     if db_conn:
         db_conn.close()
 
+    _touch_tab_activity(os.environ.get("VIOLATION_TAB_ID", ""))
     print(json.dumps(all_results, ensure_ascii=False, indent=2))
+
+    # === Auto-cleanup for single-vehicle queries (铁律 #18) ===
+    if single_mode:
+        _cleanup_after_single_query(plate, query_date, all_results)
+
+
+def _cleanup_after_single_query(plate, query_date, all_results):
+    """Auto mark-task-done + release-tab for single-vehicle queries.
+    Best-effort: failures are logged to stderr but never crash the main flow."""
+    try:
+        import sqlite3
+        # Look up company name from DB
+        db_path = _get_db_path()
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute("""
+            SELECT c.name FROM companies c
+            JOIN vehicles v ON v.company_id = c.id
+            WHERE v.plate_number = ? AND v.query_date = ?
+            ORDER BY v.id DESC LIMIT 1
+        """, (plate, query_date))
+        row = cur.fetchone()
+        conn.close()
+        company_name = row[0] if row else ""
+
+        # Count new violations
+        new_count = len([x for x in all_results if not x.get('skipped') and not x.get('from_db')])
+        new_points = sum(x.get('points', 0) or 0 for x in all_results
+                        if not x.get('skipped') and not x.get('from_db'))
+
+        helper = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              'violation_helper.py')
+
+        if company_name:
+            _run([sys.executable, helper, 'mark-task-done',
+                  '--company', company_name, '--query-type', 'single',
+                  '--vehicles-queried', '1',
+                  '--new-violations', str(new_count),
+                  '--new-points', str(new_points)],
+                 timeout=10)
+
+        _run([sys.executable, helper, 'release-tab'], timeout=10)
+    except Exception as e:
+        print(f"    [cleanup] auto-cleanup failed: {e}", file=sys.stderr)
 
 
 def _extract_detail_page_violations():
@@ -679,6 +774,17 @@ def _click_detail_page(target):
         if min_p <= target_page <= max_p:
             result = _click_page_number(target_page)
             if "clicked" in result:
+                # B3 fix: verify page actually navigated before returning.
+                # Without this, slow page loads cause the next extraction
+                # to read stale data from the previous page.
+                time.sleep(0.5)
+                for _ in range(6):
+                    pi2 = _get_pagination_state()
+                    if pi2 and pi2.get("current") == target_page:
+                        return True
+                    time.sleep(0.5)
+                # Page didn't confirm, but click reported success — return True
+                # anyway to avoid infinite looping (caller's delay provides margin).
                 return True
             if target_page not in visited_pages:
                 visited_pages.add(target_page)
@@ -980,6 +1086,7 @@ def cmd_go_back():
     """Navigate back from detail page to vehicle list page.
     Uses history.back() as primary method to preserve the original page position.
     Only falls back to the back-link click if history.back() doesn't work."""
+    _touch_tab_activity(os.environ.get("VIOLATION_TAB_ID", ""))
     # Primary: use history.back() to return to list at original page position
     _run(["pinchtab", "eval", "history.back()"])
     time.sleep(random.uniform(1, 2))
@@ -1055,6 +1162,8 @@ def cmd_click_page():
             i += 1
 
     target = p["target"]
+
+    _touch_tab_activity(os.environ.get("VIOLATION_TAB_ID", ""))
 
     if target in ("next", "prev"):
         _click_page_direct(target)
@@ -1336,15 +1445,16 @@ def cmd_save_detail_progress():
       --vehicle-index N     Vehicle index on the page (1-based)
       --plate PLATE         Plate number of last processed vehicle
       --company NAME        Company name (required, used for file isolation)
-      --query-date DATE     Query date YYYY-MM-DD (required, used for file isolation)
+      --batch-id ID         Batch ID YYYYMMDD_NNN (required, used for file isolation)
+      --query-date DATE     (deprecated) Query date YYYY-MM-DD, fallback if --batch-id omitted
       --total-violations N  Total violation count so far (optional)
       --detail-page N       Detail page within the vehicle (0-based)
       --violation-index N   Violation index within the detail page (0-based)
       --violation-time T    Timestamp of last processed violation (for cross-ref)
-    Writes to details_progress_<company>_<date>.json with resume point.
+    Writes to details_progress_<company>_<batch_id>.json with resume point.
     """
     p = {"page": "1", "vehicle_index": "0", "plate": "", "company": "",
-         "query_date": "", "total_violations": "0",
+         "batch_id": "", "query_date": "", "total_violations": "0",
          "detail_page": "-1", "violation_index": "-1", "violation_time": ""}
     _read_stdin_json(p)
     args = sys.argv[2:]
@@ -1358,6 +1468,8 @@ def cmd_save_detail_progress():
             p["plate"] = args[i + 1]; i += 2
         elif args[i] == "--company" and i + 1 < len(args):
             p["company"] = args[i + 1]; i += 2
+        elif args[i] == "--batch-id" and i + 1 < len(args):
+            p["batch_id"] = args[i + 1]; i += 2
         elif args[i] == "--query-date" and i + 1 < len(args):
             p["query_date"] = args[i + 1]; i += 2
         elif args[i] == "--total-violations" and i + 1 < len(args):
@@ -1371,13 +1483,18 @@ def cmd_save_detail_progress():
         else:
             i += 1
 
-    if not p["company"] or not p["query_date"]:
-        print(json.dumps({"ok": False, "error": "--company and --query-date are required"}, ensure_ascii=False))
+    # Resolve file suffix: --batch-id takes precedence, --query-date as fallback
+    file_suffix = p.get("batch_id") or p.get("query_date")
+    if not p["company"] or not file_suffix:
+        print(json.dumps({"ok": False, "error": "--company and --batch-id (or --query-date) are required"}, ensure_ascii=False))
         sys.exit(1)
 
     data_dir = _get_data_dir()
     safe_company = re.sub(r'[<>:"/\\|?*]', '_', p["company"])
-    prog_file = os.path.join(data_dir, f"details_progress_{safe_company}_{p['query_date']}.json")
+    instance_port = os.environ.get("VIOLATION_INSTANCE_PORT", "").strip()
+    if instance_port:
+        file_suffix = f"{file_suffix}_{instance_port}"
+    prog_file = os.path.join(data_dir, f"details_progress_{safe_company}_{file_suffix}.json")
 
     # Load existing progress
     progress = {}
@@ -1392,12 +1509,15 @@ def cmd_save_detail_progress():
     progress["last_page"] = int(p["page"])
     progress["last_vehicle_index"] = int(p["vehicle_index"])
     progress["last_plate"] = p["plate"]
-    progress["total_violations"] = int(progress.get("total_violations", 0)) + int(p.get("total_violations", 0))
+    # B2 fix: only accumulate if plate not already in processed_plates
+    # (prevents double-counting on retry of the same vehicle)
+    if p["plate"] and p["plate"] not in progress.get("processed_plates", []):
+        progress["total_violations"] = int(progress.get("total_violations", 0)) + int(p.get("total_violations", 0))
 
-    # Violation-level resume: only save if explicitly provided (>=0)
+    # Violation-level resume: only save if explicitly provided (>= -1)
     detail_page = int(p["detail_page"])
     violation_idx = int(p["violation_index"])
-    if detail_page >= 0:
+    if detail_page >= -1:
         progress["last_detail_page"] = detail_page
     if violation_idx >= 0:
         progress["last_violation_index"] = violation_idx
@@ -1423,30 +1543,36 @@ def cmd_save_detail_progress():
 
 def cmd_load_detail_progress():
     """Load the detail progress resume point.
-    Args: --company NAME --query-date DATE (both required for file isolation)
+    Args: --company NAME --batch-id ID (required for file isolation, --query-date as fallback)
     Returns JSON: {resume_page, resume_vehicle_index, resume_plate, processed_plates, total_violations}
     """
-    p = {"company": "", "query_date": ""}
+    p = {"company": "", "batch_id": "", "query_date": ""}
     args = sys.argv[2:]
     i = 0
     while i < len(args):
         if args[i] == "--company" and i + 1 < len(args):
             p["company"] = args[i + 1]; i += 2
+        elif args[i] == "--batch-id" and i + 1 < len(args):
+            p["batch_id"] = args[i + 1]; i += 2
         elif args[i] == "--query-date" and i + 1 < len(args):
             p["query_date"] = args[i + 1]; i += 2
         else:
             i += 1
 
-    if not p["company"] or not p["query_date"]:
+    file_suffix = p.get("batch_id") or p.get("query_date")
+    if not p["company"] or not file_suffix:
         print(json.dumps({"resume_page": 1, "resume_vehicle_index": 0,
                           "resume_plate": "", "processed_plates": [],
                           "total_violations": 0, "fresh": True,
-                          "error": "--company and --query-date required"}, ensure_ascii=False))
+                          "error": "--company and --batch-id (or --query-date) required"}, ensure_ascii=False))
         return
 
+    instance_port = os.environ.get("VIOLATION_INSTANCE_PORT", "").strip()
+    if instance_port:
+        file_suffix = f"{file_suffix}_{instance_port}"
     data_dir = _get_data_dir()
     safe_company = re.sub(r'[<>:"/\\|?*]', '_', p["company"])
-    prog_file = os.path.join(data_dir, f"details_progress_{safe_company}_{p['query_date']}.json")
+    prog_file = os.path.join(data_dir, f"details_progress_{safe_company}_{file_suffix}.json")
 
     if not os.path.exists(prog_file):
         print(json.dumps({"resume_page": 1, "resume_vehicle_index": 0,
@@ -1492,27 +1618,33 @@ def cmd_reset_detail_progress():
     Only clears the detail-level progress (plates processed, resume point).
     Does NOT touch all_vehicles_progress.json.
 
-    Args: --company NAME --query-date DATE (both required)
+    Args: --company NAME --batch-id ID (required, --query-date as fallback)
     """
-    p = {"company": "", "query_date": ""}
+    p = {"company": "", "batch_id": "", "query_date": ""}
     args = sys.argv[2:]
     i = 0
     while i < len(args):
         if args[i] == "--company" and i + 1 < len(args):
             p["company"] = args[i + 1]; i += 2
+        elif args[i] == "--batch-id" and i + 1 < len(args):
+            p["batch_id"] = args[i + 1]; i += 2
         elif args[i] == "--query-date" and i + 1 < len(args):
             p["query_date"] = args[i + 1]; i += 2
         else:
             i += 1
 
-    if not p["company"] or not p["query_date"]:
-        print(json.dumps({"ok": False, "error": "--company and --query-date required"}, ensure_ascii=False))
+    file_suffix = p.get("batch_id") or p.get("query_date")
+    if not p["company"] or not file_suffix:
+        print(json.dumps({"ok": False, "error": "--company and --batch-id (or --query-date) required"}, ensure_ascii=False))
         sys.exit(1)
 
+    instance_port = os.environ.get("VIOLATION_INSTANCE_PORT", "").strip()
+    if instance_port:
+        file_suffix = f"{file_suffix}_{instance_port}"
     data_dir = _get_data_dir()
     safe_company = re.sub(r'[<>:"/\\|?*]', '_', p["company"])
-    prog_file = os.path.join(data_dir, f"details_progress_{safe_company}_{p['query_date']}.json")
-    details_file = os.path.join(data_dir, f"violation_details_{safe_company}_{p['query_date']}.json")
+    prog_file = os.path.join(data_dir, f"details_progress_{safe_company}_{file_suffix}.json")
+    details_file = os.path.join(data_dir, f"violation_details_{safe_company}_{file_suffix}.json")
 
     with open(prog_file, "w", encoding="utf-8") as f:
         json.dump({"processed_plates": [], "total_violations": 0,
@@ -1695,6 +1827,16 @@ def cmd_find_plate_page():
             if pi and 1 >= pi["min_page"] and 1 <= pi["max_page"]:
                 _click_page_number(1)
                 time.sleep(random.uniform(1, 2))
+    else:
+        # B4 fix: fallback when .pagination CSS class is absent.
+        # Use prev-button clicks to walk back toward page 1, then
+        # verify via _get_current_page_vehicles + cmd_list_vehicles.
+        for _ in range(max_forward + 5):
+            _click_page_direct("prev")
+            time.sleep(random.uniform(1, 2))
+            pi = _get_pagination_state()
+            if pi and pi.get("min_page", 99) <= 1:
+                break
 
     print(json.dumps({"found": False, "page": 1, "method": "scan",
                        "message": f"plate {plate} not found in {max_forward} forward pages, reset to page 1"}))
@@ -1818,6 +1960,7 @@ def cmd_dismiss_popup():
 """
     result = _run(["pinchtab", "eval", js])
     dismissed = 'clicked' in result.stdout or 'closed' in result.stdout or 'modal' in result.stdout
+    _touch_tab_activity(os.environ.get("VIOLATION_TAB_ID", ""))
     print(json.dumps({"dismissed": dismissed, "method": result.stdout.strip()}, ensure_ascii=False))
 
 

@@ -13,9 +13,9 @@ Keepalive Daemon — 独立于 Claude 会话的 12123 登录保活守护进程�
 生命周期:
   1. 启动时从 profiles 表读取公司信息（instance_port、platform_url）
   2. 创建专属 keepalive 标签页并导航到平台 URL（首次）
-  3. 每 55 分钟执行一个保活周期：reload + dismiss popup
+  3. 每 55 分钟执行一个保活周期：nav vehlist + dismiss popup
   4. 每个周期开始前检查 is_logged_in，若变为 0 则自动退出
-  5. reload 连续失败 → profile-logout → 退出
+  5. nav 连续失败 → profile-logout → 退出
   6. 检测到登录页或风控关键词 → profile-logout → 退出（若启用 auto-recover 则尝试一次 QR 恢复）
   7. 收到 SIGTERM/SIGINT → 清理 PID 文件后退出
 
@@ -49,7 +49,6 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib.core import (
     UNIT_LOGIN_URL,
-    LOGIN_PAGE_KEYWORDS,
     RATE_LIMIT_KEYWORDS,
     _parse_tab_ids,
 )
@@ -61,6 +60,7 @@ HEARTBEAT_MAX_SEC = 120              # max seconds between light heartbeats
 PAGE_LOAD_WAIT = 5                   # wait after reload
 POPUP_DISMISS_WAIT = 3               # wait after dismiss
 MAX_CONSECUTIVE_FAILURES = 3         # consecutive reload failures → exit
+MAX_CONSECUTIVE_UNKNOWN = 3         # consecutive unknown states → exit (CDP broken?)
 MAX_CONSECUTIVE_HEARTBEAT_FAILS = 5  # consecutive heartbeat fails → treat as potential stall
 
 # ── exit codes (for systemd RestartPreventExitStatus) ─────────
@@ -74,10 +74,7 @@ MAX_RECOVERY_ATTEMPTS = 1            # one recovery opportunity per keepalive se
 MAX_QR_REFRESHES = 3                 # within the one recovery, up to 3 QR sends (过期刷新)
 RECOVERY_POLL_INTERVAL = 10          # seconds between login checks during recovery
 RECOVERY_TIMEOUT = 300               # 5 minutes per QR code before refresh
-LOGIN_PAGE_WAIT = 3                  # wait after clicking login button before QR appears
-
-# Alias for backward compatibility within this file
-LOGIN_PAGE_INDICATORS = LOGIN_PAGE_KEYWORDS
+LOGIN_PAGE_WAIT = 3                  # wait after selecting unit login tab before QR appears
 
 # Paths for external tools (resolved at runtime)
 _TAB_SESSION = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -414,8 +411,71 @@ def _load_tab_id(tab_file):
         return None
 
 
+def _cleanup_stale_tabs(instance_port, keep_tab_id, log):
+    """Close stale login-page tabs, keep the platform-page tab.
+
+    Stale tabs (gab.122.gov.cn/m/login, deptLoginNext) accumulate from
+    repeated restarts.  Closing them is safe — cookies are per-profile,
+    not per-tab.  The platform-page tab (fj/sc/gd.122.gov.cn/*) MUST be
+    kept — closing the last tab breaks the 12123 session.
+    """
+    if not instance_port:
+        return
+    try:
+        result = _run_pinchtab(["tab", "--json"], instance_port=instance_port, timeout=10)
+        tabs = json.loads(result.stdout)
+        if isinstance(tabs, dict):
+            tabs = tabs.get("tabs", [])
+    except Exception as e:
+        log.debug(f"Cleanup: cannot list tabs: {e}")
+        return
+
+    stale_patterns = [
+        "gab.122.gov.cn/m/login",
+        "gab.122.gov.cn/m/deptLoginNext",
+    ]
+    closed = 0
+    for tab in tabs:
+        url = tab.get("url", "")
+        tid = tab.get("id", "")
+        if tid == keep_tab_id:
+            continue  # never close the keepalive tab
+        if any(p in url for p in stale_patterns):
+            try:
+                _run_pinchtab(["close", tid], instance_port=instance_port, timeout=10)
+                log.info(f"Cleanup: closed stale tab {tid[:16]}... ({url[:50]})")
+                closed += 1
+            except Exception as e:
+                log.debug(f"Cleanup: close tab {tid[:16]}... failed: {e}")
+    if closed:
+        log.info(f"Cleanup: closed {closed} stale login tab(s) on instance {instance_port}")
+
+
+def _cleanup_tab_registry(project_root, company, log):
+    """Remove this daemon's entry from tab_registry.json."""
+    registry_path = os.path.join(project_root, "data", "tab_registry.json")
+    if not os.path.exists(registry_path):
+        return
+    try:
+        with open(registry_path) as f:
+            registry = json.load(f)
+    except Exception:
+        return
+
+    # Key format used by session_manager.py: keepalive_<company>
+    key = f"keepalive_{company}"
+    if key in registry:
+        del registry[key]
+        try:
+            with open(registry_path, "w") as f:
+                json.dump(registry, f, indent=2, ensure_ascii=False)
+            log.info(f"Cleanup: removed '{key}' from tab_registry.json")
+        except Exception as e:
+            log.debug(f"Cleanup: write tab_registry.json failed: {e}")
+
+
 def _create_keepalive_tab(instance_port, platform_url, project_root, company, log):
-    """Create a new browser tab for keepalive, navigate to platform, then click 我的主页.
+    """Create a new browser tab for keepalive and navigate directly to 我的主页 (vehlist).
 
     Uses tab_session.py init --json to create and register the tab, then sets
     VIOLATION_TAB_ID so all subsequent _run_pinchtab() calls auto-inject --tab.
@@ -449,14 +509,20 @@ def _create_keepalive_tab(instance_port, platform_url, project_root, company, lo
         # auto-inject --tab <id> without switching the global active tab
         os.environ["VIOLATION_TAB_ID"] = tab_id
 
-        log.info(f"Navigating keepalive tab {tab_id} to {platform_url}")
-        _run_pinchtab(["nav", platform_url], instance_port=instance_port, timeout=30)
+        # Navigate to 我的主页 (vehicle list page) when we have a valid session.
+        # Auto-recovery passes UNIT_LOGIN_URL here — skip vehlist nav in that case
+        # because the user hasn't logged in yet.
+        if "122.gov.cn" in platform_url and "/m/login" not in platform_url:
+            vehlist_url = platform_url.rstrip("/") + "/views/memrent/vehlist.html"
+            log.info(f"Navigating keepalive tab {tab_id} to {vehlist_url}")
+            _run_pinchtab(["nav", vehlist_url], instance_port=instance_port, timeout=30)
+        else:
+            log.info(f"Navigating keepalive tab {tab_id} to {platform_url}")
+            _run_pinchtab(["nav", platform_url], instance_port=instance_port, timeout=30)
         time.sleep(PAGE_LOAD_WAIT)
 
-        # Dismiss popup and navigate to 我的主页 (vehicle list page)
-        # This ensures keepalive stays on a page that shows real login state
+        # Dismiss any popup that appears after navigation
         _dismiss_popup(instance_port, log)
-        _navigate_to_homepage(instance_port, log)
 
         return tab_id
     except Exception as e:
@@ -569,55 +635,45 @@ def _navigate_to_homepage(instance_port, log):
         return False
 
 
-def _check_page_state(instance_port, log):
-    """Check page state after reload: normal / login-page / rate-limited.
+def _check_page_state(instance_port, platform_url, log):
+    """Check page state after reload.
 
-    Uses pinchtab snap (accessibility tree) instead of text because text
-    includes hidden DOM elements — "退出"/"我的主页" exist in the HTML source
-    but are CSS-hidden when logged out, causing false positives.
+    After reload, verify the current URL is still on the platform (platform_url).
+    If the session expired, the server redirects to gab.122.gov.cn/m/login.
+
+    Rate-limit detection: snap check for anti-crawl keywords, since rate-limit
+    popups don't cause a URL redirect.
 
     Returns: ("ok"|"login_expired"|"rate_limited"|"unknown", detail_text)
     """
+    # ── rate-limit check (best-effort, non-fatal on failure) ──
     try:
         snap_result = _run_pinchtab(["snap"], instance_port=instance_port, timeout=15)
         snap_text = snap_result.stdout
+        for kw in RATE_LIMIT_KEYWORDS:
+            if kw in snap_text:
+                log.warning(f"Rate-limit keyword detected: '{kw}'")
+                return ("rate_limited", f"found keyword: {kw}")
     except Exception as e:
-        log.warning(f"PinchTab snap failed: {e}")
-        return ("unknown", f"snap command failed: {e}")
+        log.debug(f"Snap rate-limit check skipped (non-fatal): {e}")
 
-    # Check rate-limit keywords first (highest priority)
-    # These still use snap text — rate-limit popups are visible elements
-    for kw in RATE_LIMIT_KEYWORDS:
-        if kw in snap_text:
-            log.warning(f"Rate-limit keyword detected: '{kw}'")
-            return ("rate_limited", f"found keyword: {kw}")
-
-    # Check for normal logged-in state: "退出" or "我的主页" in accessibility tree.
-    # These are ONLY present in snap when actually visible (logged in).
-    # When logged out, they exist in HTML source but are CSS-hidden → absent from snap.
-    if "退出" in snap_text:
-        return ("ok", "logged in (退出 visible in snap)")
-
-    if "我的主页" in snap_text:
-        return ("ok", "logged in (我的主页 visible in snap)")
-
-    if any(kw in snap_text for kw in ["车辆管理", "租赁车辆"]):
-        return ("ok", "logged in (business menus visible in snap)")
-
-    # Check for login page — only if NOT clearly logged in.
-    # "单位用户登录"/"个人用户登录" are clickable buttons visible in snap
-    # when logged out. When logged in they still appear in HTML but may or
-    # may not be in snap depending on CSS — safe to check here since we
-    # already ruled out "退出"/"我的主页" above.
-    login_signals = [s for s in LOGIN_PAGE_INDICATORS if s in snap_text]
-    if login_signals:
-        log.warning(f"Login page detected in snap: {login_signals}")
-        return ("login_expired", f"login indicators: {login_signals}")
-
-    # Neither clearly logged in nor clearly expired
-    snap_preview = snap_text[:200].replace("\n", " ")
-    log.info(f"Ambiguous page state, snap preview: {snap_preview}")
-    return ("unknown", snap_preview[:100])
+    # ── URL check: must be on the platform, not anywhere else ──
+    try:
+        url_result = _run_pinchtab(
+            ["eval", "window.location.href"],
+            instance_port=instance_port, timeout=5
+        )
+        url = (url_result.stdout or "").strip()
+        if url.startswith(platform_url) and "vehlist" in url and "/m/login" not in url:
+            log.info(f"Session OK (URL={url[:80]})")
+            return ("ok", url[:80])
+        log.warning(f"Session expired: not on 我的主页 (URL={url[:80]})")
+        return ("login_expired", f"not on 我的主页: {url[:80]}")
+    except Exception as e:
+        # URL eval failed — instance may be slow/busy, don't mark as
+        # login_expired (that would trigger false auto-recovery).
+        log.warning(f"URL check failed (transient, retry next cycle): {e}")
+        return ("unknown", f"URL check failed: {e}")
 
 
 # ── heartbeat ──────────────────────────────────────────────────
@@ -733,11 +789,14 @@ def _resolve_notify_target(name=None, phone=None, chat=None, log=None):
                     timeout=20
                 )
                 data = json.loads(result.stdout)
-                users = data if isinstance(data, list) else data.get("data", [])
-                if users:
-                    uid = users[0].get("open_id") or users[0].get("id")
+                user_list = data if isinstance(data, list) else []
+                if not user_list:
+                    inner = data.get("data", {}) if isinstance(data, dict) else {}
+                    user_list = inner.get("users", [])
+                if user_list:
+                    uid = user_list[0].get("open_id") or user_list[0].get("id")
                     if uid:
-                        label = users[0].get("name") or name
+                        label = user_list[0].get("localized_name") or user_list[0].get("name") or name
                         if log:
                             log.info("Resolved user '%s' → %s (%s…)", name, label, uid[:8])
                         return {"type": "user", "id": uid, "label": label}
@@ -820,53 +879,204 @@ def _take_qr_screenshot(instance_port, output_path, log):
         return False
 
 
-def _click_unit_login_button(instance_port, log):
-    """Click the '单位用户登录'/'单位用户扫码登录' tab/button on the login page."""
+def _ensure_unit_login_tab(instance_port, log):
+    """Ensure the '单位用户登录' tab is selected on the login page.
+
+    12123 login page has two tabs: 个人用户登录 (t=1) and 单位用户登录 (t=2).
+    Even with ?t=2 in URL, the page may not reliably select the unit tab.
+    This function checks if the unit tab is active, and clicks it if not.
+
+    Returns True if unit tab is confirmed selected, False on error.
+    """
     js = """
 (function() {
+  // Find the unit login tab element
   var all = document.querySelectorAll('*');
+  var unitTab = null;
   for (var i = 0; i < all.length; i++) {
     var el = all[i];
     var text = (el.textContent || '').trim();
-    // Match both "单位用户登录" and "单位用户扫码登录"
-    if (text.indexOf('单位用户') !== -1 && (text.indexOf('登录') !== -1 || text.indexOf('扫码') !== -1)) {
-      // Only click if this is likely the tab/button itself (not a large container)
-      if (text.length < 30) {
-        // Try to click the closest clickable ancestor
-        var target = el;
-        while (target && target.tagName && target.tagName.toLowerCase() !== 'button'
-               && target.tagName.toLowerCase() !== 'a'
-               && target.tagName.toLowerCase() !== 'li'
-               && target.tagName.toLowerCase() !== 'span') {
-          target = target.parentElement;
-        }
-        if (target) {
-          target.click();
-          return 'clicked:' + target.tagName + ':' + text;
-        }
-        el.click();
-        return 'clicked-element:' + el.tagName + ':' + text;
-      }
+    if (text.indexOf('单位用户') !== -1 && text.indexOf('登录') !== -1 && text.length < 30) {
+      unitTab = el;
+      break;
     }
   }
-  return 'not-found';
+  if (!unitTab) return 'UNIT_TAB_NOT_FOUND';
+
+  // Check if already active: check the element and its parents for active/selected/cur classes
+  var node = unitTab;
+  for (var depth = 0; depth < 5 && node; depth++) {
+    var cls = (node.className || '') + ' ' + (node.getAttribute('class') || '');
+    if (/\\b(active|selected|cur|on|current)\\b/i.test(cls)) {
+      return 'ALREADY_ACTIVE:' + unitTab.textContent.trim();
+    }
+    node = node.parentElement;
+  }
+
+  // Not active — click it
+  var target = unitTab;
+  while (target && target.tagName && target.tagName.toLowerCase() !== 'button'
+         && target.tagName.toLowerCase() !== 'a'
+         && target.tagName.toLowerCase() !== 'li'
+         && target.tagName.toLowerCase() !== 'span') {
+    target = target.parentElement;
+  }
+  if (target) {
+    target.click();
+    return 'CLICKED:' + target.tagName + ':' + unitTab.textContent.trim();
+  }
+  unitTab.click();
+  return 'CLICKED_ELEMENT:' + unitTab.tagName + ':' + unitTab.textContent.trim();
 })()
 """
     try:
         result = _run_pinchtab(["eval", js], instance_port=instance_port, timeout=15)
-        log.info(f"Click unit login result: {result.stdout.strip()[:100]}")
-        return "clicked" in result.stdout.lower()
+        output = result.stdout.strip()
+        log.info(f"Ensure unit login tab: {output[:120]}")
+        if "UNIT_TAB_NOT_FOUND" in output:
+            log.warning("Unit login tab not found on page — may already show QR")
+            return True  # Tab not found but maybe the page doesn't need it
+        if "ALREADY_ACTIVE" in output:
+            log.info("Unit login tab already selected")
+            return True
+        if "CLICKED" in output:
+            log.info("Clicked unit login tab to select it")
+            return True
+        return True  # Default: assume OK
     except Exception as e:
-        log.error(f"Click unit login error: {e}")
+        log.error(f"Ensure unit login tab error: {e}")
+        return True  # Don't block on this check — proceed with screenshot
+
+
+def _click_company_on_deptnext(instance_port, company, log):
+    """Select company and click login on deptLoginNext page.
+
+    Follows DST skill SKILL.md "A. deptLoginNext 流程" precisely:
+      a. Extract companies via querySelectorAll('.company-name')
+      b. Fuzzy-match target company against list entries
+      c. Click matching .company-name div
+      d. Verify: parentElement.classList.contains('active')
+      e. Click 登录 button (document.getElementById('btnQyyhdl'))
+
+    Returns True if company was selected AND login button was clicked,
+    False otherwise (caller should retry on next poll iteration).
+    """
+    # Build keyword list for fuzzy matching: full name + progressively shorter forms
+    keywords = [company]
+    # Add short name (strip 有限公司/股份有限公司 etc.)
+    short = company
+    for suffix in ["有限", "责任", "股份", "公司", "汽车", "服务", "租赁", "新能源"]:
+        short = short.replace(suffix, "")
+    short = short.strip()
+    if short and short not in keywords:
+        keywords.append(short)
+    # Also try the first meaningful word (e.g. city name)
+    parts = [p for p in company.replace("有限", " ").replace("公司", " ").split() if len(p) >= 2]
+    for p in parts:
+        if p not in keywords:
+            keywords.append(p)
+
+    keywords_json = json.dumps(keywords, ensure_ascii=False)
+
+    # Step 1: querySelectorAll('.company-name'), match, click, verify
+    select_js = f"""(function(){{
+  var keywords = {keywords_json};
+  var companies = document.querySelectorAll('.company-name');
+  if (!companies || companies.length === 0) {{
+    return 'NO_COMPANY_ELEMENTS';
+  }}
+  var target = null;
+  for (var k = 0; k < keywords.length && !target; k++) {{
+    var kw = keywords[k];
+    for (var i = 0; i < companies.length; i++) {{
+      if ((companies[i].textContent || '').indexOf(kw) >= 0) {{
+        target = companies[i];
+        break;
+      }}
+    }}
+  }}
+  if (!target) {{
+    // Gather all company names for diagnostics
+    var names = [];
+    for (var i = 0; i < companies.length; i++) {{
+      names.push((companies[i].textContent || '').trim());
+    }}
+    return 'NOT_FOUND:' + JSON.stringify(names);
+  }}
+  target.click();
+  // Verify: check parentElement.classList.contains('active')
+  var verified = target.parentElement && target.parentElement.classList.contains('active');
+  return 'CLICKED:' + target.textContent.trim() + '|verified=' + verified;
+}})()"""
+
+    try:
+        result = _run_pinchtab(
+            ["eval", select_js],
+            instance_port=instance_port, timeout=15
+        )
+        output = (result.stdout or "").strip()
+        log.info(f"Company selection: {output[:300]}")
+
+        if output.startswith("NO_COMPANY_ELEMENTS"):
+            log.warning("No .company-name elements found — page may still be loading")
+            return False
+
+        if output.startswith("NOT_FOUND:"):
+            log.warning(f"Company '{company}' not in deptLoginNext list. "
+                        f"Keywords tried: {keywords}. List: {output}")
+            return False  # Don't click login — would select wrong company
+
+        if not output.startswith("CLICKED:"):
+            log.warning(f"Unexpected company selection result: {output[:200]}")
+            return False
+
+        log.info(f"Company clicked: {output}")
+    except Exception as e:
+        log.error(f"Company selection eval error: {e}")
+        return False
+
+    # Step 2: Click 登录 button (btnQyyhdl)
+    login_js = """(function(){
+  var btn = document.getElementById('btnQyyhdl');
+  if (btn) { btn.click(); return 'LOGIN_CLICKED'; }
+  // Fallback: search for login button by visible text
+  var all = document.querySelectorAll('button, a, .btn, [role="button"]');
+  for (var i = 0; i < all.length; i++) {
+    var t = (all[i].textContent || '').trim();
+    if (t === '登录' || t === '登 录' || t === '确认登录') {
+      all[i].click();
+      return 'LOGIN_CLICKED_FALLBACK:' + all[i].tagName;
+    }
+  }
+  return 'LOGIN_BTN_NOT_FOUND';
+})()"""
+    try:
+        result = _run_pinchtab(
+            ["eval", login_js],
+            instance_port=instance_port, timeout=15
+        )
+        output = (result.stdout or "").strip()
+        log.info(f"Login button: {output[:120]}")
+        if "LOGIN_CLICKED" in output:
+            time.sleep(PAGE_LOAD_WAIT)
+            return True
+        else:
+            log.warning(f"Login button not found after company selection: {output}")
+            return False
+    except Exception as e:
+        log.error(f"Login button click error: {e}")
         return False
 
 
 def _poll_until_logged_in(instance_port, timeout_seconds, poll_interval, log,
                           shutdown_flag=None, health_file=None, tab_id=None,
-                          cycle_count=0):
+                          cycle_count=0, company=None):
     """Poll page state until logged in or timeout. Uses keyword match on
     post-login indicators (公司列表, 退出, 车辆管理 etc.) — this is the
     intended use of text matching: detecting the transition after QR scan.
+
+    When a company list page is detected, attempts to click the target
+    company automatically before continuing to poll.
 
     Sends WATCHDOG=1 each iteration so the daemon won't be killed by
     systemd watchdog timeout during the potentially 5-minute poll window.
@@ -874,6 +1084,7 @@ def _poll_until_logged_in(instance_port, timeout_seconds, poll_interval, log,
 
     Returns True if logged in, False on timeout or shutdown signal."""
     deadline = time.time() + timeout_seconds
+    company_clicked = False
     while time.time() < deadline:
         if shutdown_flag and shutdown_flag.get("triggered"):
             log.info("Shutdown signaled during QR poll — aborting.")
@@ -888,10 +1099,18 @@ def _poll_until_logged_in(instance_port, timeout_seconds, poll_interval, log,
             if any(kw in page_text for kw in ["车辆管理", "租赁车辆", "业务办理", "违法查询"]):
                 log.info(f"Login detected: business menus found")
                 return True
-            # Also check for company list page (post-QR landing)
+            # Company list page (deptLoginNext post-QR landing)
+            # ── Aligned with DST skill SKILL.md "A. deptLoginNext 流程" ──
+            # Uses querySelectorAll('.company-name') for precise selection,
+            # verifies active state, then clicks 登录 button.
             if any(kw in page_text for kw in ["公司列表", "公司名称", "请选择", "选择单位"]):
-                log.info("Login detected: company list page")
-                return True
+                if company and not company_clicked:
+                    log.info(f"Login detected: deptLoginNext page, selecting company '{company}'...")
+                    company_clicked = _click_company_on_deptnext(
+                        instance_port, company, log
+                    )
+                elif not company:
+                    log.info("Login detected: deptLoginNext page (no company to auto-select)")
         except Exception as e:
             log.warning(f"Poll check error: {e}")
 
@@ -928,8 +1147,8 @@ def _auto_recover_login(company, instance_port, platform_url, project_root, log,
     disk only (no Lark notification).
 
     Flow:
-    1. Navigate to UNIT_LOGIN_URL
-    2. Click '单位用户登录'
+    1. Navigate to UNIT_LOGIN_URL (https://gab.122.gov.cn/m/login?t=2)
+    2. Confirm '单位用户登录' tab is selected (personal/unit tabs share QR area)
     3. Screenshot QR code
     4. Send to Lark (if notify configured): user→P2P, chat→group
     5. Poll for login success (5 min timeout per QR)
@@ -960,10 +1179,10 @@ def _auto_recover_login(company, instance_port, platform_url, project_root, log,
                 continue
             time.sleep(PAGE_LOAD_WAIT)
 
-            # Step 2: Click "单位用户登录"
-            log.info("Clicking '单位用户登录'...")
-            _click_unit_login_button(instance_port, log)
-            time.sleep(LOGIN_PAGE_WAIT)
+            # Step 2: Confirm unit login tab is selected (personal/unit share same QR page)
+            log.info("Ensuring '单位用户登录' tab is selected...")
+            _ensure_unit_login_tab(instance_port, log)
+            time.sleep(PAGE_LOAD_WAIT)
 
             # Step 3: Take QR screenshot
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -972,6 +1191,18 @@ def _auto_recover_login(company, instance_port, platform_url, project_root, log,
                 data_dir,
                 f"recovery_qr_{_safe_name(company)}_{timestamp}.png"
             )
+
+            # Remove old recovery QR files for this company (QR is single-use)
+            try:
+                import glob
+                old_pattern = os.path.join(data_dir, f"recovery_qr_{_safe_name(company)}_*.png")
+                for old in glob.glob(old_pattern):
+                    try:
+                        os.remove(old)
+                    except OSError:
+                        pass
+            except Exception:
+                pass
 
             screenshot_ok = _take_qr_screenshot(instance_port, qr_file, log)
 
@@ -1076,7 +1307,7 @@ def _auto_recover_login(company, instance_port, platform_url, project_root, log,
             logged_in = _poll_until_logged_in(
                 instance_port, RECOVERY_TIMEOUT, RECOVERY_POLL_INTERVAL, log,
                 shutdown_flag=shutdown_flag, health_file=health_file,
-                tab_id=tab_id, cycle_count=cycle_count
+                tab_id=tab_id, cycle_count=cycle_count, company=company
             )
 
             if logged_in:
@@ -1183,6 +1414,8 @@ def _run_daemon(company, project_root, auto_recover=False,
             log.info("No notify target configured (no CLI args, no persisted config). "
                      "Auto-recovery QR will be saved to disk only.")
 
+    cycle_count = 0
+
     # Verify login state at startup
     profile = _read_profile(db_path, company)
     if profile is None:
@@ -1190,6 +1423,13 @@ def _run_daemon(company, project_root, auto_recover=False,
         _remove_pid(pid_file)
         print(json.dumps({"ok": False, "error": "company not found in profiles"}))
         sys.exit(1)
+
+    # Notify systemd we're ready BEFORE auto-recovery.
+    # Default TimeoutStartSec=90s kills the process if READY=1 isn't sent
+    # in time, but auto-recovery (3 QR × 5 min each) can take up to 15 min.
+    # After READY=1, WatchdogSec=240 takes over; poll loop feeds WATCHDOG=1
+    # every 10s, and the longest gap between QR attempts is ~100s < 240s.
+    _sd_notify("READY=1", log)
 
     if not profile["is_logged_in"]:
         if auto_recover:
@@ -1207,6 +1447,10 @@ def _run_daemon(company, project_root, auto_recover=False,
                     _save_tab_id(tab_file, tab_id)
 
             if tab_id:
+                # Ensure VIOLATION_TAB_ID is set so _run_pinchtab targets this tab.
+                # _create_keepalive_tab sets it, but when reusing an existing tab
+                # (line 1375 passes verification), it's never set.
+                os.environ["VIOLATION_TAB_ID"] = tab_id
                 recovered = _auto_recover_login(
                     company, instance_port, platform_url, project_root, log,
                     notify=notify, shutdown_flag=shutdown_flag,
@@ -1279,18 +1523,16 @@ def _run_daemon(company, project_root, auto_recover=False,
     os.environ["VIOLATION_TAB_ID"] = tab_id
 
     consecutive_failures = 0
+    consecutive_unknown = 0
     cycle_count = 0
     recovery_used = False  # only ONE auto-recovery opportunity per keepalive session
     exit_code = EXIT_OK    # track exit reason for systemd RestartPreventExitStatus
-
-    # Notify systemd that daemon is fully initialized
-    _sd_notify("READY=1", log)
 
     while not shutdown_flag["triggered"]:
         cycle_count += 1
         cycle_start = time.time()
         # Notify systemd watchdog immediately at cycle start so the
-        # reload + dismiss + navigate + check (20-30s of pinchtab calls)
+        # nav + dismiss + check (20-30s of pinchtab calls)
         # can't push us past WatchdogSec if the last heartbeat was >90s ago.
         _sd_notify("WATCHDOG=1", log)
         _touch_health(health_file, "ok", tab_id, cycle_count, instance_port, log)
@@ -1327,15 +1569,18 @@ def _run_daemon(company, project_root, auto_recover=False,
                 continue
             _save_tab_id(tab_file, tab_id)
 
-        # ── step 1: reload page ──
+        # ── step 1: navigate to 我的主页 (vehlist) ──
+        # Direct navigation ensures we always land on the vehicle list page
+        # regardless of where the tab was previously (root, recovery page, etc.).
+        vehlist_url = platform_url.rstrip("/") + "/views/memrent/vehlist.html"
         try:
-            reload_result = _run_pinchtab(["reload"], instance_port=instance_port, timeout=30)
-            if reload_result.returncode != 0:
+            nav_result = _run_pinchtab(["nav", vehlist_url], instance_port=instance_port, timeout=30)
+            if nav_result.returncode != 0:
                 consecutive_failures += 1
-                log.error(f"Reload failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): "
-                          f"{reload_result.stderr[:200]}")
+                log.error(f"Nav to vehlist failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): "
+                          f"{nav_result.stderr[:200]}")
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    log.critical("Too many consecutive reload failures — exiting.")
+                    log.critical("Too many consecutive nav failures — exiting.")
                     _set_logged_out(db_path, company)
                     exit_code = EXIT_LOGGED_OUT
                     break
@@ -1351,9 +1596,9 @@ def _run_daemon(company, project_root, auto_recover=False,
             time.sleep(PAGE_LOAD_WAIT)
         except Exception as e:
             consecutive_failures += 1
-            log.error(f"Reload exception: {e} ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
+            log.error(f"Nav exception: {e} ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})")
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                log.critical("Too many consecutive reload failures — exiting.")
+                log.critical("Too many consecutive nav failures — exiting.")
                 _set_logged_out(db_path, company)
                 exit_code = EXIT_LOGGED_OUT
                 break
@@ -1369,14 +1614,8 @@ def _run_daemon(company, project_root, auto_recover=False,
         # ── step 2: dismiss popups ──
         _dismiss_popup(instance_port, log)
 
-        # ── step 3: navigate to 我的主页 ──
-        # Always click 我的主页 to ensure we're on the vehicle list page,
-        # not the province homepage. This way anomalies (rate-limit,
-        # session expiry) are detected immediately.
-        _navigate_to_homepage(instance_port, log)
-
-        # ── step 4: check page state ──
-        state, detail = _check_page_state(instance_port, log)
+        # ── step 3: verify session (URL must be on vehlist page) ──
+        state, detail = _check_page_state(instance_port, platform_url, log)
 
         if state == "rate_limited":
             log.critical(f"Rate-limited! {detail}")
@@ -1413,16 +1652,22 @@ def _run_daemon(company, project_root, auto_recover=False,
 
         elif state == "ok":
             log.info(f"Page state OK: {detail}")
+            consecutive_unknown = 0
             # Persist cookies every cycle so session cookies survive Chrome restart
             _persist_cookies(
                 _get_profile_dir(profile.get("profile_name")), log
             )
 
         else:
-            # "unknown" — _check_page_state already used snap, so this means
-            # the accessibility tree had no clear login/logout indicators.
-            # Don't break — the page might be loading or in a transient state.
-            log.warning(f"Unknown page state (snap inconclusive): {detail}")
+            # "unknown" — transient CDP failure (timeout, instance busy).
+            # Skip this cycle, but if it happens too many times in a row,
+            # the CDP/instance is likely broken and we should exit.
+            consecutive_unknown += 1
+            log.warning(f"Transient page state check failure ({consecutive_unknown}/{MAX_CONSECUTIVE_UNKNOWN}): {detail}")
+            if consecutive_unknown >= MAX_CONSECUTIVE_UNKNOWN:
+                log.critical("Too many consecutive unknown states — CDP likely broken, exiting.")
+                exit_code = EXIT_LOGGED_OUT
+                break
 
         # ── step 4: sleep + interleaved heartbeats until next cycle ──
         elapsed = time.time() - cycle_start
@@ -1499,6 +1744,15 @@ def _run_daemon(company, project_root, auto_recover=False,
 
     # ── cleanup ──
     log.info(f"Keepalive daemon exiting (code={exit_code}).")
+
+    # Close stale login-page tabs on this instance to prevent tab accumulation.
+    # Keep the platform-page tab (fj/sc/gd.122.gov.cn/*) — closing it would
+    # lose the session (verified: 12123 session breaks when all tabs closed).
+    _cleanup_stale_tabs(instance_port, tab_id, log)
+
+    # Clean up tab_registry.json entry so stale entries don't accumulate
+    _cleanup_tab_registry(project_root, company, log)
+
     _touch_health(health_file, "exited", tab_id, cycle_count, instance_port, log)
     _remove_pid(pid_file)
     # Note: we do NOT remove the tab_file — the tab persists in Chrome

@@ -111,27 +111,53 @@ def cmd_gen_qr_fallback():
 
 def cmd_gen_result_msg():
     """Generate query completion notification post message JSON.
-    Includes summary + history comparison (N4)."""
+    Includes summary + history comparison (N4).
+
+    Key metrics:
+      --scanned-count            扫描车辆总数（DB中该公司/日期的车辆总数）
+      --new-vehicle-count        新入库车辆数（本次扫描新增）
+      --vehicles-with-violations  有违章车辆数（查询列表中的车辆数）
+      --vehicles-queried         实际成功查询车辆数
+      --new-violation-count      新增违章条数
+      --new-points               新增扣分
+      --new-unpaid-fine          新增待缴费罚款
+      --resolved-count           对比历史已处理条数
+    """
     p = {
-        "company": "", "date": "", "vehicle_count": "0",
+        "company": "", "date": "",
         "scanned_count": "0", "new_vehicle_count": "0",
+        "vehicles_with_violations": "0", "vehicles_queried": "0",
         "new_violation_count": "0", "new_points": "0", "new_unpaid_fine": "0",
-        "resolved_count": "0",
+        "resolved_count": "0", "missing_vehicle_count": "0",
         "target_type": "personal", "user_id": "", "user_name": ""
     }
     _read_stdin_json(p)
     args = sys.argv[2:]
     i = 0
     while i < len(args):
-        for key in ["company", "date", "vehicle_count", "scanned_count",
-                     "new_vehicle_count",
-                     "new_violation_count", "new_points", "new_unpaid_fine",
-                     "resolved_count",
+        for key in ["company", "date",
+                     "scanned_count", "scanned-count",
+                     "new_vehicle_count", "new-vehicle-count",
+                     "vehicles_with_violations", "vehicles-with-violations",
+                     "vehicles_queried", "vehicles-queried",
+                     "vehicle_count", "vehicle-count",
+                     "new_violation_count", "new-violation-count",
+                     "new_points", "new-points",
+                     "new_unpaid_fine", "new-unpaid-fine",
+                     "resolved_count", "resolved-count",
+                     "missing_vehicle_count", "missing-vehicle-count",
                      "target_type", "user_id", "user_name"]:
-            if args[i] == f"--{key.replace('_', '-')}" and i + 1 < len(args):
-                p[key] = args[i + 1]; i += 2; break
+            cli_key = key if '-' in key else key.replace('_', '-')
+            if args[i] == f"--{cli_key}" and i + 1 < len(args):
+                # Normalize hyphenated CLI keys to underscore dict keys
+                dict_key = key.replace('-', '_')
+                p[dict_key] = args[i + 1]; i += 2; break
         else:
             i += 1
+
+    # Backward compat: --vehicle-count maps to vehicles_with_violations if not explicitly set
+    if p.get("vehicle_count") and p["vehicle_count"] != "0" and p.get("vehicles_with_violations", "0") == "0":
+        p["vehicles_with_violations"] = p["vehicle_count"]
 
     # N4: history comparison — query DB for previous same-company results
     history_lines = []
@@ -159,13 +185,19 @@ def cmd_gen_result_msg():
                 today_new = sum(1 for r in rows if r[1] and r[1][:10] == today)
                 # Count violations from previous dates
                 prev_total = sum(1 for r in rows if r[0] and r[0][:10] != today)
-                # Count historical total
+                # Count historical total (all violations in DB for this company)
                 total_all = len(rows)
+                # Count previously resolved violations
+                prev_resolved = sum(1 for r in rows if r[2] and '已处理' in str(r[2]) and (r[1] and r[1][:10] != today if r[1] else True))
 
                 if prev_total > 0:
                     history_lines.append(
                         f"📊 历史对比：本次新增 {today_new} 条，历史累计 {total_all} 条"
                     )
+                    if prev_resolved > 0:
+                        history_lines.append(
+                            f"✅ 历史已处理：{prev_resolved} 条"
+                        )
                 elif today_new > 0 and prev_total == 0:
                     history_lines.append(
                         f"📊 首次查询（无历史数据），本次采集 {today_new} 条"
@@ -174,18 +206,22 @@ def cmd_gen_result_msg():
             pass  # History comparison is best-effort, never break the main flow
 
     title = "✅ 12123违章查询完成"
-    # Simple summary: 7 key metrics
+    # Summary: all key metrics in clear groups
     lines = [
         f"🏢 {p['company']}  🕐 {p['date']}",
-        f"📋 扫描车辆：{p['scanned_count']} 台  🚗 查询车辆：{p['vehicle_count']} 台  🆕 新入库：{p['new_vehicle_count']} 台",
+        f"📋 扫描车辆：{p['scanned_count']} 台  🆕 新入库：{p['new_vehicle_count']} 台",
+        f"🚗 有违章车辆：{p['vehicles_with_violations']} 台  ✅ 成功查询：{p['vehicles_queried']} 台",
         f"⚠️ 新增违章：{p['new_violation_count']} 条",
         f"📛 新增扣分：{p['new_points']} 分",
         f"💰 新增待缴费：{p['new_unpaid_fine']} 元",
     ]
-    # Show resolved count only if > 0
+    # Show missing (不存在) count only if > 0
+    if p.get("missing_vehicle_count") and p["missing_vehicle_count"] != "0":
+        lines.append(f"🚫 已不存在车辆：{p['missing_vehicle_count']} 台")
+    # Show resolved count only if explicitly provided
     if p.get("resolved_count") and p["resolved_count"] != "0":
-        lines.append(f"✅ 对比历史已处理：{p['resolved_count']} 条")
-    # N4: append history comparison if available
+        lines.append(f"✅ 对比历史已处理违章：{p['resolved_count']} 条")
+    # Append history comparison if available
     if history_lines:
         lines.extend(history_lines)
     summary = "\n".join(lines)

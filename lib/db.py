@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS profiles (
 CREATE INDEX IF NOT EXISTS idx_profiles_company ON profiles(company_name);
 ALTER TABLE profiles ADD COLUMN is_logged_in INTEGER DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_violations_query_date ON violations(query_date);
+ALTER TABLE vehicles ADD COLUMN tag TEXT DEFAULT '';
+ALTER TABLE vehicles ADD COLUMN tag_batch_id TEXT DEFAULT '';
 """
 def _get_db_path():
     return os.path.join(_get_data_dir(), "violations.db")
@@ -136,17 +138,20 @@ def cmd_db_insert_vehicle():
     Args (stdin JSON or CLI):
     --company-id --plate-number --plate-type --plate-type-label --status-code
     --status-label --inspection-date --unprocessed-count --query-date
+    --tag --tag-batch-id
     Returns JSON with vehicle_id."""
     p = {"company_id": 0, "plate_number": "", "plate_type": "", "plate_type_label": "",
          "status_code": "", "status_label": "", "inspection_date": "",
-         "unprocessed_count": 0, "query_date": ""}
+         "unprocessed_count": 0, "query_date": "",
+         "tag": "", "tag_batch_id": ""}
     _read_stdin_json(p)
     args = sys.argv[2:]
     i = 0
     while i < len(args):
         for key in ["company-id", "plate-number", "plate-type", "plate-type-label",
                      "status-code", "status-label", "inspection-date",
-                     "unprocessed-count", "query-date"]:
+                     "unprocessed-count", "query-date",
+                     "tag", "tag-batch-id"]:
             if args[i] == f"--{key}" and i + 1 < len(args):
                 p[key.replace("-", "_")] = args[i + 1]; i += 2; break
         else:
@@ -163,19 +168,23 @@ def cmd_db_insert_vehicle():
         conn.execute(
             """UPDATE vehicles SET plate_type=?, plate_type_label=?,
                status_code=?, status_label=?, inspection_date=?,
-               unprocessed_count=?, query_date=?
+               unprocessed_count=?, query_date=?,
+               tag=?, tag_batch_id=?
                WHERE id=?""",
             (p["plate_type"], p["plate_type_label"],
              p["status_code"], p["status_label"], p["inspection_date"],
-             int(p["unprocessed_count"]), p["query_date"], vehicle_id))
+             int(p["unprocessed_count"]), p["query_date"],
+             p["tag"], p["tag_batch_id"], vehicle_id))
     else:
         cur = conn.execute(
             """INSERT INTO vehicles (company_id, plate_number, plate_type, plate_type_label,
-               status_code, status_label, inspection_date, unprocessed_count, query_date)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               status_code, status_label, inspection_date, unprocessed_count, query_date,
+               tag, tag_batch_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (p["company_id"], p["plate_number"], p["plate_type"], p["plate_type_label"],
              p["status_code"], p["status_label"], p["inspection_date"],
-             int(p["unprocessed_count"]), p["query_date"]))
+             int(p["unprocessed_count"]), p["query_date"],
+             p["tag"], p["tag_batch_id"]))
         vehicle_id = cur.lastrowid
     conn.commit()
     conn.close()

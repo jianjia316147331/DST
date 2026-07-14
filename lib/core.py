@@ -774,6 +774,286 @@ def cmd_get_login_url():
     """Output the national unit login URL."""
     print(UNIT_LOGIN_URL)
 
+
+def cmd_release_tab():
+    """Close current session tab and clean up tab_registry.json.
+
+    Reads VIOLATION_TAB_ID from env, finds its label in tab_registry.json,
+    then delegates to session_manager.py release for the actual close + cleanup.
+
+    Outputs JSON: {ok, tab_id, label, delegated}
+    """
+    tab_id = os.environ.get("VIOLATION_TAB_ID", "").strip()
+
+    if not tab_id:
+        print(json.dumps({"ok": False, "error": "VIOLATION_TAB_ID not set"},
+                         ensure_ascii=False))
+        return
+
+    # Find label for this tab_id in the registry
+    label = None
+    try:
+        registry_path = os.path.join(
+            os.getcwd(), "violation_query", "data", "tab_registry.json"
+        )
+        if os.path.exists(registry_path):
+            with open(registry_path, "r", encoding="utf-8") as f:
+                registry = json.load(f)
+            for lbl, info in registry.items():
+                if info.get("tab_id") == tab_id:
+                    label = lbl
+                    break
+    except Exception:
+        pass
+
+    if not label:
+        # Tab not in registry — might have been cleaned already.
+        # Still try to close the tab via pinchtab directly.
+        closed = False
+        try:
+            result = _run(["pinchtab", "close", tab_id], timeout=10)
+            closed = result.returncode == 0
+        except Exception:
+            pass
+        print(json.dumps({
+            "ok": True, "tab_id": tab_id,
+            "closed": closed, "registry_cleaned": False,
+            "note": "tab not found in registry, closed directly",
+        }, ensure_ascii=False))
+        return
+
+    # Delegate to session_manager.py release
+    session_mgr = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "session_manager.py"
+    )
+    result = _run(
+        [sys.executable or "python3", session_mgr, "release", "--label", label],
+        timeout=15
+    )
+    print(json.dumps({
+        "ok": True,
+        "tab_id": tab_id,
+        "label": label,
+        "delegated": True,
+    }, ensure_ascii=False))
+
+
+def cmd_mark_task_done():
+    """Write a lightweight completion marker file for the current task.
+
+    Reads VIOLATION_TAB_ID from env.  Writes .task_done_<tab_id>.json
+    to violation_query/data/ with completion metadata.
+
+    Options (all optional, for audit):
+      --company <name>
+      --query-type single|batch
+      --vehicles-queried <n>
+      --new-violations <n>
+      --changed-violations <n>
+      --new-vehicles <n>
+      --new-points <n>
+      --new-fine <n>
+      --failed-vehicles <n>
+
+    Outputs JSON: {ok, marker_file, tab_id}
+    """
+    tab_id = os.environ.get("VIOLATION_TAB_ID", "").strip()
+    if not tab_id:
+        print(json.dumps({"ok": False, "error": "VIOLATION_TAB_ID not set"},
+                         ensure_ascii=False))
+        return
+
+    # Parse optional flags
+    company = ""
+    query_type = ""
+    vehicles_queried = 0
+    new_violations = 0
+    changed_violations = 0
+    new_vehicles = 0
+    new_points = 0
+    new_fine = 0
+    failed_vehicles = 0
+    missing_vehicles = 0
+    args = sys.argv[2:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--company" and i + 1 < len(args):
+            company = args[i + 1]; i += 2
+        elif args[i] == "--query-type" and i + 1 < len(args):
+            query_type = args[i + 1]; i += 2
+        elif args[i] == "--vehicles-queried" and i + 1 < len(args):
+            vehicles_queried = int(args[i + 1]); i += 2
+        elif args[i] == "--new-violations" and i + 1 < len(args):
+            new_violations = int(args[i + 1]); i += 2
+        elif args[i] == "--changed-violations" and i + 1 < len(args):
+            changed_violations = int(args[i + 1]); i += 2
+        elif args[i] == "--new-vehicles" and i + 1 < len(args):
+            new_vehicles = int(args[i + 1]); i += 2
+        elif args[i] == "--new-points" and i + 1 < len(args):
+            new_points = int(args[i + 1]); i += 2
+        elif args[i] == "--new-fine" and i + 1 < len(args):
+            new_fine = int(args[i + 1]); i += 2
+        elif args[i] == "--failed-vehicles" and i + 1 < len(args):
+            failed_vehicles = int(args[i + 1]); i += 2
+        elif args[i] == "--missing-vehicles" and i + 1 < len(args):
+            missing_vehicles = int(args[i + 1]); i += 2
+        else:
+            i += 1
+
+    data_dir = os.path.join(os.getcwd(), "violation_query", "data")
+    os.makedirs(data_dir, exist_ok=True)
+    marker_file = os.path.join(data_dir, f".task_done_{tab_id}.json")
+
+    marker = {
+        "tab_id": tab_id,
+        "company": company,
+        "query_type": query_type,
+        "completed_at": datetime.now().isoformat(),
+    }
+    if vehicles_queried:
+        marker["vehicles_queried"] = vehicles_queried
+    if new_violations:
+        marker["new_violations"] = new_violations
+    if changed_violations:
+        marker["changed_violations"] = changed_violations
+    if new_vehicles:
+        marker["new_vehicles"] = new_vehicles
+    if new_points:
+        marker["new_points"] = new_points
+    if new_fine:
+        marker["new_fine"] = new_fine
+    if failed_vehicles:
+        marker["failed_vehicles"] = failed_vehicles
+    if missing_vehicles:
+        marker["missing_vehicles"] = missing_vehicles
+
+    try:
+        with open(marker_file, "w", encoding="utf-8") as f:
+            json.dump(marker, f, ensure_ascii=False, indent=2)
+        print(json.dumps({"ok": True, "marker_file": marker_file, "tab_id": tab_id},
+                         ensure_ascii=False))
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+
+
+def cmd_check_task_done():
+    """Check whether a completion marker exists for a tab.
+
+    --tab-id <id>   check specific tab
+    (if omitted, reads VIOLATION_TAB_ID from env)
+
+    Outputs JSON: {done: true/false, marker_file: path or null, marker: {...}}
+    """
+    tab_id = ""
+    args = sys.argv[2:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--tab-id" and i + 1 < len(args):
+            tab_id = args[i + 1]; i += 2
+        else:
+            i += 1
+
+    if not tab_id:
+        tab_id = os.environ.get("VIOLATION_TAB_ID", "").strip()
+
+    if not tab_id:
+        print(json.dumps({"done": False, "error": "no tab_id specified or in env"},
+                         ensure_ascii=False))
+        return
+
+    marker_file = os.path.join(
+        os.getcwd(), "violation_query", "data", f".task_done_{tab_id}.json"
+    )
+    if os.path.exists(marker_file):
+        try:
+            with open(marker_file, "r", encoding="utf-8") as f:
+                marker = json.load(f)
+            print(json.dumps({"done": True, "marker_file": marker_file, "marker": marker},
+                             ensure_ascii=False))
+        except Exception:
+            print(json.dumps({"done": True, "marker_file": marker_file, "marker": None},
+                             ensure_ascii=False))
+    else:
+        print(json.dumps({"done": False, "marker_file": marker_file, "marker": None},
+                         ensure_ascii=False))
+
+
+def cmd_cleanup_stale_tabs():
+    """Garbage-collect zombie tabs.
+
+    Thin delegate to session_manager.py cleanup-stale, which implements
+    three-tier detection (completion marker → progress activity → age timeout).
+
+    Options (forwarded as-is):
+      --idle-hours <n>       Progress-file idle threshold (default 2)
+      --max-age-hours <n>    Absolute age threshold (default 6)
+      --instance-port <p>    Only clean tabs on a specific instance
+      --dry-run              Report without cleaning
+
+    Outputs JSON: {ok, cleaned: [...], kept: [...], summary}
+    """
+    session_mgr = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "session_manager.py"
+    )
+    # Forward all arguments after the subcommand name (sys.argv[0]=helper,
+    # sys.argv[1]=cleanup-stale-tabs, sys.argv[2:]=user flags)
+    args = sys.argv[2:]
+    result = _run([sys.executable or "python3", session_mgr, "cleanup-stale"] + args,
+                  timeout=30)
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+
+
+def _touch_tab_activity(tab_id):
+    """Update last_activity timestamp in tab_registry.json for the given tab_id.
+
+    Best-effort: failures are silently ignored so they never break the
+    main operation (e.g. open-vehicle, collect-violations).
+    """
+    if not tab_id:
+        return
+    try:
+        data_dir = _get_data_dir()
+        registry_path = os.path.join(data_dir, "tab_registry.json")
+        if not os.path.exists(registry_path):
+            return
+        with open(registry_path, "r", encoding="utf-8") as f:
+            registry = json.load(f)
+        updated = False
+        for info in registry.values():
+            if info.get("tab_id") == tab_id:
+                info["last_activity"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                updated = True
+                break
+        if updated:
+            with open(registry_path, "w", encoding="utf-8") as f:
+                json.dump(registry, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def cmd_cleanup():
+    """Run the cleanup daemon (oneshot mode). Delegates to cleanup_daemon.py."""
+    cleanup_script = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "cleanup_daemon.py"
+    )
+    args = sys.argv[2:]  # forward all flags after "cleanup"
+    # Auto-add --project-root if not explicitly provided
+    if "--project-root" not in args:
+        args = ["--project-root", os.path.expanduser("~")] + args
+    result = _run([sys.executable or "python3", cleanup_script] + args, timeout=120)
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    sys.exit(result.returncode)
+
+
 # Rate-limit / feng-kong indicators from 12123 platform
 RATE_LIMIT_KEYWORDS = [
     "频繁", "异常操作", "强制退出", "黑名单", "限制使用",

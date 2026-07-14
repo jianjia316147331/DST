@@ -119,6 +119,54 @@ def _get_pinchtab_binary():
     return "pinchtab"
 
 
+def _get_active_tab_ids(instance_port=None):
+    """Query PinchTab for active tab IDs on a specific instance.
+
+    Returns a set of tab_id strings, or empty set on failure.
+    """
+    try:
+        pt = _get_pinchtab_binary()
+        cmd = [pt, "tab"]
+        if instance_port:
+            cmd.insert(1, f"http://127.0.0.1:{instance_port}")
+            cmd.insert(1, "--server")
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                encoding="utf-8", timeout=10)
+        data = json.loads(result.stdout)
+        tabs = data.get("tabs", [])
+        return {t["id"] for t in tabs if t.get("id")}
+    except Exception:
+        return set()
+
+
+def _clean_ghost_entries(registry, instance_port=None):
+    """Remove registry entries whose browser tabs no longer exist.
+
+    Returns (cleaned_registry, ghost_labels).
+    """
+    active_ids = _get_active_tab_ids(instance_port=instance_port)
+    ghosts = []
+    for label, info in list(registry.items()):
+        tab_id = info.get("tab_id", "")
+        if not tab_id:
+            continue
+        entry_port = info.get("instance_port")
+        # Only check entries on the same instance
+        if instance_port is not None and entry_port is not None:
+            try:
+                if int(entry_port) != int(instance_port):
+                    continue
+            except (ValueError, TypeError):
+                pass
+        elif instance_port is None and entry_port is not None:
+            # Can't reliably check cross-instance; skip
+            continue
+        if tab_id not in active_ids:
+            ghosts.append(label)
+            del registry[label]
+    return registry, ghosts
+
+
 def _get_running_instances():
     """Call 'pinchtab instances --json' and return parsed list.
     Returns empty list on any error."""
@@ -270,6 +318,11 @@ def cmd_init():
     tab_id = _create_tab(instance_port=instance_port)
     registry = _read_registry()
 
+    # Clean ghost entries (tabs closed externally, e.g. browser crash)
+    registry, ghosts = _clean_ghost_entries(registry, instance_port=instance_port)
+    if ghosts:
+        _write_registry(registry)
+
     # Remove any existing entry with same label
     registry.pop(label, None)
 
@@ -382,6 +435,221 @@ def cmd_list():
         instance = info.get("instance_port", "default")
         created = info.get("created_at", info.get("bound_at", ""))[:19]
         print(f"{label:<30} {tab_id:<34} {str(instance):<10} {str(pid):<8} {created}")
+
+
+def cmd_cleanup_stale():
+    """Garbage-collect zombie tabs: close tabs whose task is done or timed out.
+
+    Three-tier detection (NO PID check — Claude sessions live forever):
+
+      Tier 1  Completion marker:  .task_done_<tab_id>.json exists
+              → task explicitly ended, safe to clean.
+
+      Tier 2  Progress file active:  details_progress_*.json modified
+              within --idle-hours (default 2h)
+              → batch task still running, KEEP ALL tabs (conservative —
+                a single active batch job blocks GC for every tab).
+
+      Tier 3  Created-at timeout:  tab older than --max-age-hours (default 6h)
+              with no completion marker and no active progress
+              → zombie, safe to clean.
+
+    Options:
+      --idle-hours <n>       Progress-file idle threshold (default 2)
+      --max-age-hours <n>    Absolute age threshold (default 6)
+      --instance-port <p>    Only clean tabs on a specific instance
+      --project-root <dir>   Use <dir> as project root instead of cwd
+      --dry-run              Report what would be cleaned without doing it
+
+    Outputs JSON: {ok, cleaned: [...], kept: [...], summary}
+    """
+    idle_hours = 2.0
+    max_age_hours = 6.0
+    instance_filter = None
+    dry_run = False
+    project_root = None
+    args = sys.argv[2:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--idle-hours" and i + 1 < len(args):
+            try: idle_hours = float(args[i + 1])
+            except ValueError: pass
+            i += 2
+        elif args[i] == "--max-age-hours" and i + 1 < len(args):
+            try: max_age_hours = float(args[i + 1])
+            except ValueError: pass
+            i += 2
+        elif args[i] == "--instance-port" and i + 1 < len(args):
+            try: instance_filter = int(args[i + 1])
+            except ValueError: pass
+            i += 2
+        elif args[i] == "--project-root" and i + 1 < len(args):
+            project_root = args[i + 1]; i += 2
+        elif args[i] == "--dry-run":
+            dry_run = True; i += 1
+        else:
+            i += 1
+
+    # Override registry/data paths if --project-root given
+    root = project_root or os.getcwd()
+    data_dir = os.path.join(root, "violation_query", "data")
+    registry_path = os.path.join(data_dir, "tab_registry.json")
+
+    if project_root:
+        os.makedirs(data_dir, exist_ok=True)
+        if os.path.exists(registry_path):
+            try:
+                with open(registry_path, "r", encoding="utf-8") as f:
+                    registry = json.load(f)
+            except Exception:
+                registry = {}
+        else:
+            registry = {}
+    else:
+        registry = _read_registry()
+
+    if not registry:
+        print(json.dumps({"ok": True, "cleaned": [], "kept": [],
+                          "summary": "empty registry"},
+                         ensure_ascii=False))
+        return
+
+    now = datetime.now()
+    cleaned = []
+    kept = []
+
+    # ── Pre-scan: find newest progress-file mtime, scoped to instance ──
+    progress_newest_mtime = 0.0
+    try:
+        if instance_filter is not None:
+            # Only consider progress files for this instance
+            port_suffix = f"_{instance_filter}.json"
+            for fname in os.listdir(data_dir):
+                if fname.startswith("details_progress_") and fname.endswith(port_suffix):
+                    fp = os.path.join(data_dir, fname)
+                    try:
+                        mtime = os.path.getmtime(fp)
+                        if mtime > progress_newest_mtime:
+                            progress_newest_mtime = mtime
+                    except OSError:
+                        pass
+        else:
+            # No instance filter — scan all (backward compat)
+            for fname in os.listdir(data_dir):
+                if fname.startswith("details_progress_") and fname.endswith(".json"):
+                    fp = os.path.join(data_dir, fname)
+                    try:
+                        mtime = os.path.getmtime(fp)
+                        if mtime > progress_newest_mtime:
+                            progress_newest_mtime = mtime
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+
+    progress_idle_sec = idle_hours * 3600
+    max_age_sec = max_age_hours * 3600
+    pt_bin = _get_pinchtab_binary()
+
+    for label, info in list(registry.items()):
+        tab_id = info.get("tab_id", "")
+        instance_port = info.get("instance_port")
+        created_str = info.get("created_at", info.get("bound_at", ""))
+
+        # ── Instance filter ──
+        if instance_filter is not None:
+            entry_port = instance_port
+            if entry_port is not None:
+                try: entry_port = int(entry_port)
+                except (ValueError, TypeError): pass
+            if entry_port != instance_filter:
+                kept.append({"label": label, "reason": "instance_mismatch"})
+                continue
+
+        # ── Tier 1: Completion marker ──
+        marker_file = os.path.join(data_dir, f".task_done_{tab_id}.json")
+        if os.path.exists(marker_file):
+            if not dry_run and tab_id:
+                _close_tab(pt_bin, tab_id, instance_port)
+                del registry[label]
+            cleaned.append({
+                "label": label, "tab_id": tab_id, "instance_port": instance_port,
+                "reason": "completion_marker",
+            })
+            continue
+
+        # ── Tier 2: Active progress file ──
+        if progress_newest_mtime > 0:
+            idle_sec = now.timestamp() - progress_newest_mtime
+            if idle_sec < progress_idle_sec:
+                kept.append({
+                    "label": label,
+                    "tab_id": tab_id[:12] + "..." if tab_id else "",
+                    "reason": f"progress_active (idle {idle_sec/60:.0f}m < {idle_hours}h)",
+                })
+                continue
+
+        # ── Tier 3: Created-at timeout ──
+        age_sec = None
+        if created_str:
+            try:
+                created = datetime.strptime(created_str[:19], "%Y-%m-%dT%H:%M:%S")
+                age_sec = (now - created).total_seconds()
+            except (ValueError, TypeError):
+                pass
+
+        if age_sec is not None and age_sec > max_age_sec:
+            if not dry_run and tab_id:
+                _close_tab(pt_bin, tab_id, instance_port)
+                del registry[label]
+            cleaned.append({
+                "label": label, "tab_id": tab_id, "instance_port": instance_port,
+                "reason": f"age_timeout ({age_sec/3600:.1f}h > {max_age_hours}h)",
+            })
+        else:
+            age_str = f"{age_sec/3600:.1f}h" if age_sec is not None else "unknown"
+            kept.append({
+                "label": label, "tab_id": tab_id[:12] + "..." if tab_id else "",
+                "reason": f"too_young (age {age_str} < {max_age_hours}h, no marker, no progress)",
+            })
+
+    # ── Write back registry ──
+    if cleaned and not dry_run:
+        _write_registry_data(data_dir, registry)
+
+    print(json.dumps({
+        "ok": True,
+        "dry_run": dry_run,
+        "idle_hours": idle_hours,
+        "max_age_hours": max_age_hours,
+        "cleaned": cleaned,
+        "kept": kept,
+        "summary": f"{len(cleaned)} stale tabs cleaned, {len(kept)} active tabs kept",
+    }, ensure_ascii=False))
+
+
+def _close_tab(pt_bin, tab_id, instance_port):
+    """Close a single browser tab via pinchtab. Best-effort, never throws."""
+    try:
+        cmd = [pt_bin]
+        if instance_port:
+            cmd += ["--server", f"http://127.0.0.1:{instance_port}"]
+        cmd += ["close", tab_id]
+        # Use subprocess directly — NO _run() to avoid double --server injection
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except Exception:
+        pass
+
+
+def _write_registry_data(data_dir, registry):
+    """Write registry dict to tab_registry.json under data_dir. Best-effort."""
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        path = os.path.join(data_dir, "tab_registry.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(registry, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def cmd_current():
@@ -719,6 +987,7 @@ COMMANDS = {
     "bind": cmd_bind,
     "release": cmd_release,
     "list": cmd_list,
+    "cleanup-stale": cmd_cleanup_stale,
     "current": cmd_current,
     "instance-discover": cmd_instance_discover,
     "instance-status": cmd_instance_status,
@@ -732,6 +1001,7 @@ if __name__ == "__main__":
         print(f"  bind          --tab-id <id> --label <name>             Bind to existing tab", file=sys.stderr)
         print(f"  release       --label <name>                           Remove from registry + unset env", file=sys.stderr)
         print(f"  list                                                    List all sessions", file=sys.stderr)
+        print(f"  cleanup-stale [--idle-hours <n>] [--max-age-hours <n>] [--dry-run]  GC zombie tabs", file=sys.stderr)
         print(f"  current                                                 Show current bindings", file=sys.stderr)
         print(f"  instance-discover                                       Discover instances → sync to profiles DB", file=sys.stderr)
         print(f"  instance-status   --company <name>                       Check if company's instance is running", file=sys.stderr)
