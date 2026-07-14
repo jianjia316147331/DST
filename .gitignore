@@ -4,3 +4,6 @@ __pycache__/
 *.prev
 *.win.bak
 *bak
+*.jpg
+*.png
+*.jpeg
