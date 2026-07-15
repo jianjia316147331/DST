@@ -1,0 +1,68 @@
+{
+  "name": "violation-query-tray",
+  "version": "1.0.0",
+  "description": "违章查询中央控制台 - 托盘插件",
+  "main": "dist/main.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "tsc && electron .",
+    "build": "tsc",
+    "start": "electron dist/main.js",
+    "pack:mac": "tsc && electron-builder --mac",
+    "pack:win": "tsc && electron-builder --win",
+    "pack:win:portable": "tsc && electron-builder --win portable"
+  },
+  "build": {
+    "appId": "com.violation-query.tray",
+    "productName": "违章查询托盘",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "dist/tray-icon*.png"
+    ],
+    "extraResources": [
+      { "from": "assets/tray-icon.png", "to": "tray-icon.png" },
+      { "from": "assets/tray-icon@2x.png", "to": "tray-icon@2x.png" }
+    ],
+    "afterPack": "scripts/after-pack.js",
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": [
+        { "target": "dmg", "arch": ["arm64"] }
+      ],
+      "icon": "assets/icon.icns",
+      "executableName": "violation-query-tray",
+      "identity": null,
+      "extendInfo": {
+        "LSUIElement": true
+      }
+    },
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "违章查询托盘"
+    }
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.0",
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0",
+    "typescript": "^5.6.0"
+  }
+}
