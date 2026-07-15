@@ -1,0 +1,790 @@
+#!/usr/bin/env python3
+"""node_agent.py — DST Skill 守护进程，替代 Electron tray app。
+
+作为 systemd 服务运行在每台查询服务器上，负责：
+- WebSocket 长连接中央控制台
+- 接收任务指令 → spawn Claude Code 子进程
+- 实时解析进度并上报
+- 任务完成自动同步 SQLite → 中央 MySQL
+- 定时上报保活状态
+- 响应云控指令（触发扫码登录等）
+- 启动时检查配置，未配置则提醒用户通过交互式对话完成
+
+用法:
+  python3 node_agent.py              # 启动守护进程
+  python3 node_agent.py --setup      # 交互式配置
+  python3 node_agent.py --health     # 健康检查
+"""
+
+import asyncio
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+# Ensure lib/ is importable
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from lib.sync import read_node_config, write_node_config, check_cloud_connectivity, export_for_sync
+
+
+# ── Configuration ──────────────────────────────────────────────
+
+WEBSOCKET_RECONNECT_DELAY = 5   # seconds
+HEARTBEAT_INTERVAL = 10          # seconds
+KEEPALIVE_REPORT_INTERVAL = 300  # 5 minutes
+SYNC_INTERVAL = 1800             # 30 minutes periodic sync fallback
+CLAUDE_PATH = "claude"
+
+
+# ── Setup ───────────────────────────────────────────────────────
+
+def run_setup():
+    """Interactive or CLI-driven setup of node_config.json."""
+    config = read_node_config()
+    if config:
+        print(f"当前配置:")
+        print(f"  设备 ID: {config.get('node_id')}")
+        print(f"  控制台地址: {config.get('cloud_ws_url')}")
+        print(f"  配置时间: {config.get('setup_at')}")
+        overwrite = input("是否覆盖已有配置? [y/N] ").strip().lower()
+        if overwrite != 'y':
+            print("保持现有配置。")
+            return
+
+    # Support CLI args for non-interactive setup
+    args = sys.argv[2:] if len(sys.argv) > 2 else []
+    node_id = ""
+    cloud_ws_url = ""
+
+    i = 0
+    while i < len(args):
+        if args[i] == "--node-id" and i + 1 < len(args):
+            node_id = args[i + 1]; i += 2
+        elif args[i] == "--cloud-ws-url" and i + 1 < len(args):
+            cloud_ws_url = args[i + 1]; i += 2
+        else:
+            i += 1
+
+    if not node_id:
+        node_id = input("设备 ID (与控制台预注册的名称一致): ").strip()
+    if not cloud_ws_url:
+        cloud_ws_url = input("中央控制台 WebSocket 地址 (如 ws://10.0.1.5:3001/ws?client=node): ").strip()
+
+    if not node_id or not cloud_ws_url:
+        print("❌ 设备 ID 和控制台地址不能为空")
+        sys.exit(1)
+
+    write_node_config(node_id, cloud_ws_url)
+    print(f"✅ 配置已保存")
+
+    # Connectivity check
+    ok, err = check_cloud_connectivity(cloud_ws_url)
+    if ok:
+        print(f"✅ 控制台连接正常")
+    else:
+        print(f"⚠️  警告: 无法连接控制台: {err}")
+        print(f"   配置已保存，请确认控制台已启动后重新运行 node_agent")
+
+
+def check_health():
+    """Health check - check config and connectivity."""
+    config = read_node_config()
+    if not config:
+        print("❌ 未配置。请运行: python3 node_agent.py --setup")
+        sys.exit(1)
+
+    print(f"✅ 设备 ID: {config['node_id']}")
+    print(f"   控制台: {config['cloud_ws_url']}")
+
+    ok, err = check_cloud_connectivity(config['cloud_ws_url'])
+    if ok:
+        print(f"✅ 控制台可达")
+    else:
+        print(f"❌ 控制台不可达: {err}")
+        sys.exit(1)
+
+
+# ── WebSocket Client ────────────────────────────────────────────
+
+class NodeAgent:
+    """Main agent that connects to cloud server and manages everything."""
+
+    def __init__(self, config):
+        self.node_id = config["node_id"]
+        self.cloud_ws_url = config["cloud_ws_url"]
+        self.ws = None
+        self._running = False
+        self._tasks = {}       # task_id → process info
+        self._heartbeat_task = None
+        self._keepalive_task = None
+        self._sync_task = None
+        self._company_sessions = set()  # company IDs with active sessions
+
+    async def start(self):
+        """Connect to cloud server and run main loop."""
+        self._running = True
+        print(f"[node_agent] {self.node_id} 启动, 控制台: {self.cloud_ws_url}")
+
+        # Start periodic tasks
+        self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
+        self._keepalive_task = asyncio.ensure_future(self._keepalive_report_loop())
+        self._sync_task = asyncio.ensure_future(self._periodic_sync_loop())
+
+        # Main WebSocket connection loop
+        while self._running:
+            try:
+                await self._connect_ws()
+            except Exception as e:
+                print(f"[node_agent] WebSocket 错误: {e}, {WEBSOCKET_RECONNECT_DELAY}s 后重连...")
+                await asyncio.sleep(WEBSOCKET_RECONNECT_DELAY)
+
+    async def stop(self):
+        """Graceful shutdown."""
+        self._running = False
+        for task in [self._heartbeat_task, self._keepalive_task, self._sync_task]:
+            if task:
+                task.cancel()
+        # Kill all running Claude processes
+        for task_id, proc in list(self._tasks.items()):
+            try:
+                proc["process"].terminate()
+            except Exception:
+                pass
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+        print("[node_agent] 已停止")
+
+    async def _connect_ws(self):
+        """Establish WebSocket connection using native TCP sockets (zero deps)."""
+        await self._connect_ws_native()
+
+    async def _connect_ws_native(self):
+        """Native asyncio WebSocket fallback."""
+        # Parse URL
+        url = self.cloud_ws_url.replace("ws://", "").replace("wss://", "")
+        if "/" in url:
+            host_part, path = url.split("/", 1)
+            path = "/" + path
+        else:
+            host_part = url
+            path = "/"
+
+        if ":" in host_part:
+            host, port = host_part.rsplit(":", 1)
+            port = int(port)
+        else:
+            host = host_part
+            port = 80
+
+        reader, writer = await asyncio.open_connection(host, port)
+
+        # HTTP Upgrade handshake (proper base64 WS key)
+        import base64 as b64
+        ws_key_bytes = os.urandom(16)
+        ws_key = b64.b64encode(ws_key_bytes).decode('ascii')
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {ws_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        )
+        writer.write(request.encode())
+        await writer.drain()
+
+        # Read response
+        response = b""
+        while b"\r\n\r\n" not in response:
+            chunk = await reader.read(4096)
+            if not chunk:
+                break
+            response += chunk
+
+        if b"101" not in response:
+            print(f"[node_agent] WS 握手失败: {response[:200]}")
+            writer.close()
+            return
+
+        print(f"[node_agent] WS 已连接 (native)")
+
+        # Send register
+        hostname = socket.gethostname()
+        await self._ws_send_native(writer, {
+            "type": "register",
+            "node_id": self.node_id,
+            "node_name": self.node_id,
+            "hostname": hostname,
+            "max_concurrency": 15,
+            "memory_total_gb": 4,
+            "cpu_cores": os.cpu_count() or 4,
+        })
+
+        # Read loop
+        while self._running:
+            try:
+                msg = await self._ws_recv_native(reader)
+                if msg is None:
+                    break
+                await self._handle_message(msg)
+            except Exception as e:
+                print(f"[node_agent] 读取错误: {e}")
+                break
+
+        writer.close()
+
+    async def _read_exactly(self, reader, n):
+        """Read exactly n bytes from reader (Python 3.6 compat)."""
+        data = b""
+        while len(data) < n:
+            chunk = await reader.read(n - len(data))
+            if not chunk:
+                raise ConnectionError("Connection closed")
+            data += chunk
+        return data
+
+    async def _ws_send_native(self, writer, msg):
+        """Send a WebSocket text frame (client → server, MUST set MASK)."""
+        payload = json.dumps(msg, ensure_ascii=False).encode("utf-8")
+        frame = bytearray()
+        frame.append(0x81)  # FIN + text opcode
+        length = len(payload)
+        # Set MASK bit (bit 7) per spec: client → server frames MUST be masked
+        if length < 126:
+            frame.append(length | 0x80)
+        elif length < 65536:
+            frame.append(126 | 0x80)
+            frame.extend(length.to_bytes(2, "big"))
+        else:
+            frame.append(127 | 0x80)
+            frame.extend(length.to_bytes(8, "big"))
+        # Generate 4-byte mask key
+        mask_key = os.urandom(4)
+        frame.extend(mask_key)
+        # XOR payload with mask key
+        masked_payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+        frame.extend(masked_payload)
+        writer.write(bytes(frame))
+        await writer.drain()
+
+    async def _ws_recv_native(self, reader):
+        """Receive a WebSocket frame, return parsed JSON or None."""
+        header = await self._read_exactly(reader, 2)
+        opcode = header[0] & 0x0F
+        masked = header[1] & 0x80
+        length = header[1] & 0x7F
+
+        if opcode == 0x08:  # Close
+            return None
+        if opcode == 0x09:  # Ping
+            # Send pong (we don't have the writer in this context, just skip)
+            return None
+
+        if length == 126:
+            length = int.from_bytes(await self._read_exactly(reader, 2), "big")
+        elif length == 127:
+            length = int.from_bytes(await self._read_exactly(reader, 8), "big")
+
+        if masked:
+            mask_key = await self._read_exactly(reader, 4)
+
+        payload = await self._read_exactly(reader, length)
+        if masked:
+            payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+
+        try:
+            return json.loads(payload.decode("utf-8"))
+        except Exception:
+            return None
+
+    def _ws_send(self, msg):
+        """Send a message via WebSocket (thread-safe)."""
+        if self.ws and hasattr(self.ws, 'send'):
+            try:
+                self.ws.send(json.dumps(msg, ensure_ascii=False))
+            except Exception as e:
+                print(f"[node_agent] 发送失败: {e}")
+
+    # ── Message Handler ─────────────────────────────────────
+
+    async def _handle_message(self, msg):
+        """Handle incoming messages from cloud server."""
+        msg_type = msg.get("type", "")
+        print(f"[node_agent] 收到: {msg_type}")
+
+        if msg_type == "register_ack":
+            print(f"[node_agent] 注册确认: {msg.get('message', 'OK')}")
+
+        elif msg_type == "assign_task":
+            await self._handle_assign_task(msg)
+
+        elif msg_type == "pause_task":
+            self._handle_pause_task(msg)
+
+        elif msg_type == "resume_task":
+            self._handle_resume_task(msg)
+
+        elif msg_type == "terminate_task":
+            self._handle_terminate_task(msg)
+
+        elif msg_type == "trigger_login":
+            await self._handle_trigger_login(msg)
+
+        elif msg_type == "trigger_sync":
+            asyncio.ensure_future(self._run_sync())
+
+        elif msg_type == "sync_ack":
+            status = msg.get("ok") and "成功" or "失败"
+            print(f"[node_agent] 同步{status}: {msg.get('stats', '')}")
+
+    async def _handle_assign_task(self, msg):
+        """Spawn a Claude Code subprocess to run the query."""
+        task_id = msg.get("task_id")
+        company_id = msg.get("company_id")
+        company_name = msg.get("company_name", "")
+        province = msg.get("province", "")
+        session_id = msg.get("session_id", f"sess-{int(time.time())}")
+
+        print(f"[node_agent] 任务 {task_id}: {company_name} ({province})")
+
+        prompt = f"查询{company_name}的车辆违章，省份{province}"
+        try:
+            proc = subprocess.Popen(
+                [CLAUDE_PATH, "--session", session_id, "--prompt", prompt],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            self._ws_send({
+                "type": "task_failed", "task_id": task_id,
+                "error": f"Claude CLI 未找到, 请确认 {CLAUDE_PATH} 已安装"
+            })
+            return
+
+        self._tasks[task_id] = {
+            "process": proc,
+            "task_id": task_id,
+            "company_id": company_id,
+            "company_name": company_name,
+            "session_id": session_id,
+            "started_at": datetime.now().isoformat(),
+        }
+        self._company_sessions.add(company_id)
+
+        self._ws_send({
+            "type": "status_ack", "task_id": task_id,
+            "status": "进行中",
+            "message": f"Claude Code 已启动, pid={proc.pid}, session={session_id}"
+        })
+
+        # Read stdout/stderr in background
+        asyncio.ensure_future(self._read_process_output(task_id, proc))
+
+    def _handle_pause_task(self, msg):
+        task_id = msg.get("task_id")
+        task = self._tasks.get(task_id)
+        if task:
+            try:
+                task["process"].send_signal(signal.SIGSTOP)
+                self._ws_send({
+                    "type": "status_ack", "task_id": task_id, "status": "暂停",
+                    "message": f"SIGSTOP sent to pid={task['process'].pid}"
+                })
+            except Exception as e:
+                self._ws_send({
+                    "type": "status_ack", "task_id": task_id, "status": "暂停指令下发",
+                    "message": f"Pause failed: {e}"
+                })
+
+    def _handle_resume_task(self, msg):
+        task_id = msg.get("task_id")
+        task = self._tasks.get(task_id)
+        if task:
+            try:
+                task["process"].send_signal(signal.SIGCONT)
+                self._ws_send({
+                    "type": "status_ack", "task_id": task_id, "status": "进行中",
+                    "message": f"SIGCONT sent to pid={task['process'].pid}"
+                })
+            except Exception as e:
+                self._ws_send({
+                    "type": "status_ack", "task_id": task_id,
+                    "message": f"Resume failed: {e}"
+                })
+
+    def _handle_terminate_task(self, msg):
+        task_id = msg.get("task_id")
+        task = self._tasks.get(task_id)
+        if task:
+            try:
+                task["process"].terminate()
+                # Schedule kill after 10s
+                pid = task["process"].pid
+                asyncio.get_event_loop().call_later(10,
+                    lambda: task["process"].kill() if task["process"].poll() is None else None
+                )
+                self._ws_send({
+                    "type": "status_ack", "task_id": task_id, "status": "终止指令下发",
+                    "message": f"SIGTERM sent to pid={pid}"
+                })
+            except Exception as e:
+                self._ws_send({
+                    "type": "status_ack", "task_id": task_id,
+                    "message": f"Terminate failed: {e}"
+                })
+
+    async def _handle_trigger_login(self, msg):
+        """Handle trigger_login command from cloud server.
+        Spawn Claude Code to open 12123 login page and capture QR code.
+        """
+        company_name = msg.get("company_name", "")
+        province_url = msg.get("province_url", "")
+
+        print(f"[node_agent] 触发扫码登录: {company_name}")
+
+        # Start a Claude session to get QR code
+        session_id = f"login-{company_name}-{int(time.time())}"
+        prompt = (
+            f"登录{company_name}的12123账号。"
+            f"请导航到 provincial 12123 登录页面，截图二维码保存到 "
+            f"violation_query/screenshots/qr_{company_name}.png，"
+            f"然后输出 __QR_READY__:qr_{company_name}.png"
+        )
+
+        try:
+            proc = subprocess.Popen(
+                [CLAUDE_PATH, "--session", session_id, "--prompt", prompt],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            self._ws_send({
+                "type": "login_failed", "company_name": company_name,
+                "reason": "Claude CLI 未找到"
+            })
+            return
+
+        # Monitor output for QR ready marker
+        import threading
+        def _monitor_qr():
+            try:
+                for line in proc.stdout:
+                    line = line.strip()
+                    if "__QR_READY__" in line:
+                        # Extract filename
+                        qr_file = line.split("__QR_READY__:")[-1].strip()
+                        # Read and base64
+                        import base64
+                        from lib.core import _find_project_root
+                        root = _find_project_root()
+                        qr_path = os.path.join(root, qr_file) if not os.path.isabs(qr_file) else qr_file
+                        if os.path.exists(qr_path):
+                            with open(qr_path, "rb") as f:
+                                img_b64 = base64.b64encode(f.read()).decode("utf-8")
+                            self._ws_send({
+                                "type": "qr_code",
+                                "company_name": company_name,
+                                "image_base64": img_b64,
+                                "qr_expires_at": datetime.now().isoformat(),
+                            })
+                    elif "__LOGIN_OK__" in line:
+                        self._ws_send({
+                            "type": "login_ok",
+                            "company_name": company_name,
+                        })
+                    elif "__LOGIN_FAILED__" in line:
+                        reason = line.split("__LOGIN_FAILED__:")[-1].strip() if ":" in line else "unknown"
+                        self._ws_send({
+                            "type": "login_failed",
+                            "company_name": company_name,
+                            "reason": reason,
+                        })
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_monitor_qr, daemon=True)
+        t.start()
+
+    # ── Process Output ────────────────────────────────────────
+
+    async def _read_process_output(self, task_id, proc):
+        """Read stdout/stderr from a Claude Code process and relay to cloud."""
+        seq = 0
+        loop = asyncio.get_event_loop()
+
+        def _read_stream(stream_name, pipe):
+            nonlocal seq
+            try:
+                for line in pipe:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    seq += 1
+                    msg = {
+                        "type": "stream_output",
+                        "task_id": task_id,
+                        "stream": stream_name,
+                        "line": line,
+                        "seq": seq,
+                    }
+
+                    # Parse progress
+                    if "入口导航" in line:
+                        msg["progress"] = "入口导航"
+                    elif "登录中" in line:
+                        msg["progress"] = "登录中"
+                    elif "查询准备" in line:
+                        msg["progress"] = "查询准备"
+                    elif "查询中" in line:
+                        msg["progress"] = "查询中"
+                    elif "已完成" in line:
+                        msg["progress"] = "已完成"
+
+                    self._ws_send(msg)
+            except Exception:
+                pass
+
+        # Read both streams in threads
+        import threading
+        t1 = threading.Thread(target=_read_stream, args=("stdout", proc.stdout), daemon=True)
+        t2 = threading.Thread(target=_read_stream, args=("stderr", proc.stderr), daemon=True)
+        t1.start()
+        t2.start()
+
+        # Wait for process completion
+        def _wait_exit():
+            proc.wait()
+            asyncio.run_coroutine_threadsafe(self._on_task_exit(task_id, proc.returncode), loop)  # type: ignore
+
+        t3 = threading.Thread(target=_wait_exit, daemon=True)
+        t3.start()
+
+    async def _on_task_exit(self, task_id, exit_code):
+        """Handle task process exit."""
+        task = self._tasks.pop(task_id, None)
+        if not task:
+            return
+
+        company_name = task["company_name"]
+        self._company_sessions.discard(task["company_id"])
+
+        if exit_code == 0:
+            self._ws_send({
+                "type": "task_completed",
+                "task_id": task_id,
+            })
+            self._ws_send({
+                "type": "log", "task_id": task_id,
+                "level": "INFO", "category": "task",
+                "message": f"任务完成, exit code={exit_code}",
+            })
+            # Trigger sync after task completion
+            await asyncio.sleep(3)  # wait for SQLite writes
+            await self._sync_company(company_name, task_id)
+        else:
+            self._ws_send({
+                "type": "task_failed", "task_id": task_id,
+                "error": f"进程退出, exit code={exit_code}",
+            })
+
+        print(f"[node_agent] 任务 {task_id} 退出, code={exit_code}")
+
+    # ── Sync ──────────────────────────────────────────────────
+
+    async def _sync_company(self, company_name, task_id=None):
+        """Export data for a company and send to cloud server."""
+        print(f"[node_agent] 同步: {company_name}")
+        result = export_for_sync(company_name=company_name, node_id=self.node_id)
+
+        if not result.get("ok"):
+            print(f"[node_agent] 同步导出失败: {result.get('error')}")
+            return
+
+        if not result.get("vehicles") and not result.get("violations"):
+            print(f"[node_agent] 无数据需同步: {company_name}")
+            return
+
+        self._ws_send({
+            "type": "sync_data",
+            "task_id": task_id,
+            "node_id": self.node_id,
+            "companies": result["companies"],
+            "vehicles": result["vehicles"],
+            "violations": result["violations"],
+        })
+
+    async def _run_sync(self):
+        """Periodic full sync — sync all companies in local DB."""
+        import sqlite3
+        from lib.db import _get_db_path, _init_db
+        _init_db()
+        db_path = _get_db_path()
+        if not os.path.exists(db_path):
+            return
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute("SELECT DISTINCT name FROM companies")
+        company_names = [r[0] for r in cur.fetchall()]
+        conn.close()
+
+        for name in company_names:
+            await self._sync_company(name)
+            await asyncio.sleep(5)  # throttle
+
+    # ── Periodic Loops ────────────────────────────────────────
+
+    async def _heartbeat_loop(self):
+        """Send heartbeat every HEARTBEAT_INTERVAL seconds."""
+        while self._running:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            self._ws_send({
+                "type": "heartbeat",
+                "node_id": self.node_id,
+                "active_sessions": len(self._tasks),
+                "memory_used_gb": 0,
+                "cpu_percent": 0,
+            })
+
+    async def _keepalive_report_loop(self):
+        """Report keepalive status for all companies every KEEPALIVE_REPORT_INTERVAL."""
+        while self._running:
+            await asyncio.sleep(KEEPALIVE_REPORT_INTERVAL)
+            companies_status = self._gather_keepalive_status()
+            if companies_status:
+                self._ws_send({
+                    "type": "keepalive_status",
+                    "node_id": self.node_id,
+                    "companies": companies_status,
+                })
+
+    def _gather_keepalive_status(self):
+        """Read local keepalive state for all profiles."""
+        import sqlite3
+        from lib.db import _get_db_path, _init_db
+        _init_db()
+        db_path = _get_db_path()
+        if not os.path.exists(db_path):
+            return []
+
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute("SELECT * FROM profiles")
+        profiles = [dict(r) for r in cur.fetchall()]
+        conn.close()
+
+        result = []
+        for p in profiles:
+            status = {"name": p["company_name"], "is_logged_in": bool(p.get("is_logged_in", 0))}
+
+            # Check keepalive systemd service
+            profile_name = p.get("profile_name", "").replace("profile_", "")
+            service_name = f"keepalive-watchdog-profile_{profile_name}"
+            try:
+                r = subprocess.run(
+                    ["systemctl", "is-active", service_name],
+                    capture_output=True, text=True, timeout=5
+                )
+                status["keepalive_alive"] = r.stdout.strip() == "active"
+            except Exception:
+                status["keepalive_alive"] = False
+
+            # Read health file
+            from lib.core import _get_data_dir
+            health_file = os.path.join(_get_data_dir(), f"keepalive_health_{p['company_name']}.json")
+            if os.path.exists(health_file):
+                try:
+                    with open(health_file, "r") as f:
+                        health = json.load(f)
+                    status["last_cycle"] = health.get("last_check", "")
+                except Exception:
+                    status["last_cycle"] = None
+            else:
+                status["last_cycle"] = None
+
+            result.append(status)
+
+        return result
+
+    async def _periodic_sync_loop(self):
+        """Periodic full sync fallback every SYNC_INTERVAL seconds."""
+        while self._running:
+            await asyncio.sleep(SYNC_INTERVAL)
+            print("[node_agent] 定时全量同步...")
+            await self._run_sync()
+
+
+# ── Main ────────────────────────────────────────────────────────
+
+def main():
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1]
+        if cmd == "--setup":
+            run_setup()
+            return
+        elif cmd == "--health":
+            check_health()
+            return
+        elif cmd == "--help" or cmd == "-h":
+            print(__doc__)
+            return
+
+    # Start daemon
+    config = read_node_config()
+    if not config:
+        print("=" * 60)
+        print("❌ 未检测到设备配置")
+        print("   请先执行交互式配置: python3 node_agent.py --setup")
+        print("   或在对话中说: '配置设备连接'")
+        print("=" * 60)
+        sys.exit(1)
+
+    if not config.get("node_id") or not config.get("cloud_ws_url"):
+        print("=" * 60)
+        print("❌ 设备配置不完整")
+        print(f"   缺失字段: node_id={config.get('node_id')!r}, cloud_ws_url={config.get('cloud_ws_url')!r}")
+        print("   请重新配置: python3 node_agent.py --setup")
+        print("=" * 60)
+        sys.exit(1)
+
+    # Connectivity check before starting
+    ok, err = check_cloud_connectivity(config["cloud_ws_url"])
+    if not ok:
+        print("=" * 60)
+        print(f"⚠️  警告: 无法连接中央控制台 ({config['cloud_ws_url']})")
+        print(f"   原因: {err}")
+        print("   将尝试启动并持续重连...")
+        print("=" * 60)
+
+    agent = NodeAgent(config)
+
+    # Handle signals
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, lambda: asyncio.ensure_future(agent.stop()))
+        except NotImplementedError:
+            pass  # Windows
+
+    try:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(agent.start())
+    except KeyboardInterrupt:
+        print("[node_agent] 收到中断信号")
+
+
+if __name__ == "__main__":
+    main()

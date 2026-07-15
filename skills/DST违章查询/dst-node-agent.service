@@ -1,0 +1,24 @@
+[Unit]
+Description=DST Node Agent - Violation Query Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openclaw
+WorkingDirectory=/home/openclaw
+ExecStart=/usr/bin/python3 /home/openclaw/.claude/skills/DST违章查询/node_agent.py
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=1
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dst-node-agent
+
+[Install]
+WantedBy=multi-user.target
