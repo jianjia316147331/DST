@@ -1,14 +1,14 @@
 ***
 
-name: DSTviolation_query
-description: 当用户提到查询xxx公司/xxx车的违章、违法、违规、罚款、扣分、交通违法、12123时调用。通过PinchTab控制Chrome访问12123平台查询车辆违章，支持单/批量查询，支持车牌号自动识别省份。输出MD报告+飞书完成通知。
+name: DST违章查询
+description: 当用户提到查询xxx公司/xxx车的违章、违法、违规、罚款、扣分、交通违法、12123时调用。通过PinchTab控制Chrome访问12123平台查询车辆违章，支持单/批量查询，支持车牌号自动识别省份。查询完成后对话内简单总结+飞书完成通知。
 ------------------------------------------------------------------------------------------------------------------------------------
 
-# DSTviolation_query
+# DST违章查询
 
 ## 概述
 
-通过 **PinchTab**（12MB Go 二进制，零依赖）自动操作 Chrome 访问 12123 平台，完成单位用户扫码登录后查询车辆违章。输出：本地 MD 报告 + 飞书完成通知。支持防退出保活和飞书通知。
+通过 **PinchTab**（12MB Go 二进制，零依赖）自动操作 Chrome 访问 12123 平台，完成单位用户扫码登录后查询车辆违章。输出：对话内简单总结 + 飞书完成通知。支持防退出保活和飞书通知。
 
 > PinchTab 内置 daemon 模式、持久 session、accessibility tree 快照（带 ref 编号）、stealth 注入和人体化操作。后台常驻，所有 CLI 命令共用同一个 Chrome session，无反复建连开销。
 
@@ -19,7 +19,7 @@ description: 当用户提到查询xxx公司/xxx车的违章、违法、违规、
 ```
 violation_query/
 ├── screenshots/   # 二维码截图、页面截图
-├── reports/       # MD 格式查询报告
+├── reports/       # 历史报告（可选，查询结果在对话中总结）
 └── data/          # SQLite 数据库 (violations.db)
 ```
 
@@ -37,6 +37,35 @@ violation_query/
 4. 结果通过 helper 的 --output FILE 写入 UTF-8 文件，外部脚本读取文件获取结果
 ```
 
+**🔴 Python stdout 缓冲陷阱（后台运行时必做）：**
+
+当 Python 脚本通过 `subprocess` 调用 helper/pinchtab 且自身在后台运行时，Python 的 stdout **默认全缓冲**（非 TTY 模式），导致 `print()` 输出被吞掉，看起来脚本"卡住"了，实际上可能已经跑完。必须强制无缓冲：
+
+```python
+# 脚本第一行（import 之后），三重保险：
+import sys
+sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
+
+# Bash 执行时加 -u 标志（双重保险）：
+# python3 -u /path/to/script.py
+```
+
+**🔴 批量脚本完成判定铁律（禁止凭 DB 记录数猜测）：**
+
+后台脚本因缓冲不可见时，**严禁**仅凭"数据库里有 N 条记录"就推断脚本已完成。必须同时满足以下**全部三项**才算真正完成：
+
+| # | 判定条件 | 反例（本次教训） |
+|---|---------|----------------|
+| 1 | **进度文件存在且含完成标记**：`save-detail-progress --phase scan` 在脚本启动时写入总车辆数基准值（从页面"共 X 条"提取），脚本末尾再次写入完成标记。启动标记 ≠ 完成标记 | 540 条记录在 DB 但无进度文件 → 脚本被中途 kill |
+| 2 | **记录数对得上**：DB 记录数 vs 进度文件中的总车辆数（从页面"共 X 条"提取的权威值）。差值 > 10 视为未完成 | 540 vs 预期 2040 → 差距过大 |
+| 3 | **脚本进程已退出**：确认后台进程已正常结束（exit code 0），非被 kill/挂起 |
+
+**阶段一脚本启动时立即通过 `pinchtab eval` JS 提取页面"共 X 条"中的总车辆数，保存到进度文件**（用于后续校验），然后每页扫描落库，最后再写完成标记。这样即使中途崩溃，也能通过进度文件中的总车辆数与 DB 实际记录数对比来判断完成度。
+
+**违反任一条 = 脚本未完成，必须续跑（非重跑）。不得"差不多就行"。**
+
+> **为什么 DB 有记录 ≠ 已完成：** `db-insert-vehicle` 是逐条 upsert，每扫一页就写一页。脚本被 kill 时，已扫页的数据已在 DB 中，但剩余页未扫。DB 有数据只说明"跑过"，不说明"跑完了"。
+
 **工具路径（均在 PATH 上，无需硬编码）：**
 
 | 工具          | 调用方式                                                                     |
@@ -44,7 +73,7 @@ violation_query/
 | Python      | `python3`（`/opt/aiext/bin/python3`） |
 | lark-cli    | `lark-cli`（`/home/openclaw/.npm-global/bin/lark-cli`） |
 | pinchtab    | `pinchtab`（`/home/openclaw/.npm-global/bin/pinchtab`） |
-| TEMP helper | `/tmp/violation_helper.py`（首次 init 时从 skill 目录复制） |
+| helper      | `/home/openclaw/.claude/skills/DST违章查询/violation_helper.py`（直接引用，无需复制） |
 | 输出目录        | `<cwd>/violation_query/`（通过 helper `get-dir -o <file>` 安全获取）               |
 
 ## 适用场景
@@ -56,27 +85,31 @@ violation_query/
 ## 核心铁律
 
 1. **只查未处理违章：** 只对"未处理"或"未缴费"状态的违章记录点击"查看详情"获取罚款金额和记分。"已处理且已缴费"的记录直接跳过。查询前先对比 SQLite 数据库：已存在且状态未变的跳过；状态变更的（从未处理→已处理）更新记录。
-2. **随机延迟反爬：** 每条违章记录查询之间间隔 2-5 秒随机，每台车之间间隔 2-5 秒随机，点击操作间隔 1-2 秒随机。触发风控时立即停止所有操作。
+2. **随机延迟反爬：** 
+   - 搜索确认：固定 1s + 轮询（最长 3s）+ 1 次重试（失败跳过该车）
+   - 车间保底：从上一台搜索到下一台搜索间隔 ≥ 10s（自然耗时不足则等待）
+   - 违章详情弹窗间隔：1-2.5s 随机（点击"查看详情"前等待）
+   - 违章列表翻页间隔：1.5-3.5s 随机
+   - 车辆列表翻页间隔：2-5s 随机（阶段一全页扫描）
+   触发风控时立即停止所有操作。
 3. **中文参数兼容：** Linux 终端原生支持 UTF-8，含中文路径/参数可直接传入 Bash。复杂中文参数操作（如 pinchtab find/wait 含中文描述）建议通过 helper 子命令（`pt-find` / `pt-wait`）完成以确保稳妥。**⚠️ 导航后 `pt-find` 有竞态风险（异步语义索引未就绪），详见「导航后元素定位」章节。**
 4. **🔴 导航后元素定位 —— snap 优先于 find：** `pinchtab snap` 同步读 DOM，导航后立即可用。`pinchtab find` 异步语义索引，有 1-5s 竞态窗口。导航后首次定位元素**必须用 `snap` 直接获取 ref 编号后 `click`**，不得依赖 `pt-find`。`pt-find` 仅用于页面稳定后（>5s）或需要语义模糊匹配的场景。
 5. **文件操作建议：** Linux 可直接在 Bash 中使用中文路径。为提高可靠性，推荐使用 helper 的 `get-dir` / `get-screenshot-dir` 等子命令获取路径后操作。
 6. **风控熔断：** 三种触发条件：(1) 页面含"频繁"、"异常操作"、"黑名单"等关键词；(2) open_vehicle 连续 3 台车全部失败；(3) 查看详情 XHR 返回 `{"code":500,"message":"查询过于频繁"}`。任一触发立即终止所有进程并告警。XHR 监控由 `_setup_xhr_monitor()` 注入，`_check_xhr_rate_limit()` 轮询。
 7. **禁止随意退出登录：** 检测到已登录状态（单位用户）时严禁退出。只需确认省份和公司匹配当前任务即可继续。只有实际查询遇到非单位用户报错时才重新登录。
 8. **保活生命周期：** 登录成功 → 进入我的主页确认正常 → **🔴 调用 `ensure-keepalive` 自动启动保活**（脚本内置，不再依赖模型记忆；自动防重复）。保活程序导航到我的主页（车辆列表页）而非省份首页，确保有异常（风控/掉线）能及时发现。查询正常完成后保活继续运行不停止，除非用户明确要求或会话自然过期。**退出登录后不再自动重启**（systemd `RestartPreventExitStatus=42 43 44`）。
-9. **弹窗防御：** 每次 `get-page-vehicles`、`open-vehicle`、`collect-violations` 操作前自动检测并关闭"本人已知晓"等系统弹窗，确保表格数据可访问。
+9. **弹窗防御 + 页面漂移自愈：** 每次 `get-page-vehicles`、`open-vehicle`、`collect-violations` 操作前自动检测并关闭"本人已知晓"等系统弹窗。`get-page-vehicles` 内置页面漂移自愈：找不到车辆表格时检查当前 URL，若非 vehlist 页面（如卡在 vehdetail 详情页），自动点击"我的主页"回到车辆列表并重新提取，确保批量查询中途被中断后不会误判完成。
 10. **🔴 铁律：先查人再开登录页（防二维码失效）：** 用户指定通知对象（姓名/手机号/群名）时，**必须先完成飞书 ID 查询（查人/查群），确认 ID 获取成功后再打开 12123 登录页截图二维码**。二维码有效期约 5 分钟，先查人可避免扫码等待期间二维码过期。
-11. **🔴 铁律：批量查询必须走 helper 已有子命令：** 批量查询（全量/多台车）的循环逻辑必须通过 `violation_helper.py` 已有子命令组合实现（`get-page-vehicles` → `open-vehicle` → `collect-violations` → `go-back` → `save-detail-progress` → `click-page`）。**禁止为批量查询新写独立 Python 脚本**，只能写极简调用封装（循环体内只调 helper 子命令）。
+11. **🔴 铁律：批量查询使用固化脚本，禁止自行写脚本：** 批量查询分两阶段：(1) `scripts/scan_vehicles.py` 全页扫描落库（内部只调 helper 已有子命令）；(2) `scripts/collect_violations.py` 搜索→单车查询循环。**禁止自行新写 Python 脚本**——包括禁止 Write 临时脚本、禁止在 Bash 中内联 Python 代码做批量循环。唯一允许的方式是直接调用 skill 目录下的固化脚本。脚本接受 `--company` `--batch-id` `--tab-id` `--instance-port` 参数。车辆列表页不翻页（搜索定位），违章详情页翻页由 `collect-violations` 内部自动处理。
 12. **🔴 铁律：违章详情必须逐个查询（不可跳过）：** 车辆列表上显示有未处理违章的车辆，**必须进入详情页 + 逐条点击"查看详情"获取真实罚款金额和记分**。禁止只读列表数据不查详情、禁止仅凭列表摘要生成报告。此条为最高优先级铁律，违反即为查询失败。
 13. **🔴 数据落库策略：查一条落库一条 → 逐条即时写入：** `collect-violations` 每提取完一条违章详情，调用方应立即通过 `db-insert-violation` 写入 SQLite。不使用中间 JSON/JS 文件暂存、不攒到最后批量落库。这样即使中途崩溃，已查询的违章数据不会丢失。helper `db-insert-violation` 支持按自然键 upsert（车牌+时间+地点+行为），重复写入不会产生脏数据。
 14. **🔴 公司名称以平台公司列表页为准（权威来源）：** Profile 注册和数据库写入时使用的公司名称，**必须以扫码登录后 12123 平台公司列表页实际显示的名称为准**。用户输入的公司名（如"深圳公司"）和 `profile-lookup` 模糊匹配返回的名称仅供定位 Profile 和平台 URL 使用，不得直接作为最终公司名落库。扫码登录后、选择公司前，必须从公司列表页提取实际公司名称，对比校验后再写入 `profile-register` 和 `db-insert-company`。若 profile 中已有旧名称但与平台实际名称不一致，以平台为准更新覆盖。
-15. **🔴 平台排序假设 + 双模式查询：** 12123 平台车辆列表按"未处理违章数"降序排列（有未处理违章的车辆排在最前，均为 0 的排在后）。批量查询支持两种模式：
-
-   | 模式 | 行为 | 触发条件 |
-   |------|------|----------|
-   | **自动检测 `auto`（默认）** | 连续 2 页 `unprocessed` 全部为 0 时安全终止 | 用户未明确指定查询意图 |
-   | **全量扫描 `full`** | 忽略清零页，持续查询直到所有页面遍历完成 | 用户明确说"首次"/"首批"/"第一次"/"全部查完"等 |
-
-   > **意图识别规则：** 用户提到"首次查询"、"首批"、"第一次查"、"全部查一遍"、"全量扫描"、"从头查"等全量意图关键词时 → 使用 `full` 模式。用户未明确表达 → 默认 `auto` 模式（自动检测停止）。此假设同样适用于违章详情页翻页：`auto` 模式下当前页无任何未处理违章时后面的详情页也无需翻看；`full` 模式下所有详情页逐页扫描。严禁在未验证此假设的前提下对有未处理的页面提前终止。
+15. **🔴 平台排序假设：** 12123 平台车辆列表按"未处理违章数"降序排列（有未处理违章的车辆排在最前，均为 0 的排在后）。批量查询始终扫描所有车辆列表页；单台车查询中 SQLite 增量对比自动跳过已入库记录，无需额外模式区分。
+16. **🔴 铁律：新公司必须先 `profile-create` 再 `init`：** 当 `profile-lookup` 返回 `found: false` 且诊断确认无匹配时，**必须调用 `session_manager.py profile-create` 创建新的 PinchTab Profile + 独立 Instance**，然后再用 `init --instance-port <新端口>` 创建标签页。**绝对禁止**直接 `init --instance-port` 指向已有实例（如成都的默认实例），这会导致 cookie 碰撞——不同公司的 12123 SSO 会话互相覆盖（gab.122.gov.cn 根据 cookie 自动跳转到有活跃 session 的省份）。
+17. **🔴 铁律：禁止 `pinchtab cookies clear` 清除全部 Cookie：** 清除所有 Cookie 会同时销毁同一实例上其他公司的登录态。cookie 隔离依赖 Profile 级别（独立 Chrome user-data-dir），**不得**通过清 cookie 来"修复"登录跳转问题。遇到省份跳转错误 = 实例/Profile 映射错误，应从实例隔离层面排查，而非 cookie 层面。
+18. **🔴 铁律：任务完成必须写标记 + 关闭标签页（防 Tab 累积）：** 每个查询任务结束后分两步：(a) **先调用 `mark-task-done` 写入完成标记文件**（`.task_done_<tab_id>.json`），包含公司名、查询类型、车辆/违章统计；(b) **再调用 `release-tab` 关闭当前会话的浏览器标签页**。完成标记是 GC 清理僵尸 tab 的关键信号——即使 `release-tab` 漏调，`cleanup-stale-tabs` 也能通过标记文件识别已完成任务并安全清理。此外，`cleanup-dst.timer` 每小时自动触发 `cleanup_daemon.py`，兜底清理所有遗漏文件（僵尸Tab、过期截图、残留PID、日志等），无需人工干预。保活守护进程的保活 tab **不受此规则影响**——它由 systemd 管理，独立于查询任务。
+19. **🔴 铁律：禁止手动 pinchtab close（绕过标记）:** 禁止直接调用 `pinchtab close` 关闭查询 tab——这会跳过注册表清理和完成标记写入。必须通过 `release-tab` 子命令完成清理。
+20. **🔴 铁律：禁止删除 SQLite 数据库（`violation_query/data/violations.db`）：** 数据库包含所有历史查询记录的持久化存档（公司、车辆、违章、Profile 映射），是唯一的权威数据源。**任何时候不得**通过 `rm`、`DROP TABLE`、`DELETE FROM`、覆盖写入等方式删除或清空数据库。`init-db` 仅首次部署时执行一次（`CREATE TABLE IF NOT EXISTS`），已有数据库直接跳过。批量查询中途崩溃/中断时只需改进度文件，**不得**清库重跑。如需数据修正，通过 `db-insert-*` 的 upsert 机制增量更新单条记录，禁止整体重建。
 
 ### 中文参数兼容说明
 
@@ -115,7 +148,6 @@ violation_query/
 | `db-insert-company`  | 增量写入/更新公司记录              | 通过 Python 脚本（stdin JSON 或 CLI 参数）       |
 | `db-insert-vehicle`  | 增量写入/更新车辆记录              | 通过 Python 脚本（stdin JSON 或 CLI 参数）       |
 | `db-insert-violation`| 增量写入/更新违章记录（按自然键匹配）    | 通过 Python 脚本（stdin JSON）                |
-| `db-check-vehicle-collected`| 查询车辆今日是否已采集（--plate-number + --query-date） | 通过 Python 脚本                              |
 | `profile-lookup`    | 查公司→Profile 映射（精准→模糊），返回 profile 信息+登录态 | 通过 Python 脚本                              |
 | `profile-list`      | 列出所有已注册的公司 Profile          | Bash: `python <helper> profile-list`       |
 | `profile-register`  | 注册/更新公司→Profile 映射（login 后写入，标记 is_logged_in=1） | 通过 Python 脚本                              |
@@ -123,6 +155,11 @@ violation_query/
 | `pinchtab-path`      | 输出 pinchtab 完整路径        | Bash: `python <helper> pinchtab-path`     |
 | `lark-cli-path`      | 输出 lark-cli 完整路径        | Bash: `python <helper> lark-cli-path`     |
 | `get-login-url`      | 输出单位用户登录直连 URL          | Bash: `python <helper> get-login-url`     |
+| `release-tab`        | **关闭当前会话标签页**（pinchtab close + 清理注册表），任务完成后调用防止 tab 累积 | 通过 Python 脚本                              |
+| `mark-task-done`     | **写入任务完成标记文件**（`.task_done_<tab_id>.json`），`release-tab` 之前调用；支持 `--company` `--query-type` `--vehicles-queried` 等参数 | 通过 Python 脚本                              |
+| `check-task-done`    | 检查指定 tab 的完成标记是否存在（`--tab-id` 或 env），返回 done true/false | 通过 Python 脚本                              |
+| `cleanup-stale-tabs` | **GC 僵尸 tab**（三级检测：完成标记 → 进度文件活跃 → 创建超时），支持 `--idle-hours` `--max-age-hours` `--instance-port` `--dry-run` | 通过 Python 脚本                              |
+| `cleanup`            | **自动清理守护**（oneshot 模式）：僵尸Tab GC + 过期文件 + 幽灵注册表 + 健康报告，支持 `--dry-run` `--status` `--project-root`。由 systemd timer 每小时自动触发 | Bash: `python <helper> cleanup --dry-run`    |
 | `license-lookup`     | 车牌首字→省份+URL             | 通过 Python 脚本（参数 stdin JSON 传入）            |
 | `province-url`       | 省份→12123 首页 URL         | 通过 Python 脚本（参数 stdin JSON 传入）            |
 | `province-login-url` | 省份→12123 首页 URL（登录后导航用） | 通过 Python 脚本（参数 stdin JSON 传入）            |
@@ -137,22 +174,24 @@ violation_query/
 | `batch-get-id`       | 按手机号查用户                 | 通过 Python 脚本                              |
 | `pt-find`            | pinchtab find 中文描述      | 通过 Python 脚本                              |
 | `pt-wait`            | pinchtab wait 中文文本      | 通过 Python 脚本                              |
-| `poll-login`         | 等待登录完成；推荐 `--browser-only` 模式（纯浏览器检测，无飞书 API 调用）；支持 QR 失效检测 + 自动刷新上限 | 通过 Python 脚本                              |
+| `poll-login`         | 等待登录完成；纯浏览器检测（snap + eval JS），无飞书 API 调用；支持 QR 失效检测 + 自动刷新上限 | 通过 Python 脚本                              |
 | `extract-message-id` | 从响应 JSON 提取 message\_id | 通过 Python 脚本                              |
 | `run-js`             | 从文件执行含中文的 JS（无需经过 bash） | 通过 Python 脚本                              |
 | `list-vehicles`      | 提取车辆列表+分页信息为 JSON       | 通过 Python 脚本                              |
-| `open-vehicle`       | 双击第 N 台车进入详情页           | 通过 Python 脚本                              |
-| `collect-violations` | 逐条点击"查看详情"提取罚金/记分，支持SQLite增量对比、详情页智能翻页、违章级断点续跑、`--auto-insert` 逐条即时落库、`--query-mode auto|full` 控制详情页翻页策略 | 通过 Python 脚本                              |
+| `scan-all-vehicles`  | 🚧 规划中：helper 内置全页扫描落库。当前阶段一由固化脚本 `scripts/scan_vehicles.py` 替代（使用 `get-page-vehicles` + `click-page` + `db-insert-vehicle` 组合实现） | 规划中                              |
+| `search-vehicle`     | 🚧 规划中：helper 内置搜索定位。当前阶段二由固化脚本 `scripts/collect_violations.py` 替代（使用 `pinchtab eval` JS 搜索实现） | 规划中                              |
+| `open-vehicle`       | 双击第 N 台车进入详情页（搜索后始终 `--index 1`） | 通过 Python 脚本                              |
+| `collect-violations` | 逐条点击"查看详情"提取罚金/记分，支持SQLite增量对比、详情页智能翻页、违章级断点续跑、`--auto-insert` 逐条即时落库 | 通过 Python 脚本                              |
 | `go-back`            | 从详情页返回车辆列表              | 通过 Python 脚本                              |
 | `click-page`         | 点击分页（next/prev/页码）；next/prev 内部转为明页号导航（避免点"下一页"元素跳错页的 bug），页码支持智能跳转      | 通过 Python 脚本                              |
-| `save-detail-progress` | 保存进度（--company + --query-date 隔离）      | 通过 Python 脚本                              |
-| `load-detail-progress` | 加载进度（--company + --query-date 隔离）           | 通过 Python 脚本                              |
-| `reset-detail-progress`| 安全重置详情进度（--company + --query-date） | 通过 Python 脚本                              |
-| `get-page-vehicles`    | 获取当前页车辆列表+页码+总页数         | 通过 Python 脚本                              |
+| `save-detail-progress` | 保存进度（--company + --batch-id 隔离）      | 通过 Python 脚本                              |
+| `load-detail-progress` | 加载进度（--company + --batch-id 隔离）           | 通过 Python 脚本                              |
+| `reset-detail-progress`| 安全重置详情进度（--company + --batch-id） | 通过 Python 脚本                              |
+| `get-page-vehicles`    | 获取当前页车辆列表+页码+总页数；内置页面漂移自愈（非列表页自动恢复） | 通过 Python 脚本                              |
 | `get-login-type`       | 检测登录类型（单位/个人/未登录）        | 通过 Python 脚本                              |
 | `check-login-state`    | **统一登录状态检测**：URL+DOM (Tier 1) 初始检查 + 关键字匹配 (Tier 2) 扫码轮询检测 | 通过 Python 脚本                              |
 | `find-plate-page`      | 在断点页找不到上次车辆时向前搜索（最多3页） | 通过 Python 脚本                              |
-| `session_manager.py`   | **会话+实例生命周期管理**（init/bind/release/list/current + instance-discover/instance-status）；通过 `VIOLATION_TAB_ID` + `VIOLATION_INSTANCE_PORT` 环境变量自动注入 `--tab` + `--server` 到所有 PinchTab 命令 | `eval $(python3 session_manager.py init --label "name" [--instance-port <port>])` |
+| `session_manager.py`   | **会话+实例生命周期管理**（profile-create / init / bind / release / list / current + instance-discover / instance-status）；通过 `VIOLATION_TAB_ID` + `VIOLATION_INSTANCE_PORT` 环境变量自动注入 `--tab` + `--server` 到所有 PinchTab 命令 | `eval $(python3 session_manager.py init --label "name" [--instance-port <port>])` |
 | `keepalive-health`     | 检查保活守护进程健康状态（health file + PID），返回 alive + 状态详情 | 通过 Python 脚本                              |
 | `ensure-keepalive`     | **自动启动保活守护进程**（登录后调用）；检查是否已运行，未运行则 `systemctl start`；已运行则跳过（防重复） | 通过 Python 脚本                              |
 | `save-notify`          | 持久化扫码人信息到保活通知文件（--company, --project-root, --type, --id, --label, [--at-user-id, --at-user-name]），供保活守护进程自动恢复扫码时使用 | 通过 Python 脚本                              |
@@ -225,7 +264,6 @@ pinchtab click e2
 | 上传图片（`im images create`）  | `--as bot`  | API 仅支持 bot      |
 | 按姓名查飞书用户（`lark-contact`）  | `--as user` | 需用户权限搜索通讯录       |
 | 按手机号查飞书用户（`batch_get_id`） | `--as bot`  | API 限制           |
-| 监听飞书消息回执（`event consume`） | `--as bot`  | 以应用身份接收事件        |
 
 ### ⚡ 第零步：自动配置权限（每次执行必做）
 
@@ -258,7 +296,7 @@ pinchtab click e2
 ## ⚠️ 全局交互规则
 
 1. **禁止 AskUserQuestion 弹窗：** 所有确认交互通过对话自然语言完成
-2. **意图识别优先：** 已指定信息直接使用不重复询问。根据用户提供的城市/省份/车牌信息确定省份，用于导航到正确12123平台和匹配公司。单台车查询时：省份匹配的公司仅一家则直接进入，多家则向用户确认。登录后呈现多个公司且用户信息无法唯一确定时，才需补充公司名称
+2. **意图识别优先：** 已指定信息直接使用不重复询问。根据用户提供的城市/省份/车牌信息确定省份，用于匹配对应公司 Profile 和登录后页面跳转。登录入口统一为 `https://gab.122.gov.cn/m/login?t=2`，无需按省份区分。单台车查询时：省份匹配的公司仅一家则直接进入，多家则向用户确认。登录后呈现多个公司且用户信息无法唯一确定时，才需补充公司名称
 3. **姓名查人优先：** 用户提供姓名时，优先通过 `lark-contact` skill 按姓名查找飞书用户（`--as user`），查找失败时再请求用户提供手机号
 
 ***
@@ -278,13 +316,11 @@ python3 /home/openclaw/init_violation_{pid}.py
 脚本内容：
 
 ```python
-import shutil, os, json, subprocess, sys
+import os, json, shutil, subprocess, sys
 
-# Use absolute path — robust regardless of execution mode (-c, file, or interactive)
+# Helper lives in the skill directory — no /tmp copy needed
 home = os.path.expanduser('~')
-src = os.path.join(home, '.claude', 'skills', 'DSTviolation_query', 'violation_helper.py')
-dst = '/tmp/violation_helper.py'
-shutil.copy2(src, dst)
+helper = os.path.join(home, '.claude', 'skills', 'DST违章查询', 'violation_helper.py')
 
 # detect lark-cli (on PATH)
 lark = shutil.which('lark-cli') or 'lark-cli'
@@ -294,7 +330,7 @@ query_dir = os.path.join(os.getcwd(), 'violation_query')
 os.makedirs(query_dir, exist_ok=True)
 
 result = {
-    'helper': dst,
+    'helper': helper,
     'lark_cli': lark,
     'query_dir': query_dir,
     'python': sys.executable
@@ -331,7 +367,7 @@ import subprocess, os
 
 py = r'python3'
 session_mgr = r'/home/openclaw/.claude/skills/DST违章查询/session_manager.py'
-helper = r'/tmp/violation_helper.py'
+helper = r'/home/openclaw/.claude/skills/DST违章查询/violation_helper.py'
 
 # Step 0: Ensure instance is discovered (first time or after restart)
 subprocess.run([py, session_mgr, 'instance-discover'], ...)
@@ -404,15 +440,35 @@ PinchTab daemon
      c. 检查 data 目录：`ls violation_query/data/keepalive_health_*.json`
      d. 若诊断发现匹配的公司 → 用完整公司名重试 `profile-lookup`
      e. 仅当诊断确认无任何匹配时才走完整登录流程
+   - **🔴 诊断确认无匹配后，必须先创建新 Profile（铁律 #16）：**
+     f. 调用 `session_manager.py profile-create` 创建新的 PinchTab Profile + 独立 Instance（自动生成 `profile_001` / `profile_002` 等数字命名）
+     g. 记录返回的 `instance_port`（如 9877），后续用 `init --instance-port <port>` 创建标签页
+     h. **禁止**跳过此步骤直接 `init --instance-port` 指向默认实例或其他已有实例
    - 登录成功后，**从平台公司列表页 snap 提取实际公司名称**，调用 `profile-register --company <平台实际公司名> --profile-name <profile> --platform-url <url>` 写入映射。**禁止使用用户输入的公司名或模糊匹配结果直接落库**，必须以平台页面显示为准。`profile-register` 完成后会自动调用 `instance-discover` 绑定实例端口
 
 **不同公司的 Profile 创建：**
 
-当新公司的 12123 平台 URL 与已有 Profile 不同时，需要创建新的 PinchTab Profile（手动在 `~/.pinchtab/profiles/` 下创建目录，或通过 PinchTab 管理）。如果 PinchTab 已有默认 profile 尚未绑定任何公司，则直接复用。
+新公司必须通过 `session_manager.py profile-create` 创建独立的 PinchTab Profile + Instance（铁律 #16）。命令自动生成数字命名（`profile_001`、`profile_002`...），避免与省份/城市绑定（因为扫码登录前公司名称是模糊的）。Profile 与 Instance 一一绑定，各自拥有独立的 Chrome user-data-dir 和 cookie jar，确保不同公司的 12123 SSO 会话互不干扰。
+
+```bash
+# 为新公司创建 Profile + Instance
+python3 session_manager.py profile-create
+
+# 输出示例：
+# {"ok": true, "profile_id": "xxx", "profile_name": "profile_001", "instance_port": 9877}
+# 然后使用返回的 instance_port 初始化标签页：
+python3 session_manager.py init --label "深圳查询" --instance-port 9877
+```
+
+**禁止**手动创建 `~/.pinchtab/profiles/` 目录，也**禁止**复用默认 profile。Profile 的完整生命周期（创建 → 启动 Instance → 写入 SQLite）由 `profile-create` 统一管理。扫码登录后，从平台公司列表页提取实际公司名称，调用 `profile-register --company <平台实际公司名>` 更新 SQLite 中的公司名（铁律 #14）。
 
 ### 第一步：确定省份与平台入口
 
 根据用户提供的信息确定省份（优先级：车牌号自动识别 > 城市/公司注册地名推断 > 自然语言询问）。
+
+> **🔑 扫码登录入口统一为 `https://gab.122.gov.cn/m/login?t=2`**，所有省份/公司扫码均从此 URL 进入，**无需先导航到省份页面**。扫码后选择公司，系统会自动跳转到对应省份的业务页面。
+>
+> 确定省份的目的是：**(1)** 登录后根据省份 URL 直接跳转到其他页面（如 `https://gd.122.gov.cn`）；**(2)** 匹配对应省份的公司 Profile；**(3)** 对话总结中展示平台信息。
 
 **省份→12123 平台入口：**
 
@@ -462,13 +518,13 @@ PinchTab daemon
 
 1. **优先级**：车牌号（自动识别） > 城市/公司注册地名推断 > 自然语言询问用户
 2. 无法确定时自然语言询问用户
-3. 确定省份后，导航到对应省份12123首页（如广东→`https://gd.122.gov.cn`），`pinchtab snap` 确认加载完成
+3. 确定省份后，**记录省份对应的 12123 URL（如广东→`https://gd.122.gov.cn`），供登录后页面导航和对话总结使用**。登录本身无需经过省份页面，直接走统一入口（见第三步）。
 
 ### 第二步：判断登录状态与登录类型
 
 **🔑 核心原则：优先信任保活守护进程（keepalive daemon）的结果，避免重复检测。**
 
-保活守护进程每 18 分钟 reload 页面并持续验证登录态，其 health file 是最新的登录状态快照。查询流程应先查看保活结果，仅在保活不可用时才自行检测。
+保活守护进程每 55 分钟 reload 页面并持续验证登录态，其 health file 是最新的登录状态快照。查询流程应先查看保活结果，仅在保活不可用时才自行检测。
 
 **登录状态判断流程（保活优先）：**
 
@@ -491,13 +547,13 @@ PinchTab daemon
 
 ```bash
 # 初始检查（默认 URL+DOM，失败时自动回退关键字）
-python3 /tmp/violation_helper.py check-login-state
+python3 /home/openclaw/.claude/skills/DST违章查询/violation_helper.py check-login-state
 
 # 仅 URL+DOM（初始检查，推荐）
-python3 /tmp/violation_helper.py check-login-state --mode url
+python3 /home/openclaw/.claude/skills/DST违章查询/violation_helper.py check-login-state --mode url
 
 # 仅关键字匹配（扫码轮询检测用）
-python3 /tmp/violation_helper.py check-login-state --mode keyword
+python3 /home/openclaw/.claude/skills/DST违章查询/violation_helper.py check-login-state --mode keyword
 ```
 
 **返回值**：`state: "logged_in" | "login_page" | "rate_limited" | "unknown"`，exit code 对应 0/1/2/3。
@@ -537,7 +593,7 @@ python3 /tmp/violation_helper.py check-login-state --mode keyword
 # 写入 /home/openclaw/search_user_{pid}.py
 import subprocess, sys
 py = r'python3'
-helper = r'/tmp/violation_helper.py'
+helper = r'/home/openclaw/.claude/skills/DST违章查询/violation_helper.py'
 result = subprocess.run(
     [py, helper, 'search-user', '--query', '用户姓名'],
     stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8')
@@ -552,7 +608,15 @@ print(result.stdout)
 
 通过 Python 脚本调用 helper 的 `search-chat` 子命令。
 
-**3.3 点击登录入口：** 确认接收人 ID 获取成功后，在省份12123首页找到"单位用户登录"按钮，`pinchtab snap` 获取 ref 编号 → `pinchtab click <ref>`进入扫码登录页
+**3.3 导航到统一登录页：** 确认接收人 ID 获取成功后，**直接导航到统一登录入口**（无需先打开省份页面）：
+
+```bash
+pinchtab nav "https://gab.122.gov.cn/m/login?t=2"
+```
+
+> **⚠️ 确认单位用户 tab：** 登录页顶部有"个人用户登录"和"单位用户登录"两个 tab，共用同一个二维码区域。`?t=2` 参数本意是预选单位用户，但页面可能未可靠选中。导航后必须通过 JS 检查"单位用户登录" tab 是否处于 active 状态，未选中则点击切换，确保截图的是单位用户二维码。保活自动恢复中由 `_ensure_unit_login_tab()` 处理此检查。
+
+> **说明：** 登录页是跨省份通用的，扫码后选择公司，12123 会根据该公司的注册省份自动跳转到对应的省份业务页面。省份 URL（如 `https://gd.122.gov.cn`）仅用于**登录后**的直接页面跳转（如从对话链接跳转到车辆详情页）。
 
 **3.4 截图保存二维码：**
 
@@ -573,7 +637,7 @@ pinchtab screenshot -o "/home/openclaw/violation_query/login_qrcode_YYYYMMDD.png
 # 写入 /home/openclaw/upload_qr_{pid}.py
 import subprocess
 py = r'python3'
-helper = r'/tmp/violation_helper.py'
+helper = r'/home/openclaw/.claude/skills/DST违章查询/violation_helper.py'
 result = subprocess.run([py, helper, 'upload-image',
     '--dir', r'/home/openclaw/violation_query',
     '--file', 'login_qrcode_YYYYMMDD.png'],
@@ -605,7 +669,7 @@ print(result.stdout.strip())
 import subprocess, json
 
 py = r'python3'
-helper = r'/tmp/violation_helper.py'
+helper = r'/home/openclaw/.claude/skills/DST违章查询/violation_helper.py'
 
 qr_params = {
     "image_key": "<IMAGE_KEY>",
@@ -669,54 +733,40 @@ print(f"QR_MSG_ID={msg_id}")
 ⏳ 当前状态：等待扫码登录（超时5分钟）...
 ```
 
-**3.7 轮询登录回执 + QR 失效自动刷新**
-> `send-msg` 内部通过 `shutil.which()` 解析 lark-cli 路径后直接调用，Linux 上无编码问题。
+**3.7 轮询登录 + QR 失效自动刷新**
 
-通过 Python 脚本调用 `poll-login`，动态轮询间隔 + 浏览器 QR 失效检测 + 最多 3 次自动刷新。
+通过 Python 脚本调用 `poll-login`，纯浏览器检测（snap + eval JS），固定 10 秒间隔同时检测登录和 QR 过期，不调用飞书 API。
 
 **参数：**
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--browser-only` | false | **🔴 推荐模式**：纯浏览器检测，**不调用飞书 API**。登录检测：每 ~10s 通过 `pinchtab text+snap` 关键词匹配。QR 过期检测：每 ~60s 通过 `pinchtab eval` JS 检测。此模式下 `--chat-id`/`--target-user-id`/`--qr-msg-id` 可选 |
-| `--chat-id` | (browser-only 时可选) | 飞书会话 ID |
-| `--target-user-id` | (browser-only 时可选) | 目标用户 open_id |
-| `--qr-msg-id` | (browser-only 时可选) | QR 通知消息 ID（群聊时用于 reply_to 匹配） |
-| `--qr-sent-as` | user | 谁发的 QR 消息：`bot`（bot-用户 P2P，跳过 reply_to 匹配）或 `user`（群聊，需 reply_to 匹配） |
 | `--max-duration` | 300 | 总轮询时长（秒） |
-| `--check-qr` | false | [legacy] 轮询耗尽后启用浏览器 QR 失效检测 |
-| `--check-login` | false | [legacy] 飞书轮询期间启浏览器自动检测登录。每约 30s 检测，检测到即退出 0 |
 | `--qr-refresh-count` | 0 | 当前已刷新次数 |
-| `--max-qr-refreshes` | 3 | 最大刷新次数（整个 skill 统一：首次 + 2 次重发 = 3 次），超限后 QR 过期不再刷新，只等待用户回复 |
+| `--max-qr-refreshes` | 3 | 最大刷新次数（整个 skill 统一：首次 + 2 次重发 = 3 次），超限后 QR 过期不再刷新 |
 
-**轮询间隔策略：**
-
-| 时间段 | 间隔 | 说明 |
-|--------|------|------|
-| 0-60s | 10s | 用户扫码中 |
-| 60-180s | 5s | 用户可能错过通知，加频提醒 |
-| 180-300s | 15s | 用户大概率已扫码，降频 |
+**轮询策略：** 固定 10 秒间隔。每轮同时执行：
+- 登录检测：`pinchtab snap` 匹配 POST_LOGIN_KEYWORDS（"退出"、"我的主页" 等）
+- 扫码中间页检测：`pinchtab eval` JS innerText 检测 "请选择单位"（deptLoginNext 页面，公司列表在 innerText 中但不在 snap 无障碍树中）
+- QR 过期检测：`pinchtab eval` JS innerText 检测 "二维码已过期"
 
 **退出码：**
 
 | 码 | 含义 | 处理 |
 |----|------|------|
-| 0 | 用户已回复「已登录」/ 浏览器自动检测到登录 | 继续查询 |
-| 1 | 超时（无回复 / QR 过期但已达刷新上限） | 询问用户 |
-| 2 | 用户在聊天中反馈 QR 已过期 | `pinchtab reload` 当前登录页 → 截图 → 重发通知 → 重新轮询 |
-| 3 | 浏览器检测到 QR 已过期 | `pinchtab reload` 当前登录页 → 截图 → 重发通知 → 重新轮询 |
+| 0 | 浏览器检测到登录（snap 中出现 "退出"/"我的主页" 等）**或**检测到 deptLoginNext 中间页（JS innerText 含"请选择单位"） | 继续查询；中间页场景需先提取公司名称再点击"登录" |
+| 1 | 超时 / QR 过期但已达刷新上限 | 询问用户 |
+| 3 | 浏览器检测到 QR 已过期（eval JS innerText 检测） | `pinchtab reload` 当前登录页 → 截图 → 重发通知 → 重新轮询 |
 
-**基础调用（推荐 browser-only 模式）：**
+**调用：**
 
 ```python
 # 写入 /home/openclaw/poll_login_{pid}.py
 import subprocess, sys
 py = r'python3'
-helper = r'/tmp/violation_helper.py'
-# 🔴 推荐：纯浏览器检测模式，不调用飞书 API
+helper = r'/home/openclaw/.claude/skills/DST违章查询/violation_helper.py'
 result = subprocess.run(
     [py, helper, 'poll-login',
-     '--browser-only',
      '--max-duration', '300',
      '--qr-refresh-count', '<N>',
      '--max-qr-refreshes', '3'],
@@ -724,68 +774,47 @@ result = subprocess.run(
 sys.exit(result.returncode)
 ```
 
-**Legacy 调用（飞书轮询 + 浏览器检测）：**
-
-```python
-# 保留用于群聊场景（需要监听用户反馈 QR 过期）
-result = subprocess.run(
-    [py, helper, 'poll-login',
-     '--chat-id', 'oc_xxx',
-     '--target-user-id', 'ou_xxx',
-     '--qr-msg-id', 'om_xxx',
-     '--qr-sent-as', 'bot',
-     '--max-duration', '300',
-     '--check-qr',
-     '--check-login',
-     '--qr-refresh-count', '<N>',
-     '--max-qr-refreshes', '3'],
-    encoding='utf-8')
-sys.exit(result.returncode)
-```
-
-**带 QR 自动刷新的循环调用（exit 2/3 时刷新 QR 重试）：**
+**带 QR 自动刷新的循环调用（exit 3 时刷新 QR 重试）：**
 
 ```python
 # 写入 /home/openclaw/poll_with_refresh_{pid}.py
 import subprocess, sys, time
 
 py = r'python3'
-helper = r'/tmp/violation_helper.py'
+helper = r'/home/openclaw/.claude/skills/DST违章查询/violation_helper.py'
 
 MAX_REFRESHES = 3
 
 for refresh_count in range(MAX_REFRESHES + 1):
     result = subprocess.run(
         [py, helper, 'poll-login',
-         '--chat-id', 'oc_xxx',
-         '--target-user-id', 'ou_xxx',
-         '--qr-msg-id', 'om_xxx',
-         '--qr-sent-as', 'bot',
          '--max-duration', '300',
-         '--check-qr',
-         '--check-login',
          '--qr-refresh-count', str(refresh_count),
          '--max-qr-refreshes', str(MAX_REFRESHES)],
         encoding='utf-8')
 
     if result.returncode == 0:
-        print('LOGIN_SUCCESS')
+        # Check stdout to distinguish SCAN_DETECTED vs LOGIN_DETECTED_BROWSER
+        stdout = result.stdout or ''
+        if 'SCAN_DETECTED' in stdout:
+            print('SCAN_DETECTED')    # deptLoginNext — extract companies FIRST, then click 登录
+        else:
+            print('LOGIN_SUCCESS')    # fully logged in — proceed to query
         sys.exit(0)
     elif result.returncode == 1:
         print('TIMEOUT_OR_MAX_REFRESHES')
         sys.exit(1)
-    elif result.returncode in (2, 3):
+    elif result.returncode == 3:
         if refresh_count >= MAX_REFRESHES:
-            print('MAX_REFRESHES_REACHED - waiting for user reply only')
+            print('MAX_REFRESHES_REACHED')
             sys.exit(1)
         # Refresh QR: reload current login page → screenshot → upload → re-send
-        # 直接 pinchtab reload 当前登录页即可生成新二维码，无需退回首页再进入
         print(f'QR expired, refreshing ({refresh_count + 1}/{MAX_REFRESHES})...')
         # 1. pinchtab reload （刷新当前登录页，自动生成新二维码）
         # 2. 截图保存（同 3.4）
         # 3. 上传获取 image_key（同 3.5）
-        # 4. 发送新通知（同 3.6），更新 qr_msg_id
-        # 5. 用新的 qr_msg_id 继续 poll-login
+        # 4. 发送新通知（同 3.6）
+        # 5. 用新 QR 继续 poll-login
 ```
 
 **3.8 降级：** 用户主动跳过飞书通知或 lark-cli 不可用时，只执行 3.6.3 本地回复展示截图，自然语言等待用户对话回复。
@@ -794,24 +823,63 @@ for refresh_count in range(MAX_REFRESHES + 1):
 
 > **登录成功后，必须先校验平台实际公司名称、进入「我的主页」确认页面正常、未被风控，再启动保活。**
 
-1. 扫码/轮询确认登录成功后
-2. **🔴 公司名称校验（必须执行）：** 在省份首页 `pinchtab snap` 提取公司列表中的**实际公司名称**。将此名称与用户意图（如"深圳公司"）做对比校验：
-   - 若平台只有一家公司 → 直接采用该公司名，与用户意图确认匹配
-   - 若平台有多家公司 → 根据用户意图选择匹配的公司，无法唯一确定时向用户确认
+**🔀 poll-login 退出码 0 有两种情况，处理流程不同：**
+
+| 输出标记 | 含义 | 当前页面 | 处理流程 |
+|----------|------|---------|---------|
+| `SCAN_DETECTED` | 扫码后停在 deptLoginNext 中间页 | `gab.122.gov.cn/m/deptLoginNext` | → 执行下方「A. deptLoginNext 流程」 |
+| `LOGIN_DETECTED_BROWSER` | 已完全登录 | 省份首页/车辆列表页 | → 直接跳到下方步骤 4 检查页面状态 |
+
+**A. deptLoginNext 流程（SCAN_DETECTED）：**
+
+a. **🔴 提取公司名称（点登录前必须执行）：** 用 `pinchtab eval` JS innerText 提取公司列表（公司名在 innerText 中但不在 snap 无障碍树中）：
+   ```javascript
+   (function(){var t=document.body.innerText||'';return t;})()
+   ```
+   解析 innerText 中 "请选择单位" 之后、"登录" 之前的行作为公司名列表。
+b. 将提取的公司名与用户意图（如"成都公司"）做对比校验：
+   - 根据用户意图在所有公司中模糊匹配（如"成都"匹配名称中含"成都"的公司）
+   - 唯一匹配 → 直接采用该公司名
+   - 匹配多条或无法匹配（包括只有一家公司但与意图不符）→ 向用户确认
    - **以平台实际显示的公司名称为准**，调用 `profile-register --company <平台实际公司名> --profile-name <profile> --platform-url <url>` 标记 `is_logged_in=1`
    - 若 profile 中已有旧名称但与平台实际名称不一致 → **以平台为准更新覆盖**
-3. 选择公司 → 点击「我的主页」
-4. 检查页面状态：
+c. **🔴 精确选择公司（使用 `.company-name` 类选择器，禁止 `closest()` 全文搜索）：**
+   deptLoginNext 页面结构为 `DIV.dwyh-select-company > DIV.company-name`，每个 `.company-name` 是独立的公司选项，**不是包含全部公司文本的父容器**。
+   **必须**使用 `querySelectorAll('.company-name')` 逐项匹配，点击匹配项自身的 `.company-name` div：
+   ```javascript
+   (function(){
+     var companies = document.querySelectorAll('.company-name');
+     for (var i = 0; i < companies.length; i++) {
+       if (companies[i].textContent.indexOf('目标公司关键词') >= 0) {
+         companies[i].click();
+         return 'CLICKED: ' + companies[i].textContent.trim();
+       }
+     }
+     return 'NOT FOUND';
+   })()
+   ```
+   **禁止**使用 `innerText.indexOf()` + `closest('tr, li, div')` 方式定位——`closest()` 可能匹配到包含全部公司文本的父容器，导致默认选中列表中的第一家而非目标公司。
+   **点击后必须验证**：检查目标 `.company-name` 的 `parentElement.classList.contains('active')` 确认选中态已生效。
+d. 点击「登录」按钮（`document.getElementById('btnQyyhdl').click()`）。点击后直接进入 vehlist.html，无需再选公司。
+
+**B. 已登录流程（LOGIN_DETECTED_BROWSER / 保活信任 / 自行检测确认已登录）：**
+
+1. 若在省份首页需要选择公司 → `pinchtab snap` 获取公司列表，按用户意图模糊匹配选择
+2. 点击「我的主页」进入车辆列表页
+
+**公共步骤（A/B 流程汇合后，在车辆列表页执行）：**
+
+1. **检查页面状态：**
    - 有「退出」和「我的主页[*用户名]」→ 登录正常 ✅
    - 有车辆列表正常加载 → 未被风控 ✅
    - 有「频繁」「异常操作」「验证码」等关键词 → 风控 ⚠️，停止操作
-5. **持久化扫码人信息：** 调用 `save-notify` 将扫码人写入 `keepalive_notify_<公司>.json`。这样后续保活 daemon 独立启动时无需重新指定通知对象，自动恢复 QR 会直接发给此人。
+2. **持久化扫码人信息：** 调用 `save-notify` 将扫码人写入 `keepalive_notify_<公司>.json`。这样后续保活 daemon 独立启动时无需重新指定通知对象，自动恢复 QR 会直接发给此人。
 
    - **发给个人（P2P）：** `save-notify --company <公司名> --project-root <项目根目录> --type user --id <open_id> --label "<姓名>"`
    - **发给群聊（@指定人）：** `save-notify --company <公司名> --project-root <项目根目录> --type chat --id <chat_id> --label "<群名>" --at-user-id <open_id> --at-user-name "<姓名>"`
    - 带 `--at-user-id` 时，保活恢复 QR 会在群中 @同一个人（与查询流程 QR 的 @提及行为一致）
-6. **🔴 自动启动保活（必须执行）：** 调用 `ensure-keepalive --company <公司名> --project-root <项目根目录>` **自动检测并启动 systemd 保活服务**。此命令内置防重复逻辑：若 keepalive daemon 已运行则跳过（返回 `already_running`）；若未运行则自动 `systemctl --user start` + `enable`。**不再依赖模型记忆手动启动保活，此步骤为脚本强制内置**。
-7. 保活启动后再进行后续查询操作
+3. **🔴 自动启动保活（必须执行）：** 调用 `ensure-keepalive --company <公司名> --project-root <项目根目录>` **自动检测并启动 systemd 保活服务**。此命令内置防重复逻辑：若 keepalive daemon 已运行则跳过（返回 `already_running`）；若未运行则自动 `systemctl --user start` + `enable`。**不再依赖模型记忆手动启动保活，此步骤为脚本强制内置**。
+4. 保活启动后再进行后续查询操作
 
 ### 第四步：选择公司 → 进入业务主页 → 车辆列表页
 
@@ -820,7 +888,7 @@ for refresh_count in range(MAX_REFRESHES + 1):
 > **注意：首次登录时已在上一步（3.9）选择了公司并进入了我的主页，本步骤直接复用当前页面即可。**
 > **保活信任 / 自行检测确认已登录时，按以下步骤操作：**
 
-1. **选择公司**：`pinchtab snap` 获取页面上的公司列表。省份信息用于辅助匹配公司（如”成都”匹配名称中含”成都”的公司）。单台车查询时：若仅一家公司匹配省份则直接进入该公司；若多家公司匹配省份，向用户询问确认是哪家公司。全量查询无法唯一确定时同样追问。
+1. **选择公司**：`pinchtab snap` 获取页面上的公司列表。按用户意图模糊匹配公司（如”成都”匹配名称中含”成都”的公司）。唯一匹配 → 直接进入；多条匹配或无法匹配 → 向用户确认。
 2. **点击「我的主页」**：选择公司后，点击”我的主页”按钮进入该公司的业务主页（即租赁车辆管理 vehlist.html）。
    - 方法：`pinchtab snap` 获取 ref → `pinchtab click <ref>` → dismiss popup
    - 我的主页 = 车辆列表页，包含「退出」「我的主页[*用户名]」等登录特征
@@ -831,23 +899,6 @@ for refresh_count in range(MAX_REFRESHES + 1):
 
 - **指定车辆查询**：用户提供车架号或具体车牌号 → 走第六步-A
 - **全量查询**：用户要求查公司名下所有车辆 → 走第六步-B
-
-#### 全量查询模式选择（`--query-mode`）
-
-在全量查询（第六步-B）启动前，根据用户意图自动判断查询模式：
-
-| 用户意图关键词 | 模式 | `--query-mode` 值 | 行为 |
-|---------------|------|-------------------|------|
-| "首次"、"首批"、"第一次"、"全部查一遍"、"全量扫描"、"从头查"、"完整查询" | **全量扫描** | `full` | 遍历所有页面，不因连续清零页提前终止 |
-| 未明确指定意图（缺省） | **自动检测** | `auto` | 连续 2 页 `unprocessed` 全部为 0 时安全终止（默认） |
-
-**意图识别规则（必须遵守）：**
-1. 用户消息中包含上述全量意图关键词 → **直接采用 `full` 模式**，无需向用户确认
-2. 用户未提及任何模式关键词 → **默认 `auto` 模式**，无需向用户确认
-3. 当无法确定用户意图时（如"你看着办"、"随便"等模糊表述）→ 默认 `auto` 模式
-4. **不要在对话中询问用户选择哪种模式**——除非用户明确指出两种可能性但未做选择
-
-> `--query-mode` 参数传递给第六步-B 的批量查询包装脚本，脚本在循环体内据此决定是否启用提前终止逻辑。
 
 ### 第六步-A：指定车辆查询
 
@@ -861,217 +912,93 @@ for refresh_count in range(MAX_REFRESHES + 1):
    - 内置 XHR 风控监控，检测到”查询过于频繁”立即熔断
 5. 提取完成后 `go-back` 返回列表
 
-### 第六步-B：全量查询（逐页处理模式）
+### 第六步-B：全量查询（两阶段模式）
 
-> **核心改变**：一页页处理，不先扫描全部页面。每页只对有违章的车进入详情采集，无违章跳过。完成一页后再翻下一页。
+> **🔴 核心设计：阶段一由 helper 内部完成全页扫描落库（秒级），阶段二脚本只做搜索→单车查询循环（分钟级）。脚本代码极简，不含任何翻页逻辑。**
+
+> **🔴 数据权威来源策略：**
+> - **SQLite `vehicles` 表是唯一清单**：车辆是否需要查询由 `unprocessed_count > 0` + `query_date` 判定
+> - **不产生任何 JSON 清单文件**：数据库即清单，不额外维护文件
 >
-> **🔴 铁律：批量查询必须通过 `violation_helper.py` 已有子命令组合实现。** 整个逐页循环只调用以下 helper 子命令，不新写独立查询脚本：
-> - `load-detail-progress` / `save-detail-progress` — 断点续跑（进度文件按 `details_progress_<公司>_<日期>.json` 隔离）
-> - `get-page-vehicles` — 获取当前页车辆列表+页码
-> - `open-vehicle --index N` — 进入第 N 台车详情
-> - `collect-violations --plate <车牌> --query-date <日期> [--query-mode auto|full]` — 逐条采集违章详情，`--query-mode` 控制详情页翻页策略（同车辆列表页）
-> - `db-insert-violation` — 每条违章结果立即落库（逐条 upsert，不攒批）
-> - `go-back` — 返回车辆列表
-> - `click-page --target N` — 翻页（直接用明页号，禁止 `--target next`）
-> - `find-plate-page --plate <车牌>` — 断点续跑时向前搜索
-> - `detect-rate-limit` — 风控检测
+> **🔴 铁律：批量查询必须通过 `violation_helper.py` 已有子命令组合实现。** 只调用以下 helper 子命令：
+> - `scan-all-vehicles` — 遍历全部车辆列表页，逐台写入 `vehicles` 表（阶段一，helper 内部处理翻页）
+> - `search-vehicle --plate <车牌>` — 在列表页搜索框输入车牌号搜索（阶段二定位车辆）
+> - `open-vehicle --index 1` — 进入搜索结果第一台车详情（搜索后始终只有1条结果）
+> - `collect-violations --plate <车牌> --query-date <日期> [--auto-insert]` — 逐条采集违章详情
+> - `go-back` — 从详情页返回车辆列表
+> - `db-insert-company` / `db-insert-vehicle` / `db-insert-violation` — 数据落库
 > - `dismiss-popup` — 弹窗防御
+> - `save-detail-progress` / `load-detail-progress` — 采集进度断点续跑
 >
-> **🔴 铁律：违章详情逐个查询 + 逐条落库。** `collect-violations --auto-insert` 在每提取完一条违章详情（关闭弹窗后）立即调用内部 `_upsert_violation()` 写入 SQLite。即使中途崩溃，已入库的违章数据不会丢失。禁止攒到全部查完再批量落库、禁止用中间 JSON/JS 文件暂存。
+> **🔴 铁律：违章详情逐个查询 + 逐条落库。** `collect-violations --auto-insert` 逐条即时写入 SQLite。禁止攒批。
+
+> **阶段二采集进度文件：** `details_progress_<公司>_<批次>.json`，仅记录采集进度：
+> - `phase`: `"collect"`
+> - `processed_plates`: 已处理车牌列表
 >
-> **断点续跑机制（二级：车辆级 + 违章级）：**
->
-> 每次查询前先调用 `load-detail-progress` 获取断点位置：
-> - `resume_page`: 上次完成的车辆列表页码（0 or fresh = 从头开始）
-> - `resume_vehicle_index`: 该页上完成的最后一台车序号（0 = 该页从头开始）
-> - `resume_detail_page`: 该车的违章详情页码（-1 = 未开始/已完成，>=0 = 从该页续跑）
-> - `resume_violation_index`: 该详情页的违章序号（-1 = 该页从头开始）
-> - `resume_violation_time`: 最后一条已处理违章的时间戳（用于跨页交叉校验）
-> - `processed_plates`: 已处理车牌列表（用于增量去重）
->
-> **逐页处理循环（极简包装，只调 helper 子命令，写入 `/home/openclaw/batch_query_{pid}.py` 后执行）：**
+> **🔴 断点续跑原理：** 进度文件只存 `processed_plates`。待查列表从 DB 实时查询：`SELECT plate_number FROM vehicles WHERE company_id=? AND query_date=? AND unprocessed_count>0`。DB 完整则断点可续。
 
-```python
-"""
-批量查询包装脚本 — 仅调用 violation_helper.py 已有子命令。
-不包含任何查询逻辑，所有逻辑在 helper 内部。
+#### 阶段一：全页扫描落库（固化脚本 `scripts/scan_vehicles.py`）
 
-Usage: python3 batch_query_{pid}.py --company <公司名> [--query-mode auto|full]
-  --query-mode auto  (default) 连续2页清零时自动终止
-  --query-mode full             全量扫描所有页面，不提前终止
-"""
-import subprocess, json, time, random, sys
+> **目标：** 遍历全部车辆列表页，逐台写入 `vehicles` 表。自动从浏览器当前页续跑（断点续跑）。
 
-py = r'python3'
-helper = r'/tmp/violation_helper.py'
-date = time.strftime('%Y-%m-%d')
-company = '<公司名称>'  # set by caller based on selected company
-query_mode = 'auto'   # default: auto-detect stop
-
-# Parse CLI args
-args = sys.argv[1:]
-i = 0
-while i < len(args):
-    if args[i] == '--company' and i + 1 < len(args):
-        company = args[i + 1]; i += 2
-    elif args[i] == '--query-mode' and i + 1 < len(args):
-        query_mode = args[i + 1]; i += 2
-    else:
-        i += 1
-
-print(f"Batch query: company={company}, mode={query_mode}")
-
-def h(cmd_args):
-    """Call helper subcommand, return stdout stripped."""
-    result = subprocess.run([py, helper] + cmd_args,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8')
-    return result.stdout.strip()
-
-# 1. Load resume point (isolated by company + date)
-prog = json.loads(h(['load-detail-progress', '--company', company, '--query-date', date]))
-resume_page = prog['resume_page']
-resume_idx = prog['resume_vehicle_index']
-resume_plate = prog.get('resume_plate', '')
-processed = set(prog.get('processed_plates', []))
-print(f"Resume: page={resume_page}, idx={resume_idx}, processed={len(processed)}")
-
-# 2. Navigate to resume page if needed
-if resume_page > 1:
-    for attempt in range(3):
-        resp = h(['click-page', '--target', str(resume_page)])
-        if 'navigated' in resp.lower() or 'clicked' in resp.lower():
-            break
-        if 'stuck' in resp.lower():
-            h(['click-page', '--target', '1'])
-            resume_page = 1; resume_idx = 0; break
-        time.sleep(random.uniform(1, 2))
-    time.sleep(random.uniform(2, 5))
-
-    if resume_page > 1 and resume_plate:
-        find = json.loads(h(['find-plate-page', '--plate', resume_plate, '--max-forward', '3']))
-        if find.get('found') and find['method'] == 'forward':
-            resume_page = find['page']; resume_idx = 0
-        elif not find.get('found'):
-            h(['click-page', '--target', '1'])
-            resume_page = 1; resume_idx = 0
-
-# 3. Page-by-page loop
-vehicle_offset = resume_idx
-all_clean_streak = 0
-while True:
-    # Dismiss popup + get current page
-    h(['dismiss-popup'])
-    page_data = json.loads(h(['get-page-vehicles']))
-    vehicles = page_data.get('vehicles', [])
-    current_page = page_data.get('page', 1)
-    total_pages = page_data.get('total_pages', 1)
-    print(f"\n=== Page {current_page}/{total_pages}: {len(vehicles)} vehicles ===")
-
-    # Early termination logic (auto mode only):
-    # Platform sorts by unprocessed count descending. In auto mode, 2 consecutive
-    # all-clean pages means all remaining pages are clean → safe to stop early.
-    # In full mode, skip this check and scan every page.
-    unprocessed_vehicles = [v for v in vehicles if v.get('unprocessed', 0) > 0]
-    if len(unprocessed_vehicles) == 0:
-        if query_mode == 'auto':
-            all_clean_streak += 1
-            print(f"  All clean page (streak {all_clean_streak}/2)")
-            if all_clean_streak >= 2:
-                print("Early stop (auto mode): 2 consecutive pages with no unprocessed violations.")
-                break
-        else:
-            print(f"  All clean page (full mode: continuing regardless)")
-        # Go to next page
-        h(['click-page', '--target', str(current_page + 1)])
-        time.sleep(random.uniform(2, 5))
-        if current_page >= total_pages:
-            break
-        continue
-    else:
-        all_clean_streak = 0
-
-    for i, v in enumerate(vehicles):
-        if current_page == resume_page and i < vehicle_offset:
-            continue
-
-        plate = v['plate']
-        unprocessed = v.get('unprocessed', 0)
-
-        # Insert vehicle record immediately (even if no violations)
-        h(['db-insert-vehicle',
-            '--company-id', '1',
-            '--plate-number', plate,
-            '--plate-type', v.get('type', ''),
-            '--plate-type-label', v.get('type_label', v.get('type', '')),
-            '--status-code', str(v.get('status_code', '')),
-            '--status-label', v.get('status', ''),
-            '--inspection-date', v.get('inspection_date', ''),
-            '--unprocessed-count', str(unprocessed),
-            '--query-date', date])
-
-        if unprocessed == 0:
-            print(f"  [{i+1}] {plate}: skip (no violations)")
-            continue
-        if plate in processed:
-            print(f"  [{i+1}] {plate}: already processed, skip")
-            continue
-
-        print(f"  [{i+1}] {plate}: {unprocessed} violations, entering detail...")
-
-        # Open vehicle → collect violations → insert to DB → go back
-        h(['open-vehicle', '--index', str(i + 1)])
-        time.sleep(random.uniform(1, 2))
-
-        # Collect violation details with auto-insert (each detail immediately written to DB)
-        violations_out = h(['collect-violations', '--plate', plate, '--query-date', date, '--auto-insert', '--query-mode', query_mode])
-        try:
-            violations = json.loads(violations_out)
-            violation_count = len([x for x in violations if not x.get('skipped') and not x.get('from_db')])
-            print(f"    -> {violation_count} violations saved to DB")
-        except json.JSONDecodeError:
-            print(f"    -> parse error: {violations_out[:100]}")
-
-        h(['go-back'])
-        time.sleep(random.uniform(2, 5))
-
-        h(['save-detail-progress', '--page', str(current_page),
-            '--vehicle-index', str(i + 1), '--plate', plate,
-            '--company', company, '--query-date', date])
-        processed.add(plate)
-
-    if current_page >= total_pages:
-        print(f"\nAll {total_pages} pages done.")
-        break
-
-    next_page = current_page + 1
-    if next_page > total_pages:
-        break
-    print(f"\nPage {current_page} done, navigating to page {next_page}...")
-    h(['click-page', '--target', str(next_page)])
-    time.sleep(random.uniform(2, 5))
-    vehicle_offset = 0
-
-print(f"\nDone. Vehicles with violations processed: {len(processed)}")
+```bash
+python3 -u <SKILL_DIR>/scripts/scan_vehicles.py \
+    --company "<公司名>" \
+    --batch-id "20260713_001" \
+    --tab-id "<TAB_ID>" \
+    --instance-port <PORT>
 ```
 
+阶段一完成后在对话中输出：
+```
+📋 阶段一完成 | 📄 N页 | 🚗 M台 | ⚠️ 有违章 K台
+```
+
+**验证完成的三个条件（完成判定铁律）：**
+1. 进度文件存在（`save-detail-progress --phase scan` 写入）
+2. DB 记录数与总页数×每页条数基本匹配
+3. 脚本进程正常退出（exit code 0）
+
+#### 阶段二：搜索→单车查询循环（固化脚本 `scripts/collect_violations.py`）
+
+> **目标：** 从 DB 读取待查车牌列表，在列表页搜索每台车 → 进详情采集 → 返回。**车辆列表页使用搜索定位，不翻页。违章详情页翻页由 `collect-violations` 内部自动处理（违章数 > 10 时智能翻页采集）。**
+
+```bash
+python3 -u <SKILL_DIR>/scripts/collect_violations.py \
+    --company "<公司名>" \
+    --batch-id "20260713_001" \
+    --tab-id "<TAB_ID>" \
+    --instance-port <PORT>
+```
+
+阶段二自动：从 DB 读取 `unprocessed_count > 0` 的车辆 → 搜索框 JS 定位（确认机制：1s 固定 + 轮询最长 3s + 1 次重试） → `open-vehicle --index 1`（无额外 sleep，详情页自然加载即延迟） → `collect-violations --auto-insert` → `go-back` → 续跑保存。车间保底 10s（从上一台搜索开始到下一台搜索开始计时，自然耗时不足则等待）。支持断点续跑（进度文件 `processed_plates`）。
+
+**🔴 搜索确认机制（替代固定 sleep）：**
+1. `pinchtab eval` 触发搜索后，固定等 1s
+2. 轮询页面 `document.body.innerText.indexOf('{plate}')`，每 0.2s 检查一次，最长 2s（总计 3s）
+3. 未找到：重试一次搜索（dismiss-popup + 重新搜索 + 轮询最长 3s）
+4. 两次都失败：跳过该车，记录日志，继续下一台
+5. 确认目标车牌出现在列表后，调用 `open-vehicle --index 1`（无需额外 sleep）
+
+**🔴 搜索实现要点（12123 平台陷阱）：**
+1. **车牌号去省份前缀**：省份下拉框已提供"闽"，搜索框只需输入 `DD66057`（非 `闽DD66057`），否则发送 `闽闽DD66057` 搜不到
+2. **用 jQuery handler 触发搜索**：平台按钮 `id="jdcquery"` 通过 jQuery 绑定 `queryVehtodo()`，原生 `click()` 无效，必须 `jQuery._data(btn, 'events').click[0].handler()` 调用
+
 **关键规则：**
-- **有违章必须查**：`unprocessed > 0` 的车辆必须 `open-vehicle` → `collect-violations` → `go-back`，不能跳过
-- **只查未处理记录**：`collect-violations` 只对状态为"未处理"的违章逐条点击"查看详情"。状态为"已处理"、"已缴费"、"无需缴费"的记录直接从列表提取基本信息，不点击详情（已处理记录无需获取罚款记分调整）
-- **🔴 逐条落库**：`collect-violations` 返回结果后，必须逐条立即调 `db-insert-violation` 写入 SQLite。禁止攒批、禁止中间 JSON 暂存
-- **🔴 车辆即时入库**：`get-page-vehicles` 获取每台车信息后，立即调 `db-insert-vehicle` 写入 vehicles 表（含未处理违章数的车也要写）。禁止等到 Step 7 再批量补写
-- **随机延迟**：每条违章记录查询之间 `time.sleep(random.uniform(2, 5))`，每次点击操作之间 `time.sleep(random.uniform(1, 2))`
-- **`collect-violations` 已验证**：逐条点击"查看详情"提取真实罚款金额和记分，关闭弹窗后继续下一条，不 reload 页面
-- **每台车保存进度**：`save-detail-progress` 记录页码+序号+车牌+详情页+违章序号，支持车辆级和违章级两级断点续跑
-- **翻页智能跳转**：`click-page --target N` 内置智能翻页算法（目标页>当前显示最大页→先跳最大页→再找）。详情页翻页使用相同算法
-- **详情返回原路**：`go-back` 优先使用 `history.back()` 保留列表页位置，避免跳回第1页
-- **进度文件结构**：`details_progress_<公司>_<日期>.json` 记录 `last_page`、`last_vehicle_index`、`last_plate`、`processed_plates`。公司+日期隔离保证多进程互不干扰且支持跨 Claude 重启续跑
-- **安全重置**：`reset-detail-progress` 只清空采集进度，不碰全量车辆列表文件
-- **禁止新写脚本**：以上包装脚本是唯一允许的批量查询脚本，其唯一职责是循环调用 helper 已注册子命令。禁止在循环体内手写任何查询逻辑（如 JS 注入、DOM 操作、手动解析页面等）
-- **🔴 查询模式传参**：调用批量查询脚本时必须传入 `--query-mode`（值为 `auto` 或 `full`），由第五步意图识别结果决定。脚本内部根据此参数决定是否启用提前终止逻辑
+- **阶段一不查详情**：`scan_vehicles.py` 只扫描列表页写 DB，不进详情
+- **🔴 阶段二只用搜索**：车辆列表页通过搜索框输入车牌定位，不在列表页翻页。违章详情页多页由 `collect-violations` 内部自动翻页采集（违章数 > 10 时）
+- **搜索后始终 `--index 1`**：搜索过滤后结果只有一台车
+- **🔴 数据库是唯一清单**：不产生 JSON 清单文件
+- **有违章必须查**：`unprocessed > 0` 必须进详情采集
+- **🔴 逐条落库**：`--auto-insert` 逐条即时写入
+- **断点续跑**：进度文件只存 `processed_plates`，待查列表从 DB 查
+- **安全重置**：`reset-detail-progress` 仅清空进度文件
+- **使用固化脚本**：`scripts/collect_violations.py` 存放于 skill 目录复用，不每次写临时文件
 
-### 第七步：结果汇总 — 双重输出 + 飞书通知
+### 第七步：结果汇总 — 对话内总结 + 飞书通知
 
-> **🔴 查询完成后不生成飞书文档/多维表格，仅发送简洁完成通知。**
+> **🔴 查询完成后不生成飞书文档/多维表格，不写本地 MD 报告文件。仅在对话中做简单总结 + 发送飞书简洁完成通知。**
 
 #### 输出一：SQLite 数据库
 
@@ -1084,26 +1011,36 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 - **vehicles**: id, company_id, plate_number, plate_type, plate_type_label, status_code, status_label, inspection_date, unprocessed_count, query_date
 - **violations**: id, vehicle_id, plate_number, violation_time, violation_location, violation_behavior, violation_code, fine_amount, points, handling_status, payment_status, authority, 等
 
-#### 输出二：本地 Markdown 报告
+#### 输出二：对话内简单总结
 
-保存到 `violation_query/reports/violation_query报告_[公司名称]_YYYY-MM-DD.md`（由 Write tool 写入）
+> **🔴 查询完成后，直接在对话中输出以下表格总结即可，无需写入 MD 文件。**
 
-```markdown
-# 车辆violation_query报告
+总结模板：
 
-**查询公司：** [公司] | **查询日期：** YYYY-MM-DD | **平台：** [省份]12123
-**查询车辆：** N 台 | **违章总数：** M 条
-
----
-
-## 查询结果汇总
-
-| 序号 | 车牌号 | 号牌种类 | 违章时间 | 违章地点 | 违章行为 | 违章代码 | 罚款(元) | 记分 | 处理状态 | 缴款状态 |
-|------|--------|---------|----------|----------|----------|----------|----------|------|----------|----------|
-
-> 处理状态 cod：-1已删除 / 0未处理 / 1已处理 / 2已转出 / 9无需处理
-> 缴款状态 cod：0未缴款 / 1已缴款 / 9无需缴款
 ```
+📊 12123 违章查询完成
+
+| 公司名称 | 完成时间 | 查询车辆数 | 新增车辆数 | 新增违章数 | 变更违章数 |
+|----------|----------|-----------|-----------|-----------|-----------|
+| xxx公司   | 2026-07-13 14:30 | N | V | M | R |
+
+[若有新增违章，列出明细]
+⚠️ 新增违章：
+  粤B12345  2026-07-10  违反交通信号灯  200元  6分  未处理
+  粤A67890  2026-07-05  超速行驶        150元  3分  未处理
+
+[若有变更违章，列出明细]
+🔄 状态变更（未处理→已处理/已缴费）：
+  粤C11111  2026-06-20  违停  100元  0分  已处理
+
+📝 完整数据已存入 SQLite（violation_query/data/violations.db）。
+```
+
+> **字段说明：**
+> - **查询车辆数**：本轮进入详情页采集的车辆数（有未处理违章的）
+> - **新增车辆数**：本轮新写入 vehicles 表的车辆数
+> - **新增违章数**：本轮新发现入库的违章条数
+> - **变更违章数**：对比历史，状态从未处理变为已处理/已缴费的条数（无变更时不列）
 
 #### 输出三：查询完成飞书通知（简洁摘要）
 
@@ -1131,7 +1068,138 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 数据来源于12123平台，仅供参考。
 ```
 
-> **不再生成飞书云文档和飞书多维表格。** SQLite 数据库 + 本地 MD 报告保留用于数据存档。
+> **不再生成飞书云文档和飞书多维表格。** SQLite 数据库保留用于数据存档，查询结果在对话中直接总结。
+
+### 第八步：任务完成清理（每次执行必做）
+
+> **🔴 查询任务完成后分两步走：先写完成标记，再关闭标签页。**
+
+#### 8.1 写入完成标记
+
+通过 Python 脚本调用 `mark-task-done`，写入轻量完成标记文件（`.task_done_<tab_id>.json`）：
+
+```bash
+python3 <HELPER路径> mark-task-done \
+  --company "<公司名>" \
+  --query-type single|batch \
+  --vehicles-queried <N> \
+  --new-violations <M> \
+  --changed-violations <R> \
+  --new-vehicles <V>
+```
+
+标记文件内容：
+```json
+{
+  "tab_id": "A1B2C3...",
+  "company": "深圳公司",
+  "query_type": "batch",
+  "completed_at": "2026-07-13T14:30:00",
+  "vehicles_queried": 5,
+  "new_violations": 3,
+  "changed_violations": 1,
+  "new_vehicles": 2
+}
+```
+
+> **此标记是 GC 清理僵尸 tab 的一级信号——即使后续 `release-tab` 被遗漏，GC 也能据此安全清理。**
+
+#### 8.2 关闭标签页
+
+通过 Python 脚本调用 `release-tab`：
+
+```bash
+python3 <HELPER路径> release-tab
+```
+
+**`release-tab` 执行内容：**
+
+1. 读取 `VIOLATION_TAB_ID` 环境变量获取当前 tab ID
+2. 调用 `pinchtab close <tab_id>` 关闭浏览器标签页（自动携带 `--server` 指向正确实例）
+3. 从 `tab_registry.json` 中删除该 tab 的注册记录
+4. 输出 JSON 确认结果：`{"ok": true, "tab_id": "...", "closed": true, "registry_cleaned": true}`
+
+**重要约束：**
+- 保活守护进程的保活 tab **不在此步骤关闭**——它由 systemd 独立管理，与查询任务无关
+- 如果 `VIOLATION_TAB_ID` 未设置，`release-tab` 安全返回 `{"ok": false}` 不报错
+- 此步骤应在飞书通知发送成功 + 对话总结完成后执行
+
+#### 8.3 GC 兜底：僵尸 Tab 自动清理
+
+> **防御性机制：** 即使 8.1/8.2 被遗漏，`cleanup-stale-tabs` 通过三级检测自动识别并清理僵尸 tab。
+
+**三级检测逻辑（不依赖 PID，Claude 会话长期存活）：**
+
+| 级别 | 信号 | 判断 | 说明 |
+|------|------|------|------|
+| **Tier 1** | `.task_done_<tab_id>.json` 存在 | → **清理** | 任务明确已完成（8.1 已执行） |
+| **Tier 2** | `details_progress_*.json` 最近 `<idle_hours>` 内更新过 | → **保留** | 批量任务进度活跃，仍在跑 |
+| **Tier 3** | `created_at` 超过 `<max_age_hours>` 且无 Tier 1/2 信号 | → **清理** | 超时兜底，无任何活跃迹象 |
+
+**参数：**
+- `--idle-hours N`（默认 2h）：进度文件空闲阈值
+- `--max-age-hours N`（默认 6h）：创建时间硬超时
+- `--dry-run`：仅报告，不实际清理
+
+**调用示例：**
+```bash
+# 预览将要清理的僵尸 tab
+python3 <HELPER路径> cleanup-stale-tabs --dry-run
+
+# 实际执行清理
+python3 <HELPER路径> cleanup-stale-tabs
+```
+
+#### 8.4 自动清理守护（cleanup-dst.timer）
+
+> **周期性兜底：** `cleanup-dst.timer` 每小时自动触发 `cleanup_daemon.py`，补齐所有被遗漏的清理项。完全独立于 Claude 会话和用户手动操作。
+
+**四阶段清理流程：**
+
+| 阶段 | 内容 | 说明 |
+|------|------|------|
+| **Phase 1: 僵尸Tab GC** | 基于 `last_activity`（查询Tab）/ `last_check`（保活Tab）判定，>2h 无活动 → 关闭 | 不再依赖文件 mtime，基于真实页面操作 |
+| **Phase 2: 过期文件清理** | 8 类文件逐项清理（见下表） | 每项独立 try/except，单项失败不阻塞 |
+| **Phase 3: 幽灵注册表** | 移除 `tab_registry.json` 中浏览器已不存在的条目 | 保持注册表与 Chrome 实际状态一致 |
+| **Phase 4: 健康报告** | 写入 `cleanup_health.json` | 记录最后清理时间、数量、错误 |
+
+**Phase 2 清理清单：**
+
+| # | 清理项 | 策略 |
+|---|--------|------|
+| a | `screenshots/*.png` | > 1d 删除 |
+| b | `.task_done_*.json` | > 7d 删除 |
+| c | `recovery_qr_*.png` | > 1d 删除（保存新 QR 时也会立即删旧） |
+| d | `details_progress_*` | 按 mtime 保留最新 3 个 |
+| e | `violation_details_*` | 按 mtime 保留最新 3 个 |
+| f | `keepalive_*.log` | > 500 行截断保留尾部 |
+| g | 已登出公司残留 | 扫描 `keepalive_*` 提取公司名对比 profiles DB |
+| h | `dialog_debug/` 子目录 | > 7d 删除 |
+
+**安全约束：**
+- 活跃查询 Tab（`last_activity` < 2h）→ 跳过其关联文件，不阻塞其他清理
+- 活跃保活 Tab（`last_check` < 2h 且未登出）→ 保留对应文件
+- `--dry-run` 只报告不执行；每项独立 try/except
+
+**调用方式：**
+```bash
+# 预览（dry-run）
+python3 <HELPER路径> cleanup --dry-run
+
+# 手动执行一次
+python3 <HELPER路径> cleanup
+
+# 直接调用
+python3 cleanup_daemon.py --project-root /home/openclaw [--dry-run] [--status]
+```
+
+**systemd 部署（一次性）：**
+```bash
+cp cleanup-dst.service cleanup-dst.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now cleanup-dst.timer
+systemctl --user status cleanup-dst.timer  # 验证
+```
 
 ***
 
@@ -1150,7 +1218,7 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 │     作用: 保持页面活跃，避免服务端 idle 超时             │
 │     检测: 连续 5 次心跳失败 → 提前触发 L1 reload       │
 ├─────────────────────────────────────────────────────┤
-│ L1  周期 Reload 层 (18min)                           │
+│ L1  周期 Reload 层 (55min)                           │
 │     pinchtab reload → dismiss popup → 点击我的主页    │
 │     作用: 全量刷新保持 session 活跃                     │
 │     原因: 我的主页（车辆列表页）能即时暴露异常           │
@@ -1164,7 +1232,7 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 ├─────────────────────────────────────────────────────┤
 │ L3  systemd 自动重启层                                │
 │     pinchtab.service: Restart=always, RestartSec=5   │
-│     keepalive-12123.service: Type=notify,              │
+│     keepalive-profile_<N>.service: Type=notify,              │
 │       WatchdogSec=240, Restart=always, RestartSec=10   │
 │     看门狗: 独立看门狗定时器每 60s 无条件发送 WATCHDOG=1,  │
 │       心跳成功时也发送, 周期开始时发送 → 最长间隔 60s     │
@@ -1176,7 +1244,7 @@ print(f"\nDone. Vehicles with violations processed: {len(processed)}")
 └─────────────────────────────────────────────────────┘
 ```
 
-**每个公司一个独立 systemd 服务**（`keepalive-<公司简称>.service`），不同公司的保活完全隔离。
+**每个公司一个独立 systemd 服务**（`keepalive-<profile_name>.service`，如 `keepalive-profile_002.service`），不同公司的保活完全隔离。服务名使用 ASCII 安全的 `profile_name`（如 `profile_002`），**禁止**使用中文公司名作为 systemd 单元名（systemd 不支持非 ASCII 字符）。
 
 ### systemd 服务架构
 
@@ -1188,7 +1256,7 @@ systemd user services
 │       ├── ExecStartPre=cookie_persist.py   ← Chrome 启动前修 DB
 │       └── ExecStopPost=cookie_persist.py   ← Chrome 停止后修 DB（应对 clean shutdown 回写）
 │
-└── keepalive-12123.service             ← 保活守护进程（以厦门地上铁为例）
+└── keepalive-profile_<N>.service         ← 保活守护进程（以 profile_001 为例，使用 ASCII profile_name）
     ├── After=pinchtab.service
     ├── Type=notify, WatchdogSec=240
     ├── Restart=always, RestartSec=10
@@ -1215,15 +1283,15 @@ systemd user services
 
 ```bash
 # 查看当前状态
-python3 /home/openclaw/.claude/skills/DSTviolation_query/cookie_persist.py \
+python3 /home/openclaw/.claude/skills/DST违章查询/cookie_persist.py \
   --profile /home/openclaw/.pinchtab/profiles/default --verify
 
 # 执行持久化
-python3 /home/openclaw/.claude/skills/DSTviolation_query/cookie_persist.py \
+python3 /home/openclaw/.claude/skills/DST违章查询/cookie_persist.py \
   --profile /home/openclaw/.pinchtab/profiles/default
 
 # 预览（不实际修改）
-python3 /home/openclaw/.claude/skills/DSTviolation_query/cookie_persist.py \
+python3 /home/openclaw/.claude/skills/DST违章查询/cookie_persist.py \
   --profile /home/openclaw/.pinchtab/profiles/default --dry-run
 ```
 
@@ -1243,7 +1311,7 @@ MAX_CONSECUTIVE_HEARTBEAT_FAILS = 5  # 连续失败阈值
 # 3. 1/5 概率 dismiss popup — 清理意外弹窗
 ```
 
-**心跳在 18 分钟 sleep 期间以 60-120s 随机间隔执行**，每次心跳耗时 ~0.1-3 秒。连续 5 次失败则提前触发 L1 reload（不等 18 分钟）。
+**心跳在 55 分钟 sleep 期间以 60-120s 随机间隔执行**，每次心跳耗时 ~0.1-3 秒。连续 5 次失败则提前触发 L1 reload（不等 55 分钟）。
 
 ### ⚠️ 看门狗超时陷阱
 
@@ -1253,7 +1321,7 @@ MAX_CONSECUTIVE_HEARTBEAT_FAILS = 5  # 连续失败阈值
 
 **修复（2026-07-08）：**
 
-1. **独立看门狗定时器**：在 18-min sleep 循环内增加 60s 间隔的 `WATCHDOG_INTERVAL`，**无条件**发送 `WATCHDOG=1`，与心跳成功/失败完全解耦
+1. **独立看门狗定时器**：在 55-min sleep 循环内增加 60s 间隔的 `WATCHDOG_INTERVAL`，**无条件**发送 `WATCHDOG=1`，与心跳成功/失败完全解耦
 2. **周期开始时发送**：每轮 reload 周期开始前立刻发送一次 `WATCHDOG=1`，覆盖 reload + dismiss + navigate（20-30s pinchtab 调用）的时间窗口
 3. **捕获 SIGABRT**：新增 `signal.signal(signal.SIGABRT, _on_signal)`，即使未来 watchdog 触发也能有日志
 4. **WatchdogSec: 120→240**：增加系统级安全余量（60s 通知间隔 × 4 = 240s）
@@ -1276,23 +1344,26 @@ _sd_notify("WATCHDOG=1")  # 覆盖 reload 窗口
 
 ### 部署保活（首次登录成功后执行）
 
-为每个公司创建 systemd 服务。以「厦门市地上铁新创绿能汽车服务有限公司」为例：
+为每个公司创建 systemd 服务。**使用 `profile_name`（如 `profile_002`）作为服务名后缀，禁止使用中文公司名**（systemd 不支持非 ASCII 单元名）。
+
+以 profile_002 为例：
 
 **1. 创建 pinchtab drop-in（cookie 持久化钩子）：**
 
 ```ini
 # ~/.config/systemd/user/pinchtab.service.d/cookie-persist.conf
 [Service]
-ExecStartPre=/opt/aiext/bin/python3 /home/openclaw/.claude/skills/DSTviolation_query/cookie_persist.py --profile /home/openclaw/.pinchtab/profiles/default
-ExecStopPost=/opt/aiext/bin/python3 /home/openclaw/.claude/skills/DSTviolation_query/cookie_persist.py --profile /home/openclaw/.pinchtab/profiles/default
+ExecStartPre=/opt/aiext/bin/python3 /home/openclaw/.claude/skills/DST违章查询/cookie_persist.py --profile /home/openclaw/.pinchtab/profiles/<profile_name>
+ExecStopPost=/opt/aiext/bin/python3 /home/openclaw/.claude/skills/DST违章查询/cookie_persist.py --profile /home/openclaw/.pinchtab/profiles/<profile_name>
 ```
 
 **2. 创建 keepalive 服务：**
 
 ```ini
-# ~/.config/systemd/user/keepalive-12123.service
+# ~/.config/systemd/user/keepalive-<profile_name>.service
+# 服务文件名必须使用 ASCII 安全的 profile_name，例如 keepalive-profile_002.service
 [Unit]
-Description=12123 Keepalive Daemon (厦门地上铁)
+Description=12123 Keepalive Daemon (<公司名>)
 After=pinchtab.service
 Wants=pinchtab.service
 
@@ -1300,8 +1371,8 @@ Wants=pinchtab.service
 Type=notify
 WatchdogSec=240
 Environment="PATH=/home/openclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStartPre=/opt/aiext/bin/python3 /home/openclaw/.claude/skills/DSTviolation_query/cookie_persist.py --profile /home/openclaw/.pinchtab/profiles/default
-ExecStart=/opt/aiext/bin/python3 /home/openclaw/.claude/skills/DSTviolation_query/keepalive_daemon.py \
+ExecStartPre=/opt/aiext/bin/python3 /home/openclaw/.claude/skills/DST违章查询/cookie_persist.py --profile /home/openclaw/.pinchtab/profiles/<profile_name>
+ExecStart=/opt/aiext/bin/python3 /home/openclaw/.claude/skills/DST违章查询/keepalive_daemon.py \
     --company "<公司名>" \
     --project-root <项目根目录> \
     --auto-recover
@@ -1319,8 +1390,8 @@ WantedBy=default.target
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable keepalive-12123.service
-systemctl --user start keepalive-12123.service
+systemctl --user enable keepalive-<profile_name>.service
+systemctl --user start keepalive-<profile_name>.service
 
 # 确保用户服务在会话退出后继续运行（只需执行一次）
 loginctl enable-linger
@@ -1330,7 +1401,7 @@ loginctl enable-linger
 
 ```bash
 # 查看 keepalive 服务状态
-systemctl --user status keepalive-12123.service --no-pager
+systemctl --user status keepalive-<profile_name>.service --no-pager
 
 # 查看 pinchtab 服务状态
 systemctl --user status pinchtab.service --no-pager
@@ -1339,27 +1410,27 @@ systemctl --user status pinchtab.service --no-pager
 tail -f violation_query/data/keepalive_<公司名>.log
 
 # Cookie 持久化状态
-python3 /home/openclaw/.claude/skills/DSTviolation_query/cookie_persist.py \
+python3 /home/openclaw/.claude/skills/DST违章查询/cookie_persist.py \
   --profile /home/openclaw/.pinchtab/profiles/default --verify
 ```
 
 ### 停止保活
 
 ```bash
-systemctl --user stop keepalive-12123.service
+systemctl --user stop keepalive-<profile_name>.service
 # 如需彻底禁用:
-systemctl --user disable keepalive-12123.service
+systemctl --user disable keepalive-<profile_name>.service
 ```
 
 如需停止整个保活栈（含 pinchtab）：
 
 ```bash
-systemctl --user stop keepalive-12123.service pinchtab.service
+systemctl --user stop keepalive-<profile_name>.service pinchtab.service
 ```
 
 ### 守护进程行为
 
-`keepalive_daemon.py` 每 18 分钟循环执行：
+`keepalive_daemon.py` 每 55 分钟循环执行：
 
 0. 读取 SQLite `profiles.is_logged_in`，若为 0 则退出
 1. `pinchtab tab <id>` 切换到本公司的 keepalive 标签页
@@ -1372,7 +1443,7 @@ systemctl --user stop keepalive-12123.service pinchtab.service
 5. 调用 `cookie_persist.py` 持久化本周期产生的新 session cookie
 6. 日志写入 `violation_query/data/keepalive_<公司>.log`（含时间戳）
 
-**18 分钟 sleep 期间：** 心跳以 60-120s 随机间隔执行 random scroll + DOM ping，保持页面活跃。
+**55 分钟 sleep 期间：** 心跳以 60-120s 随机间隔执行 random scroll + DOM ping，保持页面活跃。
 
 **标签页持久化：** Tab ID 保存在 `violation_query/data/keepalive_tab_<公司>.txt`。守护进程重启时复用已有 Tab（不重复创建），Tab 失效时自动创建新 Tab 并导航到 `platform_url`。
 
@@ -1423,30 +1494,26 @@ SIGKILL pinchtab
 | ------------------ | ----------------------------------------------------------------------------- |
 | 页面加载超时             | `pinchtab wait --text "<关键文本>" --timeout 60000`，超时重试                          |
 | 风控/限流检测            | `detect-rate-limit` 检测到关键词或连续3台 open_vehicle 失败 → 立即终止所有进程，发送飞书告警，保留进度 |
-| 二维码过期              | `poll-login --check-qr` 自动检测 → `pinchtab reload` 当前登录页直接刷新（不退回首页重进）→ 重新截图 → 重新发送飞书通知（最多 3 次）               |
+| 二维码过期              | `poll-login` 自动检测 QR 过期 → `pinchtab reload` 当前登录页直接刷新 → 重新截图 → 重新发送飞书通知（最多 3 次）               |
 | 截图保存失败             | 重试一次；两次均失败提示用户手动截图                                                            |
 | 图片上传/发送失败          | `send-msg` 通过 `shutil.which()` 解析 lark-cli 直接调用；仍失败时降级独立图片+文字                      |
 | 飞书消息发送失败           | 报告原因，回退本地展示，不阻塞主流程                                                            |
 | 姓名查不到飞书用户          | 间隔2秒最多重试3次；3次均失败降级为请求用户提供手机号                                                  |
 | 用户ID/群名查不到         | 间隔2秒最多重试3次；3次均失败提示用户换用手机号或直接提供 open\_id/chat\_id                              |
 | poll-login 轮询超时     | 退出码 1：询问用户是否继续等待。退出码 3：自动刷新 QR 重新轮询，最多 3 次                                  |
-| 群聊中无人回复            | 超时后提醒用户，确认是否要重新发送或直接跳过                                                        |
-| 群聊中非目标用户回复         | `reply_to` + `sender.id` 双重过滤，自动忽略非目标用户的回复                                    |
-| bot 不在群中           | 先用 `lark-cli api POST /open-apis/im/v1/chats/{chat_id}/members` 把 bot 拉进群再发消息 |
 | 查询无结果              | 记录"无违章"，继续后续                                                                  |
 | 批量某台失败             | 记录原因，跳过继续                                                                     |
 | 会话过期               | 重新登录（含飞书通知）                                                                   |
 | PinchTab daemon 断开 | `pinchtab health` 检查状态 → `pinchtab daemon restart` 重启                         |
 | lark-cli 权限错误      | 按 lark-shared skill 引导授权                                                      |
-| poll-login 消息发送损坏  | helper 内部 `_run()` 强制 UTF-8 编码（PYTHONUTF8=1 + PYTHONIOENCODING=utf-8），Linux 上无编码问题 |
 
 ***
 
 ## 使用示例
 
-- **车牌自动识别：** `查粤B12345违章` → 粤→广东→导航 gab.122.gov.cn → 登录 → 选择公司 → 点击"我的主页" → 租赁车辆管理 → 输入车牌 → 生成报告
-- **批量：** `查成都公司违章` → 成都→四川→导航 gab.122.gov.cn → 登录 → 选择公司 → 点击"我的主页" → 租赁车辆管理 → 车辆列表 → 逐台查 → 三重输出
-- **群通知（@指定人）：** `查成都公司违章，发到违章通知群，@任晏平` → 四川→截图→搜群→发群+@→轮询监听→查询→通知结果
+- **车牌自动识别：** `查粤B12345违章` → 粤→广东→查人→导航 `gab.122.gov.cn/m/login?t=2` → 截图发飞书 → 扫码 → 选择公司 → 平台自动跳转广东业务页 → 我的主页 → 搜索车牌 → 采集详情 → SQLite 落库 + 对话总结 + 飞书通知 → mark-task-done + release-tab 关闭标签页
+- **批量：** `查成都公司违章` → 成都→四川→查人→导航 `gab.122.gov.cn/m/login?t=2` → 截图发飞书 → 扫码 → 选择公司 → 平台自动跳转四川业务页 → 我的主页 → 阶段一扫描全部页面 → 阶段二逐台采集违章 → SQLite 落库 + 对话总结 + 飞书通知 → mark-task-done + release-tab 关闭标签页
+- **群通知（@指定人）：** `查成都公司违章，发到违章通知群，@任晏平` → 搜群→查人→截图→发群+@→轮询监听→查公司→逐台采→对话总结+飞书通知 → mark-task-done + release-tab 关闭标签页
 - **保活：** 登录成功后通过 systemd user service 启动 `keepalive_daemon.py`，四层保活（心跳 + 周期 reload + Cookie 持久化 + systemd 自动重启），完全独立于 Claude 会话持续保活
 
 ***
@@ -1454,14 +1521,14 @@ SIGKILL pinchtab
 ## 注意事项
 
 1. 仅查授权车辆，车架号默认只显示后6位
-2. 批量查询间隔 2-5 秒随机，点击操作间隔 1-2 秒随机（模拟人工操作，避免触发反爬）
+2. 批量查询间隔：搜索确认 1s+轮询（最长3s）、车间保底 10s、违章详情弹窗 1.5-3.5s、违章列表翻页 1.5-3.5s、车辆列表翻页 2-5s
 3. 飞书不可用自动降级本地展示，不阻塞
 4. 二维码约5分钟有效，尽快发送
 5. **lark-cli 身份：** 发消息 `--as bot` | 查用户ID（手机号）`--as bot` | 查用户ID（姓名）`--as user`（通过 lark-contact）| 上传图片 `--as bot`
 6. **姓名查人优先：** 用户提供姓名时，优先通过 `lark-contact` skill 查找，失败时降级为请求手机号
 7. **Linux UTF-8 兼容：** Linux 终端原生支持 UTF-8，可直接在 Bash 命令中使用中文路径和中文参数。Python 已自动配置 UTF-8 编码（PYTHONUTF8=1）。关键输出仍可通过 `-o FILE` 写入 UTF-8 文件确保跨进程正确读取。临时脚本写入 `/home/openclaw/` 目录。
 8. **本地回复（3.6.3）：** 发送飞书通知后，必须同时在当前对话中输出截图 `file:///` 链接和登录信息
-9. **登录入口统一：** 所有省份扫码登录使用 `https://gab.122.gov.cn/m/login?t=2`。省份 URL 用于登录后导航（选择公司 → 点击"我的主页" → 租赁车辆管理）和报告展示。已登录状态下**禁止经过 gab.122.gov.cn 认证网关**，直接从省份 URL 进入
+9. **登录入口统一：** 所有省份扫码登录使用 `https://gab.122.gov.cn/m/login?t=2`。省份 URL 用于登录后导航（选择公司 → 点击"我的主页" → 租赁车辆管理）和对话展示。已登录状态下**禁止经过 gab.122.gov.cn 认证网关**，直接从省份 URL 进入
 10. **车牌自动识别：** 用户输入车牌号时，提取首字符匹配省份，用于确定省份上下文
 11. **文件存储：** `violation_query/screenshots/`（截图）、`violation_query/reports/`（报告）、`violation_query/data/`（SQLite 数据库）
 12. **PinchTab 调试：** 若 PinchTab 命令失败，先检查 `pinchtab health`，必要时 `pinchtab daemon restart`
@@ -1471,15 +1538,15 @@ SIGKILL pinchtab
 16. **lark-cli 直调：** helper `_run()` 直接使用 PATH 上的 `lark-cli` 二进制（或通过 `shutil.which()` 解析的完整路径），Linux 上不经过任何中间包裹器。`_node_path()` 优先使用 `shutil.which('node')` 搜索 PATH。
 17. **Python stdout 编码（Issue #2 三重保障修复）：** helper 启动时：(1) 强制覆盖 `PYTHONUTF8=1` + `PYTHONIOENCODING=utf-8`（非 setdefault）；(2) `TextIOWrapper` 先包裹原始 buffer（绕过控制台编码）；(3) `reconfigure(encoding='utf-8')` 兜底。子进程 `_run()` env 也强制覆盖。同时包裹 `sys.stdin` 确保 piped 输入为 UTF-8
 18. **路径输出乱码：** 通过 `-o FILE` 将含中文路径写入 UTF-8 文件，外部脚本读取文件获取正确路径
-19. **poll-login 退出码：** 0=已登录（浏览器自动检测，browser-only 模式）或飞书回复 / 1=超时或达刷新上限 / 2=用户反馈 QR 过期（legacy） / 3=浏览器检测 QR 过期。**推荐 `--browser-only` 模式**：纯浏览器检测，不调飞书 API，退出码仅有 0/1/3
+19. **poll-login 退出码：** 0=浏览器检测到登录（snap 中出现 "退出"/"我的主页" 等 POST_LOGIN_KEYWORDS）/ 1=超时或达刷新上限 / 3=浏览器检测 QR 过期（eval JS innerText 检测）。纯浏览器检测，无飞书 API 调用，无退出码 2
 20. **QR 刷新上限：** 最多自动刷新 3 次，达到上限后仅等待用户主动回复，不再刷新
 21. **send-msg 响应校验：** send-msg 发送后校验响应 JSON 必须含 `ok:true` 和 `message_id`，否则非零退出。不再静默失败。
-22. **poll-login --qr-sent-as：** bot 发送时传 `--qr-sent-as bot`，跳过 reply_to 匹配（bot-用户 P2P 对话中用户消息无需回复特定消息）；群聊中用户发送时保留默认 `user` 模式（需 reply_to 匹配）。
+22. **poll-login 检测原理：** 固定 10 秒间隔，每轮同时：(1) `pinchtab snap` 匹配 POST_LOGIN_KEYWORDS（仅可见元素，不受隐藏 DOM 干扰）；(2) `pinchtab eval` JS innerText 检测 QR 过期（innerText 忽略 display:none 元素）。登录和过期各独立判断。
 23. **bot 发个人消息用 --user-id：** bot 发给个人时使用 `send-msg --user-id <open_id>`（创建 bot-用户 P2P），**禁止使用** search-user 返回的 p2p_chat_id。
-24. **逐页处理模式 + 双模式查询：** 全量查询不再先扫描所有页面，而是一页一页处理。每页提取车辆→有违章则进入详情采集→采集完翻下一页。每台车完成后保存进度（页码+序号+车牌），下次从断点继续。支持两种查询模式：`auto`（默认，连续2页清零自动终止）和 `full`（全量扫描，首次查询时使用）。模式由第五步意图识别自动判断，通过 `--query-mode` 传入批量查询脚本。
+24. **两阶段批量查询：** 阶段一 `scan-all-vehicles` 扫描全页落库（helper 内部翻页）；阶段二从 DB 读待查列表，每台车用搜索框定位 → 进详情采集（脚本无翻页逻辑）。两阶段解耦，数据库是唯一清单来源，无 JSON 清单文件。
 25. **智能翻页（Issue #5 ref 漂移修复）：** `click-page --target next|prev` 内部先读当前页码，转为明页号（current±1）后再走智能跳转逻辑，**不直接点击"下一页/上一页"元素**（已确认该元素在12123平台会跳错页，如 page 11→next→page 2）。`click-page --target N` 使用 JS 三策略（text/CSS/charCode）点击明页号，不依赖 ref。翻页后每次 `get-page-vehicles` 重新提取当前页车辆+页码。详情页翻页复用相同算法（`_click_detail_page`）。
 26. **详情返回保留位置：** `go-back` 优先 `history.back()` 保留列表页和翻页状态；`collect-violations` 关闭弹窗而非 reload 页面，避免丢失列表位置。
-27. **安全重置进度：** 使用 `reset-detail-progress` 只清空采集进度（plates+resume point），不碰全量车辆列表文件 `all_vehicles_progress.json`。禁止直接编辑/清空进度文件。
+27. **安全重置进度：** 使用 `reset-detail-progress` 只清空采集进度（`details_progress_*.json` 中的 `processed_plates`），不碰数据库。禁止直接编辑/清空进度文件。
 28. **终端编码：** 终端显示中文乱码是已知问题，文件内数据正常。关键输出走 `-o FILE` 写入 UTF-8 文件获取正确内容。
 29. **单位用户优先：** 判断已登录状态后直接点击"我的主页"继续查询，不要自行检测登录类型。保活守护进程已持续验证登录态，信任其结果。只有实际查询遇到非单位报错时才重新登录。不要因为不确定就退出重登。
 30. **弹窗遮挡（Issue #4 修复）：** `_close_popup()` 四层策略：(1) JavaScript `dispatchEvent` 点击关闭/×/取消按钮（绕过 pinchtab occlusion 检查）；(2) pinchtab click 关闭按钮（occlusion 失败时自动降级为 JS dispatchEvent）；(3) Escape 键事件（KeyEvent + activeElement）；(4) 直接 DOM 隐藏 modal/overlay/fixed 元素（最后的保险）。确保查看违章详情后能可靠关闭弹窗返回列表页。
@@ -1489,14 +1556,14 @@ SIGKILL pinchtab
 34. **图片上传方式：** `lark-cli im images create --file` 无法读取含中文路径文件。改用 stdin 管道：`cat /path/to/img.png | lark-cli im images create --as bot --file "image=-" --data '{"image_type":"message"}'`
 35. **总页数动态获取：** 不强制一开始获取全量页数。每页查询时通过可见分页链接获取当前 total_pages，动态更新。翻页后验证 URL 是否变化（防止假翻页）。连续 2 页检测到 0 辆车时认为到达末尾。
 36. **SQLite 增量对比：** `collect-violations` 查询前先读取 SQLite 中该车牌已有记录。已存在且状态未变的跳过；状态变更的（未处理→已处理）重新查询详情并更新。
-37. **详情页分页采集：** 违章数 > 10 的车辆，`collect-violations` 自动翻页采集所有详情页的未处理记录。支持 `--resume-from N` 断点续跑。`--query-mode auto`（默认）时当前详情页无未处理则跳过后续详情页；`--query-mode full` 时全量扫描所有详情页。
+37. **详情页分页采集：** 违章数 > 10 的车辆，`collect-violations` 自动翻页采集所有详情页的未处理记录。支持 `--resume-from N` 断点续跑。
 38. **先查人再开登录页（🔴 铁律 #9）：** 用户指定了通知对象时，必须先用 `search-user`/`search-chat`/`batch-get-id` 完成飞书 ID 查询，确认获取成功后，再导航到 12123 登录页截图二维码。二维码有效期约 5 分钟，先查人避免浪费。
-39. **批量查询走 helper（🔴 铁律 #10）：** 全量/多台车查询的循环逻辑必须通过 `violation_helper.py` 已有子命令组合实现（`get-page-vehicles` → `open-vehicle` → `collect-violations` → `db-insert-violation` → `go-back` → `save-detail-progress` → `click-page`）。禁止为批量查询新写独立 Python 脚本。唯一允许的包装脚本只做循环调用，不包含任何查询逻辑。
+39. **批量查询走 helper（🔴 铁律 #10）：** 全量/多台车查询分两阶段调用 helper：(1) `scan-all-vehicles` 扫描全页落库；(2) 循环 `search-vehicle` → `open-vehicle --index 1` → `collect-violations --auto-insert` → `go-back`。脚本不含翻页逻辑，搜索定位替代页码导航。禁止新写独立查询脚本。
 40. **违章详情逐个查询（🔴 铁律 #11）：** 有未处理违章的车辆必须逐条点击"查看详情"获取真实罚款和记分。禁止只读列表数据不查详情、禁止仅凭列表摘要生成报告。此为最高优先级铁律。
 41. **逐条落库（🔴 铁律 #12）：** `collect-violations --auto-insert` 在每条违章详情提取后立即写入 SQLite（helper 内置 upsert）。禁止攒到全部查完再批量落库、禁止用中间 JSON/JS 文件暂存。即使中途崩溃，已入库的违章数据不会丢失。
 42. **双层会话隔离（实例 + 标签页）：** 多个 Claude 进程共用同一 PinchTab daemon。通过 `session_manager.py init [--instance-port <port>]` 创建会话专属标签页，设置 `VIOLATION_TAB_ID` + `VIOLATION_INSTANCE_PORT` 环境变量后，`violation_helper.py._run()` 和 `keepalive_daemon.py._run_pinchtab()` 自动对所有 PinchTab 命令注入 `--tab <id>`（标签页隔离）和 `--server http://127.0.0.1:<port>`（实例隔离）。**同一公司**共享 Instance（含 cookie/登录态），不同 Tab 独立导航互不干扰；**不同公司**使用不同 Instance（独立 Chrome Profile + 独立 cookie jar），彻底隔离 SSO 会话。
-43. **多进程文件隔离：** 临时 Python 脚本路径含 `{pid}` 后缀（`batch_query_{pid}.py` 等），不同进程互不覆盖。进度文件按公司+日期隔离（`details_progress_<公司>_<日期>.json`），支持多进程并行查不同公司，且 Claude 上下文满重启后同一天自动续跑。SQLite 开启 WAL 模式支持多进程并发读写。
-44. **Profile 隔离与登录复用：** 每个公司绑定一个 PinchTab Profile（`profiles` 表）→ 1:1 映射到 PinchTab Instance（独立端口）。同一公司的多个查询进程复用同一 Instance（共享 cookie/登录态），通过 `session_manager.py init --instance-port <port>` + `VIOLATION_TAB_ID` + `VIOLATION_INSTANCE_PORT` 实现双层隔离（实例级 cookie 隔离 + 标签页级导航隔离）。不同公司使用不同 Instance。每次执行前先 `instance-discover` 同步实例端口 → `profile-lookup` 查映射表，命中则跳过登录直接查询。首次登录成功后 `profile-register` 写入映射表（自动联动 `instance-discover` 绑定端口）。**🔴 `profile-register` 的公司名必须以平台公司列表页实际显示为准（铁律 #14），禁止使用用户输入或模糊匹配结果直接落库。**
-45. **保活守护进程：** `keepalive_daemon.py` 通过 systemd user service 管理（`keepalive-<公司>.service`），配合 pinchtab drop-in `cookie-persist.conf` 实现四层保活架构（L0 心跳 → L1 周期 reload + 我的主页 → L2 Cookie 持久化 → L3 systemd 自动重启）。保活目标页面为我的主页（vehlist.html），能即时检测风控和登录过期。服务通过 `Restart=always` + `RestartPreventExitStatus=42 43 44` 自动恢复崩溃但不重启已登出/风控的 daemon。退出码：42=登录失效(`is_logged_in=0`)、43=风控限流、44=已有实例运行，这些退出码不会触发 systemd 重启。`loginctl enable-linger` 确保会话退出后不终止。PID 文件在 `violation_query/data/keepalive_<公司>.pid`，日志在 `violation_query/data/keepalive_<公司>.log`。Cookie 持久化由 `cookie_persist.py` 实现。启动前先检查是否已有实例运行（防止重复启动）。Claude 会话结束时守护进程不受影响，继续在后台每 18 分钟执行保活周期。**登录成功后通过 `ensure-keepalive` 自动触发启动，不再依赖模型记忆。**
-46. **双模式查询策略（`--query-mode`）：** 批量查询支持 `auto`（自动检测）和 `full`（全量扫描）两种模式。行为差异仅在提前终止逻辑：`auto` 模式连续 2 页 `unprocessed` 全为 0 时安全终止；`full` 模式遍历所有页面不提前终止。两种模式在违章详情采集、逐条落库、进度保存等方面完全一致。模式选择由第五步意图识别自动判断，**无需向用户确认**——首次/首批/第一次等全量意图自动使用 `full`，其余默认 `auto`。
+43. **多进程文件隔离：** 临时 Python 脚本路径含 `{pid}` 后缀（`batch_query_{pid}.py` 等），不同进程互不覆盖。进度文件按公司+批次隔离（`details_progress_<公司>_<批次>.json`），支持多进程并行查不同公司，且 Claude 上下文满重启后同批次自动续跑。SQLite 开启 WAL 模式支持多进程并发读写。
+44. **Profile 隔离与登录复用：** 每个公司绑定一个 PinchTab Profile（`profiles` 表）→ 1:1 映射到 PinchTab Instance（独立端口）。同一公司的多个查询进程复用同一 Instance（共享 cookie/登录态），通过 `session_manager.py init --instance-port <port>` + `VIOLATION_TAB_ID` + `VIOLATION_INSTANCE_PORT` 实现双层隔离（实例级 cookie 隔离 + 标签页级导航隔离）。不同公司使用不同 Instance。每次执行前先 `instance-discover` 同步实例端口 → `profile-lookup` 查映射表，命中则跳过登录直接查询。**🔴 新公司必须先 `session_manager.py profile-create` 创建独立 Profile + Instance（铁律 #16），禁止复用默认实例或其他公司实例。** 首次登录成功后 `profile-register` 写入映射表（自动联动 `instance-discover` 绑定端口）。**🔴 `profile-register` 的公司名必须以平台公司列表页实际显示为准（铁律 #14），禁止使用用户输入或模糊匹配结果直接落库。** Profile 命名采用数字方案（`profile_001`/`profile_002`），避免与省份/城市绑定。**🔴 禁止 `pinchtab cookies clear` 清除全部 Cookie（铁律 #17），cookie 隔离由 Profile 级别实现，不得通过清 cookie 修复登录跳转。**
+45. **禁止删除数据库（🔴 铁律 #20）：** SQLite 数据库 `violation_query/data/violations.db` 是所有历史查询记录的持久化存档，**任何时候不得删除或清空**（含 `rm`、`DROP TABLE`、`DELETE FROM`）。`init-db` 仅首次部署执行一次（`CREATE TABLE IF NOT EXISTS`），已有数据库直接跳过。批量查询中断只需重置进度文件，不得清库重跑。数据修正通过 `db-insert-*` 的 upsert 机制增量更新。
+46. **保活守护进程：** `keepalive_daemon.py` 通过 systemd user service 管理（`keepalive-<profile_name>.service`，ASCII 安全命名），配合 pinchtab drop-in `cookie-persist.conf` 实现四层保活架构（L0 心跳 → L1 周期 reload + 我的主页 → L2 Cookie 持久化 → L3 systemd 自动重启）。服务名使用 `profile_name`（如 `keepalive-profile_002.service`），**禁止使用中文公司名作为 systemd 单元名**。保活目标页面为我的主页（vehlist.html），能即时检测风控和登录过期。服务通过 `Restart=always` + `RestartPreventExitStatus=42 43 44` 自动恢复崩溃但不重启已登出/风控的 daemon。退出码：42=登录失效(`is_logged_in=0`)、43=风控限流、44=已有实例运行，这些退出码不会触发 systemd 重启。`loginctl enable-linger` 确保会话退出后不终止。PID 文件在 `violation_query/data/keepalive_<公司>.pid`，日志在 `violation_query/data/keepalive_<公司>.log`。Cookie 持久化由 `cookie_persist.py` 实现。启动前先检查是否已有实例运行（防止重复启动）。Claude 会话结束时守护进程不受影响，继续在后台每 55 分钟执行保活周期。**登录成功后通过 `ensure-keepalive` 自动触发启动，不再依赖模型记忆。**
 

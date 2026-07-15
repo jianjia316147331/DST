@@ -135,10 +135,10 @@ def main():
 
     db_path = _get_cookies_db(args.profile_dir)
     if not os.path.exists(db_path):
-        print(f"ERROR: Cookies DB not found at {db_path}", file=sys.stderr)
-        print("Is pinchtab running? The Cookies DB is created on first Chrome launch.",
-              file=sys.stderr)
-        sys.exit(1)
+        # First launch / fresh profile — no cookies to persist yet, not an error.
+        # Chrome creates the Cookies DB on first launch; we'll persist them on next run.
+        print(f"Cookies DB not found at {db_path} — nothing to persist (first launch?)")
+        sys.exit(0)
 
     if args.verify:
         result = verify(db_path)
