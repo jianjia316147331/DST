@@ -7,3 +7,11 @@ __pycache__/
 *.jpg
 *.png
 *.jpeg
+
+# Root-level convenience copies (tracked versions under skills/DST违章查询/)
+/*.py
+/*.service
+/*.timer
+/*.sh
+/lib/
+/scripts/
