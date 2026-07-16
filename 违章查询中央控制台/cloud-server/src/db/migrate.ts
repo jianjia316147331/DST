@@ -165,9 +165,22 @@ async function migrate() {
     try {
       await pool.query('ALTER TABLE nodes ADD COLUMN last_sync_at TIMESTAMP NULL');
     } catch (e: any) {
-      // Ignore if column already exists
       if (!e.message?.includes('Duplicate column')) throw e;
     }
+    // Add reporting_schedules table
+    await pool.query([
+      'CREATE TABLE IF NOT EXISTS reporting_schedules (',
+      'id INT AUTO_INCREMENT PRIMARY KEY,',
+      'node_id INT NOT NULL,',
+      'frequency VARCHAR(20) DEFAULT \'daily\',',
+      'times JSON,',
+      'enabled TINYINT(1) DEFAULT 1,',
+      'created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,',
+      'updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,',
+      'FOREIGN KEY (node_id) REFERENCES nodes(id),',
+      'INDEX idx_reporting_schedules_node (node_id)',
+      ')',
+    ].join(' '));
     console.log('Migration completed successfully.');
   } catch (err) {
     console.error('Migration failed:', err);

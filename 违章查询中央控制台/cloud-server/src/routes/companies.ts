@@ -52,17 +52,17 @@ export default async function companyRoutes(app: FastifyInstance) {
 
   // Create company
   app.post('/api/companies', { preHandler: [app.authenticate] }, async (request, reply) => {
-    const { name, short_name, province, province_url, feishu_contact_id, contact_name, contact_phone } =
+    const { name, short_name, province, feishu_contact_id, contact_name, contact_phone } =
       request.body as Record<string, string>;
 
-    if (!name || !province || !province_url) {
-      return reply.status(400).send({ error: 'name, province, province_url are required' });
+    if (!name || !province || !contact_name || !contact_phone) {
+      return reply.status(400).send({ error: 'name, province, contact_name, contact_phone are required' });
     }
 
     const [result] = await pool.query(
-      `INSERT INTO companies (name, short_name, province, province_url, feishu_contact_id, contact_name, contact_phone)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [name, short_name || null, province, province_url, feishu_contact_id || null, contact_name || null, contact_phone || null]
+      `INSERT INTO companies (name, short_name, province, feishu_contact_id, contact_name, contact_phone)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [name, short_name || null, province, feishu_contact_id || null, contact_name, contact_phone]
     );
 
     // Fetch back the inserted row
@@ -75,14 +75,14 @@ export default async function companyRoutes(app: FastifyInstance) {
   // Update company
   app.put('/api/companies/:id', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string };
-    const { name, short_name, province, province_url, feishu_contact_id, contact_name, contact_phone } =
+    const { name, short_name, province, feishu_contact_id, contact_name, contact_phone } =
       request.body as Record<string, string>;
 
     const [result] = await pool.query(
-      `UPDATE companies SET name=?, short_name=?, province=?, province_url=?,
+      `UPDATE companies SET name=?, short_name=?, province=?,
        feishu_contact_id=?, contact_name=?, contact_phone=?, updated_at=NOW()
        WHERE id=?`,
-      [name, short_name, province, province_url, feishu_contact_id, contact_name, contact_phone, id]
+      [name, short_name || null, province, feishu_contact_id || null, contact_name, contact_phone, id]
     );
 
     if (result.affectedRows === 0) return reply.status(404).send({ error: 'Company not found' });
@@ -95,9 +95,27 @@ export default async function companyRoutes(app: FastifyInstance) {
   // Delete company
   app.delete('/api/companies/:id', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string };
-    const [result] = await pool.query('DELETE FROM companies WHERE id = ?', [id]);
-    if (result.affectedRows === 0) return reply.status(404).send({ error: 'Company not found' });
-    return { success: true };
+
+    try {
+      // Delete dependent records first (cascade manually since FKs don't all have ON DELETE CASCADE)
+      await pool.query('DELETE FROM violations WHERE company_id = ?', [id]);
+      await pool.query('DELETE FROM vehicles WHERE company_id = ?', [id]);
+      await pool.query('DELETE FROM tasks WHERE company_id = ?', [id]);
+      await pool.query('DELETE FROM schedules WHERE company_id = ?', [id]);
+      await pool.query('DELETE FROM company_node_bindings WHERE company_id = ?', [id]);
+
+      const [result] = await pool.query('DELETE FROM companies WHERE id = ?', [id]) as any;
+      if (result.affectedRows === 0) return reply.status(404).send({ error: 'Company not found' });
+
+      await pool.query(
+        `INSERT INTO logs (level, category, message) VALUES ('INFO', 'system', ?)`,
+        [`删除公司 id=${id} 及其关联数据`]
+      );
+
+      return { success: true };
+    } catch (err: any) {
+      return reply.status(500).send({ error: err.message || 'Delete failed' });
+    }
   });
 
   // Bind company to node

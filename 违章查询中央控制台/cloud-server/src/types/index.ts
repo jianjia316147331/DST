@@ -42,10 +42,9 @@ export interface Company {
   name: string;
   short_name: string | null;
   province: string;
-  province_url: string;
   feishu_contact_id: string | null;
-  contact_name: string | null;
-  contact_phone: string | null;
+  contact_name: string;
+  contact_phone: string;
   account_status: 'offline' | 'online';
   last_query_at: Date | null;
   created_at: Date;
@@ -161,15 +160,30 @@ export type WsMessageType =
   | 'sync_data'
   | 'sync_ack'
   | 'keepalive_status'
+  | 'keepalive_login_progress'
+  | 'keepalive_login_result'
   | 'qr_code'
   | 'qr_expired'
   | 'login_ok'
   | 'login_failed'
+  | 'session_created'
+  | 'session_chunk'
+  | 'session_marker'
+  | 'session_done'
+  | 'session_error'
+  | 'session_list_result'
   // cloud → tray
+  | 'register_ack'
   | 'assign_task'
   | 'pause_task'
   | 'resume_task'
   | 'terminate_task'
   | 'update_config'
   | 'trigger_login'
-  | 'trigger_sync';
+  | 'trigger_sync'
+  | 'start_keepalive_login'
+  | 'reporting_schedule_config'
+  | 'session_create'
+  | 'session_message'
+  | 'session_cancel'
+  | 'session_list';

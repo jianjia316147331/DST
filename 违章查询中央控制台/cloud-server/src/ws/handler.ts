@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { WebSocket } from 'ws';
 import pool from '../db/index.js';
-import { upsertCompaniesList, upsertVehicle, upsertViolations } from '../db/sync.js';
+import { upsertCompaniesList, upsertVehicle, upsertViolations, validateCompanies } from '../db/sync.js';
 
 // Connected tray nodes: Map<node_id, WebSocket>
 const nodes = new Map<string, WebSocket>();
@@ -12,6 +12,17 @@ const frontendClients = new Set<WebSocket>();
 
 export function getNodeWs(nodeId: string): WebSocket | undefined {
   return nodes.get(nodeId);
+}
+
+export function broadcastToFrontend(payload: string) {
+  for (const client of frontendClients) {
+    if (client.readyState === WebSocket.OPEN) client.send(payload);
+  }
+  for (const [, subs] of taskSubscribers) {
+    for (const client of subs) {
+      if (client.readyState === WebSocket.OPEN) client.send(payload);
+    }
+  }
 }
 
 export function subscribeTask(taskId: number, ws: WebSocket) {
@@ -46,15 +57,53 @@ async function handleMessage(ws: WebSocket, raw: string) {
           [msg.hostname || '', msg.max_concurrency || 15, msg.memory_total_gb || 0, msg.cpu_cores || 0, nodeName]
         );
       }
+
+      // Send register acknowledgment (建联确认)
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'register_ack',
+          node_id: nodeName,
+          message: 'registered',
+          timestamp: new Date().toISOString(),
+        }));
+
+        // Push reporting schedule config for this node (避免离线遗漏)
+        const [scheduleRows] = await pool.query(
+          'SELECT id, enabled, frequency, times FROM reporting_schedules WHERE enabled = 1'
+        ) as any;
+        if (scheduleRows.length > 0) {
+          ws.send(JSON.stringify({
+            type: 'reporting_schedule_config',
+            schedules: scheduleRows.map((s: any) => ({
+              id: s.id,
+              enabled: !!s.enabled,
+              frequency: s.frequency || 'custom',
+              times: typeof s.times === 'string' ? JSON.parse(s.times) : s.times,
+            })),
+          }));
+        }
+      }
       break;
     }
 
     case 'heartbeat': {
       const nodeName = msg.node_id as string;
       await pool.query(
-        `UPDATE nodes SET status='online', active_sessions=?, last_heartbeat=NOW()
+        `UPDATE nodes SET status='online', active_sessions=?,
+         cpu_percent=?, cpu_count=?, memory_total_gb=?, memory_used_gb=?, memory_percent=?,
+         disk_total_gb=?, disk_used_gb=?, disk_percent=?,
+         net_bytes_sent_mb=?, net_bytes_recv_mb=?, uptime_seconds=?, process_count=?,
+         processes=?,
+         last_heartbeat=NOW()
          WHERE node_name=?`,
-        [msg.active_sessions || 0, nodeName]
+        [msg.active_sessions || 0,
+         msg.cpu_percent || 0, msg.cpu_count || 0,
+         msg.memory_total_gb || 0, msg.memory_used_gb || 0, msg.memory_percent || 0,
+         msg.disk_total_gb || 0, msg.disk_used_gb || 0, msg.disk_percent || 0,
+         msg.net_bytes_sent_mb || 0, msg.net_bytes_recv_mb || 0,
+         msg.uptime_seconds || 0, msg.process_count || 0,
+         msg.processes ? JSON.stringify(msg.processes) : null,
+         nodeName]
       );
       break;
     }
@@ -133,19 +182,51 @@ async function handleMessage(ws: WebSocket, raw: string) {
       try {
         let stats = { companies: 0, vehicles: 0, violations_ins: 0, violations_upd: 0 };
 
+        // ── Validate companies before processing ──
+        const allCompanyNames = new Set<string>();
+        if (Array.isArray(companies)) companies.forEach((c: any) => allCompanyNames.add(c.name));
+        if (Array.isArray(vehicles)) vehicles.forEach((v: any) => allCompanyNames.add(v.company_name));
+        if (Array.isArray(violations)) violations.forEach((v: any) => allCompanyNames.add(v.company_name));
+
+        const knownCompanies = await validateCompanies([...allCompanyNames]);
+        const unknownCompanies = [...allCompanyNames].filter(n => !knownCompanies.has(n));
+
+        if (unknownCompanies.length > 0) {
+          console.warn(`[Sync] 数据上报企业未匹配: ${unknownCompanies.join(', ')} (跳过 ${unknownCompanies.length} 个企业)`);
+          await pool.query(
+            `INSERT INTO logs (level, category, message)
+             VALUES ('WARN', 'system', ?)`,
+            [`数据上报企业未匹配: ${unknownCompanies.join(', ')} (跳过 ${unknownCompanies.length} 个企业)`]
+          );
+        }
+
+        // If ALL companies are unknown, reject sync
+        if (allCompanyNames.size > 0 && knownCompanies.size === 0) {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'sync_ack', task_id, ok: false,
+              error: `所有上报企业未匹配: ${unknownCompanies.join(', ')}`,
+            }));
+          }
+          break;
+        }
+
         if (Array.isArray(companies) && companies.length > 0) {
-          stats.companies = await upsertCompaniesList(companies);
+          const known = companies.filter((c: any) => knownCompanies.has(c.name));
+          stats.companies = await upsertCompaniesList(known);
         }
 
         if (Array.isArray(vehicles) && vehicles.length > 0) {
           for (const v of vehicles) {
+            if (!knownCompanies.has(v.company_name)) continue;
             await upsertVehicle(node_id || null, v);
             stats.vehicles++;
           }
         }
 
         if (Array.isArray(violations) && violations.length > 0) {
-          const result = await upsertViolations(node_id || null, task_id || null, violations);
+          const knownViolations = violations.filter((v: any) => knownCompanies.has(v.company_name));
+          const result = await upsertViolations(node_id || null, task_id || null, knownViolations);
           stats.violations_ins = result.inserted;
           stats.violations_upd = result.updated;
         }
@@ -197,7 +278,16 @@ async function handleMessage(ws: WebSocket, raw: string) {
     case 'keepalive_status': {
       const { companies: keepaliveCompanies } = msg as { companies?: Array<{ name: string; is_logged_in: boolean; keepalive_alive: boolean }> };
       if (Array.isArray(keepaliveCompanies)) {
+        // Validate companies
+        const names = keepaliveCompanies.map((c: any) => c.name);
+        const known = await validateCompanies(names);
+        const unknownNames = names.filter((n: string) => !known.has(n));
+        if (unknownNames.length > 0) {
+          console.warn(`[Keepalive] 未知企业: ${unknownNames.join(', ')}`);
+        }
+
         for (const c of keepaliveCompanies) {
+          if (!known.has(c.name)) continue; // Skip unknown
           const newStatus = (c.is_logged_in && c.keepalive_alive) ? 'online' : 'offline';
           await pool.query(
             `UPDATE companies SET account_status = ? WHERE name = ?`,
@@ -253,6 +343,40 @@ async function handleMessage(ws: WebSocket, raw: string) {
          VALUES ('INFO', 'system', ?)`,
         [`${company_name} 扫码登录成功`]
       );
+      break;
+    }
+
+    // ── Session bridge relay (node → frontend) ──
+    case 'session_created':
+    case 'session_chunk':
+    case 'session_marker':
+    case 'session_done':
+    case 'session_error':
+    case 'session_list_result': {
+      const relayPayload = JSON.stringify(msg);
+      for (const client of frontendClients) {
+        if (client.readyState === WebSocket.OPEN) client.send(relayPayload);
+      }
+      for (const [, subs] of taskSubscribers) {
+        for (const client of subs) {
+          if (client.readyState === WebSocket.OPEN) client.send(relayPayload);
+        }
+      }
+      break;
+    }
+
+    // ── Keepalive login relay (node → frontend) ──
+    case 'keepalive_login_progress':
+    case 'keepalive_login_result': {
+      const relayPayload = JSON.stringify(msg);
+      for (const client of frontendClients) {
+        if (client.readyState === WebSocket.OPEN) client.send(relayPayload);
+      }
+      for (const [, subs] of taskSubscribers) {
+        for (const client of subs) {
+          if (client.readyState === WebSocket.OPEN) client.send(relayPayload);
+        }
+      }
       break;
     }
 

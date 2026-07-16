@@ -10,7 +10,7 @@ export default async function nodeRoutes(app: FastifyInstance) {
 
   // Create node (pre-register before deployment)
   app.post('/api/nodes', { preHandler: [app.authenticate] }, async (request, reply) => {
-    const { node_name, max_concurrency = 15 } = request.body as { node_name: string; max_concurrency?: number };
+    const { node_name, display_name, max_concurrency = 15 } = request.body as { node_name: string; display_name?: string; max_concurrency?: number };
 
     if (!node_name || !node_name.trim()) {
       return reply.status(400).send({ error: 'node_name is required' });
@@ -25,8 +25,8 @@ export default async function nodeRoutes(app: FastifyInstance) {
     }
 
     const [result] = await pool.query(
-      `INSERT INTO nodes (node_name, status, max_concurrency) VALUES (?, 'offline', ?)`,
-      [node_name.trim(), max_concurrency]
+      `INSERT INTO nodes (node_name, display_name, status, max_concurrency) VALUES (?, ?, 'offline', ?)`,
+      [node_name.trim(), display_name || '', max_concurrency]
     ) as any;
 
     const [rows] = await pool.query('SELECT * FROM nodes WHERE id = ?', [result.insertId]) as any;
@@ -49,16 +49,17 @@ export default async function nodeRoutes(app: FastifyInstance) {
     return rows[0];
   });
 
-  // Update node config (max_concurrency)
+  // Update node config (max_concurrency, node_name, display_name)
   app.patch('/api/nodes/:id', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string };
-    const { max_concurrency, node_name } = request.body as { max_concurrency?: number; node_name?: string };
+    const { max_concurrency, node_name, display_name } = request.body as { max_concurrency?: number; node_name?: string; display_name?: string };
 
     const sets: string[] = [];
     const params: unknown[] = [];
 
     if (max_concurrency !== undefined) { sets.push('max_concurrency = ?'); params.push(max_concurrency); }
-    if (node_name) { sets.push('node_name = ?'); params.push(node_name); }
+    if (node_name !== undefined) { sets.push('node_name = ?'); params.push(node_name); }
+    if (display_name !== undefined) { sets.push('display_name = ?'); params.push(display_name); }
 
     if (sets.length === 0) return reply.status(400).send({ error: 'No valid fields' });
 
@@ -72,6 +73,22 @@ export default async function nodeRoutes(app: FastifyInstance) {
 
     // Fetch updated row
     const [rows] = await pool.query('SELECT * FROM nodes WHERE id = ?', [id]) as any;
+    return rows[0];
+  });
+
+  // Get node runtime status
+  app.get('/api/nodes/:id/runtime', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const [rows] = await pool.query(
+      `SELECT node_name, hostname, status, active_sessions,
+         cpu_percent, cpu_count, memory_total_gb, memory_used_gb, memory_percent,
+         disk_total_gb, disk_used_gb, disk_percent,
+         net_bytes_sent_mb, net_bytes_recv_mb, uptime_seconds, process_count,
+         processes,
+         last_heartbeat, last_sync_at
+       FROM nodes WHERE id = ?`, [id]
+    ) as any;
+    if (rows.length === 0) return reply.status(404).send({ error: 'Node not found' });
     return rows[0];
   });
 

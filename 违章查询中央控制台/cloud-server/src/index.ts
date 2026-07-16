@@ -15,6 +15,7 @@ import downloadRoutes from './routes/download.js';
 import syncRoutes from './routes/sync.js';
 import vehicleRoutes from './routes/vehicles.js';
 import violationsRoutes from './routes/violations.js';
+import reportingScheduleRoutes from './routes/reporting-schedules.js';
 import wsHandler from './ws/handler.js';
 import { authGuard } from './middleware/auth.js';
 
@@ -41,6 +42,7 @@ await app.register(downloadRoutes);
 await app.register(syncRoutes);
 await app.register(vehicleRoutes);
 await app.register(violationsRoutes);
+await app.register(reportingScheduleRoutes);
 
 // WebSocket
 await app.register(wsHandler);

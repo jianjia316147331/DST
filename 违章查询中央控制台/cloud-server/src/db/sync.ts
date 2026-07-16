@@ -81,3 +81,23 @@ export async function upsertViolations(violations: any[]): Promise<{ inserted: n
   }
   return { inserted, updated };
 }
+
+export function validateCompanies(companies: any[]): { valid: any[]; errors: string[] } {
+  const valid: any[] = [];
+  const errors: string[] = [];
+  if (!Array.isArray(companies)) return { valid, errors: ['Invalid payload'] };
+
+  for (let i = 0; i < companies.length; i++) {
+    const c = companies[i];
+    if (!c) {
+      errors.push(`Company ${i}: null entry`);
+      continue;
+    }
+    if (!c.name || !c.province || !c.province_url) {
+      errors.push(`Company ${i}: missing required fields (name, province, province_url)`);
+    } else {
+      valid.push(c);
+    }
+  }
+  return { valid, errors };
+}

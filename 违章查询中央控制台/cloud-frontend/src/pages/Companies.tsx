@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
-import { Table, Button, Modal, Form, Input, Select, Space, Tag, message, Popconfirm, Image } from 'antd';
-import { PlusOutlined, EditOutlined, DeleteOutlined, PlayCircleOutlined, QrcodeOutlined } from '@ant-design/icons';
+import { useEffect, useState, useRef } from 'react';
+import { Table, Button, Modal, Form, Input, Select, Space, Tag, message, Popconfirm, Image, Steps } from 'antd';
+import { PlusOutlined, EditOutlined, DeleteOutlined, PlayCircleOutlined, QrcodeOutlined, SendOutlined } from '@ant-design/icons';
 import api from '../api';
 
 interface Company {
@@ -8,32 +8,17 @@ interface Company {
   name: string;
   short_name: string | null;
   province: string;
-  province_url: string;
   feishu_contact_id: string | null;
-  contact_name: string | null;
-  contact_phone: string | null;
+  contact_name: string;
+  contact_phone: string;
   account_status: string;
   last_query_at: string | null;
 }
 
 const PROVINCES = [
-  { label: '四川', value: '四川', url: 'sc.122.gov.cn' },
-  { label: '福建', value: '福建', url: 'fj.122.gov.cn' },
-  { label: '广东', value: '广东', url: 'gd.122.gov.cn' },
-  { label: '浙江', value: '浙江', url: 'zj.122.gov.cn' },
-  { label: '江苏', value: '江苏', url: 'js.122.gov.cn' },
-  { label: '上海', value: '上海', url: 'sh.122.gov.cn' },
-  { label: '北京', value: '北京', url: 'bj.122.gov.cn' },
-  { label: '湖北', value: '湖北', url: 'hb.122.gov.cn' },
-  { label: '湖南', value: '湖南', url: 'hn.122.gov.cn' },
-  { label: '山东', value: '山东', url: 'sd.122.gov.cn' },
-  { label: '河南', value: '河南', url: 'he.122.gov.cn' },
-  { label: '河北', value: '河北', url: 'hb.122.gov.cn' },
-  { label: '安徽', value: '安徽', url: 'ah.122.gov.cn' },
-  { label: '江西', value: '江西', url: 'jx.122.gov.cn' },
-  { label: '陕西', value: '陕西', url: 'sn.122.gov.cn' },
-  { label: '重庆', value: '重庆', url: 'cq.122.gov.cn' },
-];
+  '四川', '福建', '广东', '浙江', '江苏', '上海', '北京',
+  '湖北', '湖南', '山东', '河南', '河北', '安徽', '江西', '陕西', '重庆',
+].map(v => ({ label: v, value: v }));
 
 export default function Companies() {
   const [data, setData] = useState<Company[]>([]);
@@ -53,11 +38,29 @@ export default function Companies() {
   const [loginConfirmOpen, setLoginConfirmOpen] = useState(false);
   const [loginCompany, setLoginCompany] = useState<Company | null>(null);
   const [loginLoading, setLoginLoading] = useState(false);
+  const [loginPath, setLoginPath] = useState<string>(''); // 'keepalive' | 'session'
+  const [sessionId, setSessionId] = useState('');
+  const [chatMessages, setChatMessages] = useState<{ text: string; isUser?: boolean }[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [keepaliveSteps, setKeepaliveSteps] = useState<{ step: string; status: string }[]>([]);
 
   const fetch = (p = page, pf = provinceFilter, sf = statusFilter) => {
     setLoading(true);
     api.get('/api/companies', { params: { page: p, pageSize: 20, province: pf, account_status: sf } })
-      .then(({ data: d }) => { setData(d.data); setTotal(d.total); })
+      .then(({ data: d }) => {
+        setData(d.data);
+        setTotal(d.total);
+        // Load existing bindings for all companies
+        Promise.all(d.data.map((c: Company) =>
+          api.get(`/api/companies/${c.id}/bind`).then(({ data: b }) => b && { companyId: c.id, ...b }).catch(() => null)
+        )).then((results) => {
+          const map: Record<number, { node_id: number; node_name: string }> = {};
+          results.filter(Boolean).forEach((b: any) => {
+            if (b) map[b.companyId] = { node_id: b.node_id, node_name: b.node_name };
+          });
+          setBindings(map);
+        });
+      })
       .finally(() => setLoading(false));
   };
 
@@ -79,26 +82,100 @@ export default function Companies() {
           setQrCompanyName(msg.company_name);
           setQrImage(`data:image/png;base64,${msg.image_base64}`);
           setQrModalOpen(true);
+          setLoginPath('keepalive');
         } else if (msg.type === 'login_ok') {
           message.success(`${msg.company_name} 登录成功`);
           setQrModalOpen(false);
           setQrImage('');
+          setLoginPath('');
+          setChatMessages([]);
+          setKeepaliveSteps([]);
           fetch();
         } else if (msg.type === 'login_failed') {
           message.error(`${msg.company_name} 登录失败: ${msg.reason}`);
         } else if (msg.type === 'keepalive_status') {
-          // Refresh to show updated account_status
           fetch();
+        } else if (msg.type === 'keepalive_login_progress') {
+          setKeepaliveSteps(prev => {
+            const filtered = prev.filter(s => s.step !== msg.progress);
+            return [...filtered, { step: msg.progress, status: 'done' }];
+          });
+          // Auto-show keepalive progress dialog
+          setLoginPath('keepalive');
+          if (!qrModalOpen) {
+            setQrCompanyName(msg.company_name);
+            setQrModalOpen(true);
+          }
+        } else if (msg.type === 'keepalive_login_result') {
+          if (msg.ok) {
+            message.success(`${msg.company_name} 保活登录成功`);
+          } else {
+            message.warning(`${msg.company_name} 保活登录失败: ${msg.reason}，请尝试手动登录`);
+          }
+        } else if (msg.type === 'session_chunk') {
+          setChatMessages(prev => [...prev, { text: msg.text }]);
+          // Auto-show dialog if not already open
+          if (!qrModalOpen && loginCompany) {
+            setQrModalOpen(true);
+            setLoginPath('session');
+          }
+        } else if (msg.type === 'session_created') {
+          // A new session was created - auto-show the chat dialog
+          handleAutoShowLogin(msg.company_name || loginCompany?.name || '', 'session');
+        } else if (msg.type === 'session_marker') {
+          if (msg.marker === 'QR_READY' && msg.image_base64) {
+            setQrCompanyName(msg.payload || loginCompany?.name || '');
+            setQrImage(`data:image/png;base64,${msg.image_base64}`);
+            setQrModalOpen(true);
+            setLoginPath('session');
+          } else if (msg.marker === 'LOGIN_OK') {
+            message.success(`${loginCompany?.name || ''} 登录成功`);
+            fetch();
+          } else if (msg.marker === 'LOGIN_FAILED') {
+            message.error(`${loginCompany?.name || ''} 登录失败: ${msg.payload}`);
+          }
+        } else if (msg.type === 'session_done') {
+          setChatMessages(prev => [...prev, { text: `[会话结束: ${msg.reason}]` }]);
+        } else if (msg.type === 'session_error') {
+          setChatMessages(prev => [...prev, { text: `[错误: ${msg.error}]` }]);
         }
       } catch { /* ignore */ }
     };
     return () => socket.close();
   }, []);
 
-  // Step 1: Open login confirm modal
+  // Step 1: Check if there's already an active login session for this company
   const handleLogin = (record: Company) => {
+    // If QR/chat modal already open for this company, just show it
+    if (qrModalOpen && qrCompanyName === record.name) {
+      return; // already showing
+    }
+    // If we have an active session for this company (from WS events), open directly
+    if (loginPath && loginCompany?.name === record.name && qrModalOpen) {
+      return; // already in progress
+    }
     setLoginCompany(record);
     setLoginConfirmOpen(true);
+  };
+
+  // Auto-show login dialog when WS events indicate a session started for our company
+  const handleAutoShowLogin = (companyName: string, path: string) => {
+    if (loginCompany && loginCompany.name === companyName) {
+      // Already in the flow for this company
+      if (!qrModalOpen) {
+        setQrModalOpen(true);
+      }
+      return;
+    }
+    // Find the company and start showing progress
+    const c = data.find((x: Company) => x.name === companyName);
+    if (c) {
+      setLoginCompany(c);
+      setLoginPath(path);
+      setQrCompanyName(companyName);
+      setQrModalOpen(true);
+      setLoginConfirmOpen(false);
+    }
   };
 
   // Step 2: Actually trigger login
@@ -106,14 +183,30 @@ export default function Companies() {
     if (!loginCompany) return;
     setLoginLoading(true);
     try {
-      await api.post('/api/sync/trigger-login', { company_name: loginCompany.name, company_id: loginCompany.id });
+      const { data: result } = await api.post('/api/sync/trigger-login', { company_name: loginCompany.name, company_id: loginCompany.id });
       setLoginConfirmOpen(false);
-      message.success(`已向 ${loginCompany.name} 绑定的设备发送扫码登录指令，等待二维码...`);
+      setLoginPath(result.path || 'keepalive');
+      setSessionId(result.session_id || '');
+      setChatMessages([]);
+      setKeepaliveSteps([]);
+      if (result.path === 'session') {
+        setQrModalOpen(true); // Reuse QR modal as chat dialog
+      }
+      message.success(`已向 ${loginCompany.name} 发送${result.path === 'session' ? '会话' : '保活'}登录指令`);
     } catch (err: any) {
       message.error(err?.response?.data?.error || '触发登录失败');
     } finally {
       setLoginLoading(false);
     }
+  };
+
+  // Send chat message via WS (TODO: implement WS send from frontend)
+  const sendChatMessage = () => {
+    if (!chatInput.trim()) return;
+    setChatMessages(prev => [...prev, { text: chatInput, isUser: true }]);
+    // The session_message is sent via cloud-server, not directly from frontend WS
+    // For now, messages are just displayed locally
+    setChatInput('');
   };
 
   const openCreate = () => {
@@ -177,28 +270,47 @@ export default function Companies() {
     { title: '简称', dataIndex: 'short_name', width: 120 },
     { title: '省份', dataIndex: 'province', width: 80 },
     {
-      title: '状态', dataIndex: 'account_status', width: 80,
-      render: (s: string) => <Tag color={s === 'online' ? 'green' : 'default'}>{s === 'online' ? '在线' : '离线'}</Tag>,
+      title: '账号状态', dataIndex: 'account_status', width: 90,
+      render: (s: string) => <Tag color={s === 'online' ? 'green' : 'default'}>{s === 'online' ? '已登录' : '未登录'}</Tag>,
     },
     {
-      title: '绑定设备', width: 180,
+      title: '设备状态', width: 90,
+      render: (_: unknown, record: Company) => {
+        const binding = bindings[record.id];
+        if (!binding) return <Tag color="default">未绑定</Tag>;
+        const node = nodes.find(n => n.id === binding.node_id);
+        const online = node?.status === 'online';
+        return <Tag color={online ? 'green' : 'red'}>{online ? '在线' : '离线'}</Tag>;
+      },
+    },
+    {
+      title: '绑定设备', width: 200,
       render: (_: unknown, record: Company) => {
         const binding = bindings[record.id];
         return (
           <Select
             size="small"
             placeholder="选择设备"
+            allowClear
             style={{ width: 160 }}
             value={binding?.node_id}
             onChange={async (nodeId) => {
               try {
-                await api.put(`/api/companies/${record.id}/bind`, { node_id: nodeId });
-                setBindings(prev => ({ ...prev, [record.id]: { node_id: nodeId, node_name: nodes.find(n => n.id === nodeId)?.node_name || '' } }));
-                message.success('绑定成功');
-              } catch { message.error('绑定失败'); }
+                if (nodeId) {
+                  await api.put(`/api/companies/${record.id}/bind`, { node_id: nodeId });
+                  setBindings(prev => ({ ...prev, [record.id]: { node_id: nodeId, node_name: nodes.find(n => n.id === nodeId)?.node_name || '' } }));
+                  message.success('绑定成功');
+                } else {
+                  await api.delete(`/api/companies/${record.id}/bind`);
+                  setBindings(prev => { const next = { ...prev }; delete next[record.id]; return next; });
+                  message.success('已解绑');
+                }
+              } catch { message.error('操作失败'); }
             }}
             options={nodes.map(n => ({
-              label: `${n.node_name}${n.status === 'online' ? ' ●在线' : ' ○离线'}`,
+              label: n.display_name
+                ? `${n.display_name} (${n.node_name})${n.status === 'online' ? ' ●在线' : ' ○离线'}`
+                : `${n.node_name}${n.status === 'online' ? ' ●在线' : ' ○离线'}`,
               value: n.id,
             }))}
           />
@@ -266,21 +378,68 @@ export default function Companies() {
         </div>
       </Modal>
 
-      {/* Step 2: QR code display modal */}
+      {/* Step 2: Login dialog — QR (keepalive) or Chat (session) */}
       <Modal
-        title={`${qrCompanyName} - 扫码登录`}
+        title={loginPath === 'session' ? `${qrCompanyName || loginCompany?.name} - 手动登录` : `${qrCompanyName} - 扫码登录`}
         open={qrModalOpen}
-        onCancel={() => { setQrModalOpen(false); setQrImage(''); }}
+        onCancel={() => { setQrModalOpen(false); setQrImage(''); setLoginPath(''); setChatMessages([]); setKeepaliveSteps([]); }}
         footer={null}
-        width={400}
+        width={loginPath === 'session' ? 500 : 400}
       >
-        {qrImage ? (
-          <div style={{ textAlign: 'center' }}>
-            <Image src={qrImage} alt="二维码" style={{ maxWidth: 300 }} preview={false} />
-            <p style={{ marginTop: 12, color: '#666' }}>请用 12123 App 扫描二维码登录</p>
+        {loginPath === 'session' ? (
+          // ── Session chat dialog ──
+          <div>
+            <div style={{ height: 300, overflowY: 'auto', border: '1px solid #f0f0f0', borderRadius: 8, padding: 12, marginBottom: 12, background: '#fafafa' }}>
+              {chatMessages.map((m, i) => (
+                <div key={i} style={{
+                  marginBottom: 8,
+                  textAlign: m.isUser ? 'right' : 'left',
+                }}>
+                  <div style={{
+                    display: 'inline-block',
+                    padding: '6px 12px',
+                    borderRadius: 8,
+                    background: m.isUser ? '#1677ff' : '#fff',
+                    color: m.isUser ? '#fff' : '#333',
+                    maxWidth: '85%',
+                    wordBreak: 'break-word',
+                    border: m.isUser ? 'none' : '1px solid #e8e8e8',
+                  }}>
+                    {m.text}
+                  </div>
+                </div>
+              ))}
+              {chatMessages.length === 0 && (
+                <div style={{ textAlign: 'center', color: '#999', paddingTop: 40 }}>等待 Claude 响应...</div>
+              )}
+            </div>
+            <Space.Compact style={{ width: '100%' }}>
+              <Input
+                placeholder="输入消息..."
+                value={chatInput}
+                onChange={e => setChatInput(e.target.value)}
+                onPressEnter={sendChatMessage}
+              />
+              <Button type="primary" icon={<SendOutlined />} onClick={sendChatMessage}>发送</Button>
+            </Space.Compact>
           </div>
         ) : (
-          <div style={{ textAlign: 'center', padding: 40, color: '#999' }}>等待二维码生成...</div>
+          // ── Keepalive QR display ──
+          <div>
+            {keepaliveSteps.length > 0 && (
+              <Steps direction="vertical" size="small" current={keepaliveSteps.length - 1}
+                items={keepaliveSteps.map(s => ({ title: s.step, status: s.status === 'done' ? 'finish' : 'process' } as any))}
+                style={{ marginBottom: 16 }} />
+            )}
+            {qrImage ? (
+              <div style={{ textAlign: 'center' }}>
+                <Image src={qrImage} alt="二维码" style={{ maxWidth: 300 }} preview={false} />
+                <p style={{ marginTop: 12, color: '#666' }}>请用 12123 App 扫描二维码登录</p>
+              </div>
+            ) : (
+              <div style={{ textAlign: 'center', padding: 40, color: '#999' }}>等待二维码生成...</div>
+            )}
+          </div>
         )}
       </Modal>
 
@@ -293,14 +452,14 @@ export default function Companies() {
             <Input />
           </Form.Item>
           <Form.Item name="province" label="省份" rules={[{ required: true }]}>
-            <Select options={PROVINCES.map((p) => ({ label: p.label, value: p.value }))}
-              onChange={(v) => { const p = PROVINCES.find((x) => x.value === v); form.setFieldValue('province_url', p?.url); }} />
+            <Select options={PROVINCES} />
           </Form.Item>
-          <Form.Item name="province_url" label="12123 URL" rules={[{ required: true }]}>
+          <Form.Item name="contact_name" label="联系人" rules={[{ required: true, message: '请输入联系人' }]}>
             <Input />
           </Form.Item>
-          <Form.Item name="contact_name" label="联系人"><Input /></Form.Item>
-          <Form.Item name="contact_phone" label="联系电话"><Input /></Form.Item>
+          <Form.Item name="contact_phone" label="联系电话" rules={[{ required: true, message: '请输入联系电话' }]}>
+            <Input />
+          </Form.Item>
           <Form.Item name="feishu_contact_id" label="飞书联系人ID"><Input /></Form.Item>
         </Form>
       </Modal>
