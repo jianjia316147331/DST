@@ -691,39 +691,46 @@ def _clean_stale_files(query_dir):
             except OSError:
                 pass
 
-        # Clean non-today health files
+        # Clean non-today health files (check file content, not filename)
         for f in glob.glob(os.path.join(data_dir, "keepalive_health_*.json")):
             try:
-                basename = os.path.basename(f)
-                if today not in basename:
-                    os.remove(f)
-                    counts["health_files"] += 1
-            except OSError:
+                with open(f, "r", encoding="utf-8") as fh:
+                    health = json.load(fh)
+                last_check = health.get("last_check", "")
+                if last_check:
+                    # last_check format: "2026-07-16 10:11:04" or ISO format
+                    try:
+                        last_dt = datetime.fromisoformat(last_check)
+                    except (ValueError, TypeError):
+                        try:
+                            last_dt = datetime.strptime(last_check, "%Y-%m-%d %H:%M:%S")
+                        except (ValueError, TypeError):
+                            continue
+                    if last_dt.timestamp() < cutoff_7d:
+                        os.remove(f)
+                        counts["health_files"] += 1
+            except (OSError, json.JSONDecodeError):
                 pass
 
         # Clean 7d+ entries from tab_registry.json
+        # tab_registry.json is a flat dict: {label: {tab_id, pid, created_at, ...}}
         reg_path = os.path.join(data_dir, "tab_registry.json")
         if os.path.exists(reg_path):
             try:
                 with open(reg_path, "r", encoding="utf-8") as f:
                     registry = json.load(f)
-                entries = registry.get("entries", [])
-                fresh = []
                 removed = 0
-                for entry in entries:
-                    created = entry.get("created_at", "")
+                for label, info in list(registry.items()):
+                    created = info.get("created_at", "")
                     if created:
                         try:
                             ts = datetime.strptime(created[:19], "%Y-%m-%dT%H:%M:%S").timestamp()
                             if ts < cutoff_7d:
+                                del registry[label]
                                 removed += 1
-                                continue
                         except (ValueError, OSError):
                             pass
-                    fresh.append(entry)
                 if removed > 0:
-                    registry["entries"] = fresh
-                    registry["cleaned_at"] = datetime.now().isoformat()
                     with open(reg_path, "w", encoding="utf-8") as f:
                         json.dump(registry, f, ensure_ascii=False, indent=2)
                 counts["tab_entries"] = removed

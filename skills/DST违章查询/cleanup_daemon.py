@@ -46,6 +46,30 @@ def _ts():
     return _now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def _parse_datetime(s):
+    """Parse a datetime string robustly, handling multiple formats.
+
+    Formats supported:
+      - ISO with microseconds:  "2026-07-16T09:21:22.824543"
+      - ISO without microseconds: "2026-07-16T09:21:22"
+      - Space-separated:         "2026-07-16 09:21:22"
+
+    Returns datetime or None on failure.
+    """
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        # fromisoformat handles both with and without microseconds
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        pass
+    try:
+        # Fallback: space-separated format (used by keepalive health files)
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+
+
 def _file_age_hours(path):
     """Return file age in hours, or None if file doesn't exist."""
     try:
@@ -196,21 +220,24 @@ def _phase1_zombie_tabs(data_dir, profiles_db, dry_run, log):
         last_activity = info.get("last_activity")
         created_at = info.get("created_at")
 
+        # ── Skip keepalive entries — they are handled by the keepalive section below.
+        # Keepalive daemon never updates last_activity (only query flows do),
+        # so using created_at fallback would kill tabs older than IDLE_HOURS.
+        if label.startswith("keepalive_"):
+            log(f"  [Phase 1] query tab '{label}' is keepalive — skipping (handled by keepalive section)")
+            continue
+
         # Determine if active
         is_active = False
         if last_activity:
-            try:
-                last_dt = datetime.strptime(last_activity, "%Y-%m-%dT%H:%M:%S")
+            last_dt = _parse_datetime(last_activity)
+            if last_dt:
                 is_active = (_now() - last_dt).total_seconds() < IDLE_HOURS * 3600
-            except ValueError:
-                pass
         elif created_at:
-            try:
-                # Fallback: use created_at if no last_activity
-                last_dt = datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%S")
+            # Fallback: use created_at if no last_activity
+            last_dt = _parse_datetime(created_at)
+            if last_dt:
                 is_active = (_now() - last_dt).total_seconds() < IDLE_HOURS * 3600
-            except ValueError:
-                pass
 
         if is_active:
             result["query_kept"] += 1
@@ -290,12 +317,10 @@ def _phase1_zombie_tabs(data_dir, profiles_db, dry_run, log):
         # ── Then check keepalive health ──
         keepalive_active = False
         if last_check:
-            try:
-                # last_check format: "2026-07-14 15:30:00"
-                last_dt = datetime.strptime(last_check, "%Y-%m-%d %H:%M:%S")
+            # last_check format: "2026-07-14 15:30:00" (space-separated)
+            last_dt = _parse_datetime(last_check)
+            if last_dt:
                 keepalive_active = (_now() - last_dt).total_seconds() < IDLE_HOURS * 3600
-            except ValueError:
-                pass
 
         # Also check PID
         pid_path = os.path.join(data_dir, f"keepalive_{safe}.pid")
@@ -346,12 +371,9 @@ def _get_active_companies(data_dir, profiles_db):
     for info in registry.values():
         last_activity = info.get("last_activity")
         if last_activity:
-            try:
-                last_dt = datetime.strptime(last_activity, "%Y-%m-%dT%H:%M:%S")
-                if (_now() - last_dt).total_seconds() < IDLE_HOURS * 3600:
-                    active.add(info.get("company", ""))
-            except ValueError:
-                pass
+            last_dt = _parse_datetime(last_activity)
+            if last_dt and (_now() - last_dt).total_seconds() < IDLE_HOURS * 3600:
+                active.add(info.get("company", ""))
 
     # Check keepalive tabs
     profiles = _read_profiles(profiles_db)
@@ -365,12 +387,9 @@ def _get_active_companies(data_dir, profiles_db):
         last_check = health.get("last_check")
         profile = profiles.get(company)
         if last_check and profile and profile["is_logged_in"]:
-            try:
-                last_dt = datetime.strptime(last_check, "%Y-%m-%d %H:%M:%S")
-                if (_now() - last_dt).total_seconds() < IDLE_HOURS * 3600:
-                    active.add(company)
-            except ValueError:
-                pass
+            last_dt = _parse_datetime(last_check)
+            if last_dt and (_now() - last_dt).total_seconds() < IDLE_HOURS * 3600:
+                active.add(company)
 
     return active
 

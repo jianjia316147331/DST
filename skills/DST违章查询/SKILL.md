@@ -84,6 +84,7 @@ sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure'
 
 ## 核心铁律
 
+0. **🔴 铁律：Node Agent 必须先于一切操作启动并确保控制台联通（最高优先级）：** Node Agent（`node_agent.py`）是连接中央控制台的 WebSocket 守护进程，负责接收远程任务指令、实时上报进度、任务完成自动同步 SQLite → 中央 MySQL。**每次 skill 调用时，在配置权限之前必须先检查并确保 Node Agent 已配置、已运行、且与中央控制台联通。此步骤优先级高于飞书通知人查询（铁律 #11）**——不依赖任何外部 ID 查询即可完成。未配置则先完成交互式配置（`--setup`），未运行则先部署并启动 systemd 服务，控制台不可达则必须等待用户修复后重新验证。**四项条件（配置 + 服务运行 + 设备已绑定 + 控制台可达）全部满足才可继续，任一不满足则禁止执行登录或查询操作。**
 1. **只查未处理违章：** 只对"未处理"或"未缴费"状态的违章记录点击"查看详情"获取罚款金额和记分。"已处理且已缴费"的记录直接跳过。查询前先对比 SQLite 数据库：已存在且状态未变的跳过；状态变更的（从未处理→已处理）更新记录。
 2. **随机延迟反爬：** 
    - 搜索确认：固定 1s + 轮询（最长 3s）+ 1 次重试（失败跳过该车）
@@ -99,17 +100,17 @@ sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure'
 7. **禁止随意退出登录：** 检测到已登录状态（单位用户）时严禁退出。只需确认省份和公司匹配当前任务即可继续。只有实际查询遇到非单位用户报错时才重新登录。
 8. **保活生命周期：** 登录成功 → 进入我的主页确认正常 → **🔴 调用 `ensure-keepalive` 自动启动保活**（脚本内置，不再依赖模型记忆；自动防重复）。保活程序导航到我的主页（车辆列表页）而非省份首页，确保有异常（风控/掉线）能及时发现。查询正常完成后保活继续运行不停止，除非用户明确要求或会话自然过期。**退出登录后不再自动重启**（systemd `RestartPreventExitStatus=42 43 44`）。
 9. **弹窗防御 + 页面漂移自愈：** 每次 `get-page-vehicles`、`open-vehicle`、`collect-violations` 操作前自动检测并关闭"本人已知晓"等系统弹窗。`get-page-vehicles` 内置页面漂移自愈：找不到车辆表格时检查当前 URL，若非 vehlist 页面（如卡在 vehdetail 详情页），自动点击"我的主页"回到车辆列表并重新提取，确保批量查询中途被中断后不会误判完成。
-10. **🔴 铁律：先查人再开登录页（防二维码失效）：** 用户指定通知对象（姓名/手机号/群名）时，**必须先完成飞书 ID 查询（查人/查群），确认 ID 获取成功后再打开 12123 登录页截图二维码**。二维码有效期约 5 分钟，先查人可避免扫码等待期间二维码过期。
-11. **🔴 铁律：批量查询使用固化脚本，禁止自行写脚本：** 批量查询分两阶段：(1) `scripts/scan_vehicles.py` 全页扫描落库（内部只调 helper 已有子命令）；(2) `scripts/collect_violations.py` 搜索→单车查询循环。**禁止自行新写 Python 脚本**——包括禁止 Write 临时脚本、禁止在 Bash 中内联 Python 代码做批量循环。唯一允许的方式是直接调用 skill 目录下的固化脚本。脚本接受 `--company` `--batch-id` `--tab-id` `--instance-port` 参数。车辆列表页不翻页（搜索定位），违章详情页翻页由 `collect-violations` 内部自动处理。
-12. **🔴 铁律：违章详情必须逐个查询（不可跳过）：** 车辆列表上显示有未处理违章的车辆，**必须进入详情页 + 逐条点击"查看详情"获取真实罚款金额和记分**。禁止只读列表数据不查详情、禁止仅凭列表摘要生成报告。此条为最高优先级铁律，违反即为查询失败。
-13. **🔴 数据落库策略：查一条落库一条 → 逐条即时写入：** `collect-violations` 每提取完一条违章详情，调用方应立即通过 `db-insert-violation` 写入 SQLite。不使用中间 JSON/JS 文件暂存、不攒到最后批量落库。这样即使中途崩溃，已查询的违章数据不会丢失。helper `db-insert-violation` 支持按自然键 upsert（车牌+时间+地点+行为），重复写入不会产生脏数据。
-14. **🔴 公司名称以平台公司列表页为准（权威来源）：** Profile 注册和数据库写入时使用的公司名称，**必须以扫码登录后 12123 平台公司列表页实际显示的名称为准**。用户输入的公司名（如"深圳公司"）和 `profile-lookup` 模糊匹配返回的名称仅供定位 Profile 和平台 URL 使用，不得直接作为最终公司名落库。扫码登录后、选择公司前，必须从公司列表页提取实际公司名称，对比校验后再写入 `profile-register` 和 `db-insert-company`。若 profile 中已有旧名称但与平台实际名称不一致，以平台为准更新覆盖。
-15. **🔴 平台排序假设：** 12123 平台车辆列表按"未处理违章数"降序排列（有未处理违章的车辆排在最前，均为 0 的排在后）。批量查询始终扫描所有车辆列表页；单台车查询中 SQLite 增量对比自动跳过已入库记录，无需额外模式区分。
-16. **🔴 铁律：新公司必须先 `profile-create` 再 `init`：** 当 `profile-lookup` 返回 `found: false` 且诊断确认无匹配时，**必须调用 `session_manager.py profile-create` 创建新的 PinchTab Profile + 独立 Instance**，然后再用 `init --instance-port <新端口>` 创建标签页。**绝对禁止**直接 `init --instance-port` 指向已有实例（如成都的默认实例），这会导致 cookie 碰撞——不同公司的 12123 SSO 会话互相覆盖（gab.122.gov.cn 根据 cookie 自动跳转到有活跃 session 的省份）。
-17. **🔴 铁律：禁止 `pinchtab cookies clear` 清除全部 Cookie：** 清除所有 Cookie 会同时销毁同一实例上其他公司的登录态。cookie 隔离依赖 Profile 级别（独立 Chrome user-data-dir），**不得**通过清 cookie 来"修复"登录跳转问题。遇到省份跳转错误 = 实例/Profile 映射错误，应从实例隔离层面排查，而非 cookie 层面。
-18. **🔴 铁律：任务完成必须写标记 + 关闭标签页（防 Tab 累积）：** 每个查询任务结束后分两步：(a) **先调用 `mark-task-done` 写入完成标记文件**（`.task_done_<tab_id>.json`），包含公司名、查询类型、车辆/违章统计；(b) **再调用 `release-tab` 关闭当前会话的浏览器标签页**。完成标记是 GC 清理僵尸 tab 的关键信号——即使 `release-tab` 漏调，`cleanup-stale-tabs` 也能通过标记文件识别已完成任务并安全清理。此外，`cleanup-dst.timer` 每小时自动触发 `cleanup_daemon.py`，兜底清理所有遗漏文件（僵尸Tab、过期截图、残留PID、日志等），无需人工干预。保活守护进程的保活 tab **不受此规则影响**——它由 systemd 管理，独立于查询任务。
-19. **🔴 铁律：禁止手动 pinchtab close（绕过标记）:** 禁止直接调用 `pinchtab close` 关闭查询 tab——这会跳过注册表清理和完成标记写入。必须通过 `release-tab` 子命令完成清理。
-20. **🔴 铁律：禁止删除 SQLite 数据库（`violation_query/data/violations.db`）：** 数据库包含所有历史查询记录的持久化存档（公司、车辆、违章、Profile 映射），是唯一的权威数据源。**任何时候不得**通过 `rm`、`DROP TABLE`、`DELETE FROM`、覆盖写入等方式删除或清空数据库。`init-db` 仅首次部署时执行一次（`CREATE TABLE IF NOT EXISTS`），已有数据库直接跳过。批量查询中途崩溃/中断时只需改进度文件，**不得**清库重跑。如需数据修正，通过 `db-insert-*` 的 upsert 机制增量更新单条记录，禁止整体重建。
+11. **🔴 铁律：先查人再开登录页（防二维码失效）：** 用户指定通知对象（姓名/手机号/群名）时，**必须先完成飞书 ID 查询（查人/查群），确认 ID 获取成功后再打开 12123 登录页截图二维码**。二维码有效期约 5 分钟，先查人可避免扫码等待期间二维码过期。**注意：Node Agent 前置检查（铁律 #0）优先级更高，必须先于查人完成。**
+12. **🔴 铁律：批量查询使用固化脚本，禁止自行写脚本：** 批量查询分两阶段：(1) `scripts/scan_vehicles.py` 全页扫描落库（内部只调 helper 已有子命令）；(2) `scripts/collect_violations.py` 搜索→单车查询循环。**禁止自行新写 Python 脚本**——包括禁止 Write 临时脚本、禁止在 Bash 中内联 Python 代码做批量循环。唯一允许的方式是直接调用 skill 目录下的固化脚本。脚本接受 `--company` `--batch-id` `--tab-id` `--instance-port` 参数。车辆列表页不翻页（搜索定位），违章详情页翻页由 `collect-violations` 内部自动处理。
+13. **🔴 铁律：违章详情必须逐个查询（不可跳过）：** 车辆列表上显示有未处理违章的车辆，**必须进入详情页 + 逐条点击"查看详情"获取真实罚款金额和记分**。禁止只读列表数据不查详情、禁止仅凭列表摘要生成报告。此条为最高优先级铁律，违反即为查询失败。
+14. **🔴 数据落库策略：查一条落库一条 → 逐条即时写入：** `collect-violations` 每提取完一条违章详情，调用方应立即通过 `db-insert-violation` 写入 SQLite。不使用中间 JSON/JS 文件暂存、不攒到最后批量落库。这样即使中途崩溃，已查询的违章数据不会丢失。helper `db-insert-violation` 支持按自然键 upsert（车牌+时间+地点+行为），重复写入不会产生脏数据。
+15. **🔴 公司名称以平台公司列表页为准（权威来源）：** Profile 注册和数据库写入时使用的公司名称，**必须以扫码登录后 12123 平台公司列表页实际显示的名称为准**。用户输入的公司名（如"深圳公司"）和 `profile-lookup` 模糊匹配返回的名称仅供定位 Profile 和平台 URL 使用，不得直接作为最终公司名落库。扫码登录后、选择公司前，必须从公司列表页提取实际公司名称，对比校验后再写入 `profile-register` 和 `db-insert-company`。若 profile 中已有旧名称但与平台实际名称不一致，以平台为准更新覆盖。
+16. **🔴 平台排序假设：** 12123 平台车辆列表按"未处理违章数"降序排列（有未处理违章的车辆排在最前，均为 0 的排在后）。批量查询始终扫描所有车辆列表页；单台车查询中 SQLite 增量对比自动跳过已入库记录，无需额外模式区分。
+17. **🔴 铁律：新公司必须先 `profile-create` 再 `init`：** 当 `profile-lookup` 返回 `found: false` 且诊断确认无匹配时，**必须调用 `session_manager.py profile-create` 创建新的 PinchTab Profile + 独立 Instance**，然后再用 `init --instance-port <新端口>` 创建标签页。**绝对禁止**直接 `init --instance-port` 指向已有实例（如成都的默认实例），这会导致 cookie 碰撞——不同公司的 12123 SSO 会话互相覆盖（gab.122.gov.cn 根据 cookie 自动跳转到有活跃 session 的省份）。
+18. **🔴 铁律：禁止 `pinchtab cookies clear` 清除全部 Cookie：** 清除所有 Cookie 会同时销毁同一实例上其他公司的登录态。cookie 隔离依赖 Profile 级别（独立 Chrome user-data-dir），**不得**通过清 cookie 来"修复"登录跳转问题。遇到省份跳转错误 = 实例/Profile 映射错误，应从实例隔离层面排查，而非 cookie 层面。
+19. **🔴 铁律：任务完成必须写标记 + 关闭标签页（防 Tab 累积）：** 每个查询任务结束后分两步：(a) **先调用 `mark-task-done` 写入完成标记文件**（`.task_done_<tab_id>.json`），包含公司名、查询类型、车辆/违章统计；(b) **再调用 `release-tab` 关闭当前会话的浏览器标签页**。完成标记是 GC 清理僵尸 tab 的关键信号——即使 `release-tab` 漏调，`cleanup-stale-tabs` 也能通过标记文件识别已完成任务并安全清理。此外，`cleanup-dst.timer` 每小时自动触发 `cleanup_daemon.py`，兜底清理所有遗漏文件（僵尸Tab、过期截图、残留PID、日志等），无需人工干预。保活守护进程的保活 tab **不受此规则影响**——它由 systemd 管理，独立于查询任务。
+20. **🔴 铁律：禁止手动 pinchtab close（绕过标记）:** 禁止直接调用 `pinchtab close` 关闭查询 tab——这会跳过注册表清理和完成标记写入。必须通过 `release-tab` 子命令完成清理。
+21. **🔴 铁律：禁止删除 SQLite 数据库（`violation_query/data/violations.db`）：** 数据库包含所有历史查询记录的持久化存档（公司、车辆、违章、Profile 映射），是唯一的权威数据源。**任何时候不得**通过 `rm`、`DROP TABLE`、`DELETE FROM`、覆盖写入等方式删除或清空数据库。`init-db` 仅首次部署时执行一次（`CREATE TABLE IF NOT EXISTS`），已有数据库直接跳过。批量查询中途崩溃/中断时只需改进度文件，**不得**清库重跑。如需数据修正，通过 `db-insert-*` 的 upsert 机制增量更新单条记录，禁止整体重建。
 
 ### 中文参数兼容说明
 
@@ -132,6 +133,19 @@ sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure'
 - `lark-contact`、`lark-im`、`lark-shared` 官方 skill 已安装（`npx skills add larksuite/cli -y -g`）
 - 用户持有12123单位用户账号（扫码登录用）
 - 飞书操作统一用 `lark-cli` CLI（不用 MCP），发消息用 `--as bot`
+- **Node Agent** 已配置并运行（`dst-node-agent.service`），连接中央控制台：
+  ```bash
+  # 检查配置状态
+  python3 /home/openclaw/.claude/skills/DST违章查询/node_agent.py --health
+  # 首次配置（交互式）
+  python3 /home/openclaw/.claude/skills/DST违章查询/node_agent.py --setup
+  # 部署并启动 systemd 服务（一次性）
+  sudo cp /home/openclaw/.claude/skills/DST违章查询/dst-node-agent.service /etc/systemd/system/
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now dst-node-agent.service
+  sudo systemctl status dst-node-agent.service
+  ```
+  > **🔴 未配置或未运行 Node Agent 时，禁止继续执行登录或查询操作。此优先级高于飞书通知人查询。**
 
 ### ⚡ `violation_helper.py` 子命令速查
 
@@ -195,6 +209,7 @@ sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure'
 | `keepalive-health`     | 检查保活守护进程健康状态（health file + PID），返回 alive + 状态详情 | 通过 Python 脚本                              |
 | `ensure-keepalive`     | **自动启动保活守护进程**（登录后调用）；检查是否已运行，未运行则 `systemctl start`；已运行则跳过（防重复） | 通过 Python 脚本                              |
 | `save-notify`          | 持久化扫码人信息到保活通知文件（--company, --project-root, --type, --id, --label, [--at-user-id, --at-user-name]），供保活守护进程自动恢复扫码时使用 | 通过 Python 脚本                              |
+| `node_agent.py`        | **Node Agent 守护进程**（必须在第负一步检查）；`--setup` 交互式配置设备 ID + 控制台地址；`--health` 健康检查（配置+控制台可达性）；`--setup --node-id <id> --cloud-ws-url <url>` 非交互式配置 | Bash: `python3 <skill>/node_agent.py --health` |
 
 > **`profile-lookup` 匹配策略**：精准匹配（`=`）→ 模糊匹配（`LIKE '%keyword%'`）。模糊命中 1 条自动采用（`match_type: "fuzzy"`），命中多条返回 `candidates` 列表需用户确认。返回结果包含 `keepalive_alive` (bool) 和 `keepalive_state` (str) 字段。
 > **⚠️ 注意：`profile-lookup` 返回的公司名仅供定位 Profile 和平台 URL，不得直接作为最终公司名落库。最终公司名必须以扫码登录后 12123 平台公司列表页实际显示为准（铁律 #14）。**
@@ -265,6 +280,175 @@ pinchtab click e2
 | 按姓名查飞书用户（`lark-contact`）  | `--as user` | 需用户权限搜索通讯录       |
 | 按手机号查飞书用户（`batch_get_id`） | `--as bot`  | API 限制           |
 
+### 第负一步：Node Agent 前置检查（最高优先级，每次执行第一步）
+
+> **🔴 此步骤优先级高于一切其他操作，包括第零步权限配置和飞书通知人查询（铁律 #11）。Node Agent 未就绪则禁止继续执行登录或查询操作。**
+
+Node Agent（`node_agent.py`）是连接中央控制台的 WebSocket 守护进程，作为 systemd 服务（`dst-node-agent.service`）运行，负责：
+
+- WebSocket 长连接中央控制台，**发送 register 握手消息后必须等待控制台回复 `register_ack` 才算连接成功**（超时 15s 则关闭连接重试）
+- 接收远程任务指令，实时解析进度并上报
+- 任务完成自动同步 SQLite → 中央 MySQL（**违章数据同步两种机制**：① 查询任务完成后自动同步；② 与控制台建立连接时由 `register_ack` 下发同步频率，按固定时间周期性同步，默认 1800s 兜底）
+- 设备心跳上报（**30 秒一次**，独立于保活上报，携带 hostname 设备信息）
+- 账号保活状态上报（**60 秒一次**，逐公司发送，以 `company_name` 为主信息 + `node_id`/`hostname` 设备信息供中央控制台校验）
+- 响应云控指令（触发扫码登录等）
+
+**每次执行第一步 — 检查 Node Agent 状态：**
+
+```python
+# 写入 /home/openclaw/node_agent_check_{pid}.py
+import subprocess, sys, os, json
+
+py = r'python3'
+node_agent = r'/home/openclaw/.claude/skills/DST违章查询/node_agent.py'
+
+# Step 1: Check if node_config.json exists
+config_path = os.path.expanduser('~/violation_query/data/node_config.json')
+config_exists = os.path.exists(config_path)
+
+# Step 2: Check health
+health = subprocess.run(
+    [py, node_agent, '--health'],
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8')
+
+# Step 3: Check systemd service status
+svc = subprocess.run(
+    ['systemctl', 'status', 'dst-node-agent', '--no-pager'],
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8')
+
+result = {
+    'config_exists': config_exists,
+    'health_exit_code': health.returncode,
+    'health_stdout': health.stdout.strip(),
+    'service_running': 'active (running)' in (svc.stdout or '')
+}
+print(json.dumps(result, ensure_ascii=False))
+```
+
+**判断逻辑：**
+
+| 场景 | `node_config.json` | `--health` | systemd 状态 | 绑定状态 | 处理 |
+|------|-------------------|------------|-------------|---------|------|
+| ✅ 就绪 | 存在 | exit 0 | `active (running)` | 已绑定 | → 继续第零步 |
+| ⚠️ 未配置 | 不存在 | exit 1（未配置） | inactive | — | → **引导用户提供信息，agent 辅助配置**（见下方 A） |
+| ⚠️ 未运行 | 存在 | exit 0（配置 OK） | inactive | — | → **部署并启动 systemd 服务**（见下方 B） |
+| ⚠️ 未绑定 | 存在 | exit 1（控制台不可达）或服务日志含"未识别设备" | `active (running)` | 未绑定 | → **提醒用户在控制台绑定设备**（见下方 C） |
+| ⚠️ 控制台不可达 | 存在 | exit 1（控制台不可达） | `active (running)` | 已绑定 | → 🔴 **阻塞**，必须等控制台联通后才能继续（见下方 D） |
+
+**A. Agent 辅助配置（未配置时）：**
+
+> **🔴 此时尚未做任何飞书查人操作——Node Agent 优先级高于一切。**
+
+当前对话中输出：
+
+```
+⚠️ Node Agent 未配置 —— 必须先完成配置才能继续
+
+Node Agent 是连接中央控制台的守护进程。请提供绑定信息：
+
+  ① 设备 ID（与控制台预注册的名称一致）：______
+  ② 控制台 WebSocket 地址（如 ws://10.0.1.5:3001/ws?client=node）：______
+
+提供后我将自动完成配置、部署服务并启动。
+```
+
+**Agent 辅助绑定流程：**
+
+1. 用户回复设备 ID 和控制台地址（支持自然语言，如"设备ID是 beijing-server-01，控制台 ws://10.0.1.5:3001/ws"）
+2. Agent 解析用户输入，提取设备 ID 和 WebSocket URL
+3. Agent 执行非交互式配置：
+
+```bash
+python3 /home/openclaw/.claude/skills/DST违章查询/node_agent.py --setup \
+    --node-id "<设备ID>" \
+    --cloud-ws-url "<ws://控制台地址>"
+```
+
+4. 配置成功后，自动进入 B 部署并启动服务
+5. 服务启动后，自动进入 C 验证绑定状态
+
+> **Agent 应主动从用户消息中提取关键信息，而非要求用户按固定格式输入。** 例如用户说"用 ws://192.168.1.100:3001/ws，设备叫 node-001"，agent 应能解析出 `--node-id "node-001" --cloud-ws-url "ws://192.168.1.100:3001/ws"`。
+
+**B. 部署并启动服务（已配置但未运行时）：**
+
+```bash
+# 部署 service 文件（首次）
+sudo cp /home/openclaw/.claude/skills/DST违章查询/dst-node-agent.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable dst-node-agent.service
+
+# 启动
+sudo systemctl start dst-node-agent.service
+
+# 验证
+sudo systemctl status dst-node-agent.service --no-pager
+python3 /home/openclaw/.claude/skills/DST违章查询/node_agent.py --health
+```
+
+**C. 设备未绑定（服务已运行但控制台未识别该设备）：**
+
+当 `--health` 返回控制台可达但设备未在控制台注册/绑定时，输出：
+
+```
+⚠️ Node Agent 已运行但设备未在控制台绑定
+
+设备 ID：<node_id>
+控制台地址：<cloud_ws_url>
+
+请先在控制台中完成设备绑定：
+  ① 登录中央控制台管理页面
+  ② 找到「设备管理」→「添加设备」
+  ③ 输入设备 ID：<node_id>
+  ④ 确认设备上线状态变为"已连接"
+
+绑定完成后回复「已绑定」，我将验证连接状态并继续。
+```
+
+验证绑定（用户确认后执行）：
+
+```bash
+# 重启 agent 触发重新注册
+sudo systemctl restart dst-node-agent
+sleep 3
+python3 /home/openclaw/.claude/skills/DST违章查询/node_agent.py --health
+```
+
+> **🔴 设备未绑定时禁止继续执行登录或查询操作。** 必须等用户在控制台完成绑定、agent 验证通过后才能继续。
+
+**D. 控制台不可达（阻塞，必须等待联通）：**
+
+当设备已绑定但控制台网络不可达时，**禁止继续执行**，必须等待控制台联通：
+
+```
+🔴 Node Agent 已运行但无法连接中央控制台
+
+设备 ID：<node_id>
+控制台地址：<cloud_ws_url>
+错误原因：<具体连接错误>
+
+中央控制台不可达，无法继续执行登录或查询操作。
+
+请排查：
+  ① 确认控制台服务是否已启动（检查控制台所在机器的服务状态）
+  ② 确认网络是否可达（ping / telnet 控制台地址和端口）
+  ③ 确认防火墙是否放行控制台端口
+
+控制台联通后回复「已联通」，我将重新验证并继续。
+```
+
+**验证联通（用户确认后执行）：**
+
+```bash
+# 重启 agent 触发重新连接
+sudo systemctl restart dst-node-agent
+sleep 3
+python3 /home/openclaw/.claude/skills/DST违章查询/node_agent.py --health
+```
+
+> **🔴 控制台不可达时绝对禁止继续执行登录或查询操作。** 必须等用户确认控制台已启动、agent 验证 `--health` 返回控制台可达后才能继续。此要求与未绑定（C）同级，不可跳过。
+
+> **🔴 只有 A（配置）、B（启动）、C（绑定）、D（联通）全部就绪后（配置完成 + 服务运行 + 设备已绑定 + 控制台可达），才能继续第零步。任一环节未完成则绝对禁止执行任何登录或查询操作。**
+
 ### ⚡ 第零步：自动配置权限（每次执行必做）
 
 **执行前自动检查并写入当前工作区** **`.claude/settings.local.json`：**
@@ -303,7 +487,7 @@ pinchtab click e2
 
 ## 执行流程
 
-> **开始执行前，必须先完成「第零步：自动配置权限」。**
+> **开始执行前，必须先完成「第负一步：Node Agent 前置检查」，再完成「第零步：自动配置权限」。**
 
 ### 环境初始化（每次执行第一步）
 
@@ -1249,14 +1433,19 @@ systemctl --user status cleanup-dst.timer  # 验证
 ### systemd 服务架构
 
 ```
-systemd user services
-├── pinchtab.service                    ← Chrome 浏览器 + PinchTab daemon
+systemd services
+├── dst-node-agent.service               ← Node Agent（最高优先级，系统级服务）
+│   ├── Type=simple, WantedBy=multi-user.target
+│   ├── Restart=on-failure, RestartSec=10
+│   └── ExecStart=node_agent.py（WebSocket 长连接中央控制台）
+│
+├── pinchtab.service                     ← Chrome 浏览器 + PinchTab daemon（user 服务）
 │   ├── Restart=always, RestartSec=5
 │   └── drop-in: cookie-persist.conf
 │       ├── ExecStartPre=cookie_persist.py   ← Chrome 启动前修 DB
 │       └── ExecStopPost=cookie_persist.py   ← Chrome 停止后修 DB（应对 clean shutdown 回写）
 │
-└── keepalive-profile_<N>.service         ← 保活守护进程（以 profile_001 为例，使用 ASCII profile_name）
+└── keepalive-profile_<N>.service         ← 保活守护进程（user 服务，以 profile_001 为例）
     ├── After=pinchtab.service
     ├── Type=notify, WatchdogSec=240
     ├── Restart=always, RestartSec=10
@@ -1511,9 +1700,10 @@ SIGKILL pinchtab
 
 ## 使用示例
 
-- **车牌自动识别：** `查粤B12345违章` → 粤→广东→查人→导航 `gab.122.gov.cn/m/login?t=2` → 截图发飞书 → 扫码 → 选择公司 → 平台自动跳转广东业务页 → 我的主页 → 搜索车牌 → 采集详情 → SQLite 落库 + 对话总结 + 飞书通知 → mark-task-done + release-tab 关闭标签页
-- **批量：** `查成都公司违章` → 成都→四川→查人→导航 `gab.122.gov.cn/m/login?t=2` → 截图发飞书 → 扫码 → 选择公司 → 平台自动跳转四川业务页 → 我的主页 → 阶段一扫描全部页面 → 阶段二逐台采集违章 → SQLite 落库 + 对话总结 + 飞书通知 → mark-task-done + release-tab 关闭标签页
-- **群通知（@指定人）：** `查成都公司违章，发到违章通知群，@任晏平` → 搜群→查人→截图→发群+@→轮询监听→查公司→逐台采→对话总结+飞书通知 → mark-task-done + release-tab 关闭标签页
+- **车牌自动识别：** `查粤B12345违章` → **① Node Agent 前置检查** → ② 粤→广东→查人→导航 `gab.122.gov.cn/m/login?t=2` → 截图发飞书 → 扫码 → 选择公司 → 平台自动跳转广东业务页 → 我的主页 → 搜索车牌 → 采集详情 → SQLite 落库 + 对话总结 + 飞书通知 → mark-task-done + release-tab 关闭标签页
+- **批量：** `查成都公司违章` → **① Node Agent 前置检查** → ② 成都→四川→查人→导航 `gab.122.gov.cn/m/login?t=2` → 截图发飞书 → 扫码 → 选择公司 → 平台自动跳转四川业务页 → 我的主页 → 阶段一扫描全部页面 → 阶段二逐台采集违章 → SQLite 落库 + 对话总结 + 飞书通知 → mark-task-done + release-tab 关闭标签页
+- **群通知（@指定人）：** `查成都公司违章，发到违章通知群，@任晏平` → **① Node Agent 前置检查** → ② 搜群→查人→截图→发群+@→轮询监听→查公司→逐台采→对话总结+飞书通知 → mark-task-done + release-tab 关闭标签页
+- **仅登录：** `登录成都公司` → **① Node Agent 前置检查** → ② Profile 查找 → ③ 验证登录态 → ④ 进入我的主页确认 → ⑤ 自动启动保活 → release-tab 关闭标签页（不做查询）
 - **保活：** 登录成功后通过 systemd user service 启动 `keepalive_daemon.py`，四层保活（心跳 + 周期 reload + Cookie 持久化 + systemd 自动重启），完全独立于 Claude 会话持续保活
 
 ***
@@ -1566,4 +1756,5 @@ SIGKILL pinchtab
 44. **Profile 隔离与登录复用：** 每个公司绑定一个 PinchTab Profile（`profiles` 表）→ 1:1 映射到 PinchTab Instance（独立端口）。同一公司的多个查询进程复用同一 Instance（共享 cookie/登录态），通过 `session_manager.py init --instance-port <port>` + `VIOLATION_TAB_ID` + `VIOLATION_INSTANCE_PORT` 实现双层隔离（实例级 cookie 隔离 + 标签页级导航隔离）。不同公司使用不同 Instance。每次执行前先 `instance-discover` 同步实例端口 → `profile-lookup` 查映射表，命中则跳过登录直接查询。**🔴 新公司必须先 `session_manager.py profile-create` 创建独立 Profile + Instance（铁律 #16），禁止复用默认实例或其他公司实例。** 首次登录成功后 `profile-register` 写入映射表（自动联动 `instance-discover` 绑定端口）。**🔴 `profile-register` 的公司名必须以平台公司列表页实际显示为准（铁律 #14），禁止使用用户输入或模糊匹配结果直接落库。** Profile 命名采用数字方案（`profile_001`/`profile_002`），避免与省份/城市绑定。**🔴 禁止 `pinchtab cookies clear` 清除全部 Cookie（铁律 #17），cookie 隔离由 Profile 级别实现，不得通过清 cookie 修复登录跳转。**
 45. **禁止删除数据库（🔴 铁律 #20）：** SQLite 数据库 `violation_query/data/violations.db` 是所有历史查询记录的持久化存档，**任何时候不得删除或清空**（含 `rm`、`DROP TABLE`、`DELETE FROM`）。`init-db` 仅首次部署执行一次（`CREATE TABLE IF NOT EXISTS`），已有数据库直接跳过。批量查询中断只需重置进度文件，不得清库重跑。数据修正通过 `db-insert-*` 的 upsert 机制增量更新。
 46. **保活守护进程：** `keepalive_daemon.py` 通过 systemd user service 管理（`keepalive-<profile_name>.service`，ASCII 安全命名），配合 pinchtab drop-in `cookie-persist.conf` 实现四层保活架构（L0 心跳 → L1 周期 reload + 我的主页 → L2 Cookie 持久化 → L3 systemd 自动重启）。服务名使用 `profile_name`（如 `keepalive-profile_002.service`），**禁止使用中文公司名作为 systemd 单元名**。保活目标页面为我的主页（vehlist.html），能即时检测风控和登录过期。服务通过 `Restart=always` + `RestartPreventExitStatus=42 43 44` 自动恢复崩溃但不重启已登出/风控的 daemon。退出码：42=登录失效(`is_logged_in=0`)、43=风控限流、44=已有实例运行，这些退出码不会触发 systemd 重启。`loginctl enable-linger` 确保会话退出后不终止。PID 文件在 `violation_query/data/keepalive_<公司>.pid`，日志在 `violation_query/data/keepalive_<公司>.log`。Cookie 持久化由 `cookie_persist.py` 实现。启动前先检查是否已有实例运行（防止重复启动）。Claude 会话结束时守护进程不受影响，继续在后台每 55 分钟执行保活周期。**登录成功后通过 `ensure-keepalive` 自动触发启动，不再依赖模型记忆。**
+47. **Node Agent 优先级（铁律 #0）：** `node_agent.py` 是每次 skill 调用的最高优先级前置条件。必须在配置权限（第零步）之前检查并确保其已配置、已运行、且与中央控制台联通。Node Agent 连接中央控制台，负责接收云控指令、上报进度和同步数据。**连接建立时发送 register 握手消息，必须等待控制台回复 `register_ack` 才算连接成功**（15s 超时重连）。**四项条件（配置 + 服务运行 + 设备已绑定 + 控制台可达）全部满足才可继续，任一不满足则禁止执行任何登录或查询操作。** 配置：`node_agent.py --setup`（交互式）或 `--setup --node-id <id> --cloud-ws-url <url>`（CLI 非交互式）。健康检查：`node_agent.py --health`（控制台可达时 exit 0，不可达或未配置时 exit 1）。systemd 服务：`dst-node-agent.service`（系统级，`sudo systemctl` 管理）。**通信间隔：心跳 30s / 保活状态 60s / 数据同步频率由控制台 `register_ack.sync_interval` 下发（默认 1800s 兜底）。上报消息均携带 `company_name` 为主信息 + `node_id`/`hostname` 设备信息。**
 

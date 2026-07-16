@@ -96,32 +96,30 @@ print(f"Already processed: {len(processed)}")
 new_violations_total = 0
 new_points_total = 0
 new_fine_total = 0
-failed_vehicles = set()
+failed_vehicles = {}  # plate → unprocessed_count (dict for second pass)
 
-# === Search -> Open -> Collect -> Back loop ===
-search_start_time = None  # Track search start for 10s anti-rate-limit floor
+# ── Per-vehicle query helper ──
 
-for idx, (plate, unprocessed_count) in enumerate(violation_vehicles):
-    if plate in processed:
-        if (idx + 1) % 50 == 0:
-            print(f"  [{idx+1}/{len(violation_vehicles)}] {plate}: skip (already processed)")
-        continue
+def _query_one_vehicle(plate, unprocessed_count, search_start):
+    """Query one vehicle: search → confirm → (retry once) → open → collect → back.
+    Returns (success: bool, new_vios: int, new_pts: int, new_fine: int, next_search_start: float).
+    Side effects: updates DB, saves progress, modifies processed set.
+    """
+    global new_violations_total, new_points_total, new_fine_total
 
     # === 车间保底 10s：从上一台搜索开始计时 ===
-    if search_start_time is not None:
-        elapsed = time.time() - search_start_time
+    if search_start is not None:
+        elapsed = time.time() - search_start
         if elapsed < 10:
             wait = 10 - elapsed
             print(f"    [10s floor] elapsed={elapsed:.1f}s, waiting {wait:.1f}s")
             time.sleep(wait)
 
-    print(f"  [{idx+1}/{len(violation_vehicles)}] {plate}: {unprocessed_count} violations")
-
     # Dismiss popups first
     h(['dismiss-popup'])
 
     # === Search with confirmation (1s fixed + polling max 3s total + 1 retry) ===
-    search_start_time = time.time()  # Mark for 10s floor
+    new_search_start = time.time()  # Mark for 10s floor
 
     plate_no_prefix = plate[1:] if len(plate) > 1 else plate
     search_js = f"""
@@ -179,7 +177,7 @@ for idx, (plate, unprocessed_count) in enumerate(violation_vehicles):
             break
         time.sleep(0.2)
 
-    # Retry once if not found
+    # Retry once immediately if not found
     if not found:
         print(f"    search not confirmed, retrying...")
         h(['dismiss-popup'])
@@ -194,19 +192,16 @@ for idx, (plate, unprocessed_count) in enumerate(violation_vehicles):
 
     if not found:
         print(f"    SKIP: search failed after retry for {plate}")
-        # Mark query failure in DB (status_code only, preserve platform status_label)
+        # Mark query failure in DB
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
             "UPDATE vehicles SET status_code = 'query_failed' WHERE plate_number = ? AND company_id = ?",
             (plate, company_id))
         conn.commit()
         conn.close()
-        failed_vehicles.add(plate)
-        # NOT added to processed_plates — will be retried on next run
-        continue
+        return (False, 0, 0, 0, new_search_start)
 
     # Open vehicle (always index 1 after search filters to single result)
-    # No extra sleep needed — detail page loading provides natural delay
     open_result = h(['open-vehicle', '--index', '1'])
     print(f"    open: {open_result[:100]}")
 
@@ -217,16 +212,18 @@ for idx, (plate, unprocessed_count) in enumerate(violation_vehicles):
         collect_args.extend(['--resume-from', str(resume_detail_page)])
         print(f"    Resuming from detail page {resume_detail_page}")
     violations_out = h(collect_args)
+    new_count = 0
+    new_pts = 0
+    new_fine = 0
     try:
         violations = json.loads(violations_out)
         new_ones = [x for x in violations if not x.get('skipped') and not x.get('from_db')]
         new_count = len(new_ones)
         print(f"    -> {new_count} new violations")
         if new_count > 0:
-            new_violations_total += new_count
             for v in new_ones:
-                new_points_total += v.get('points', 0) or 0
-                new_fine_total += v.get('fine', 0) or 0
+                new_pts += v.get('points', 0) or 0
+                new_fine += v.get('fine', 0) or 0
         # Clear failure status on successful query
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
@@ -237,15 +234,67 @@ for idx, (plate, unprocessed_count) in enumerate(violation_vehicles):
     except json.JSONDecodeError:
         print(f"    -> parse error: {violations_out[:200]}")
 
-    # Back to list (go-back + 10s floor handles pacing, no extra fixed sleep)
+    # Back to list
     h(['go-back'])
 
-    # Save progress (续跑 + 完成判定铁律 #1)
-    h(['save-detail-progress', '--phase', 'collect',
-        '--vehicle-index', str(idx + 1), '--plate', plate,
-        '--detail-page', '-1',
-        '--company', company, '--batch-id', batch_id])
+    # Update globals
+    new_violations_total += new_count
+    new_points_total += new_pts
+    new_fine_total += new_fine
     processed.add(plate)
+
+    return (True, new_count, new_pts, new_fine, new_search_start)
+
+
+# ── First pass: process all vehicles ──
+
+search_start_time = None
+first_pass_failed = {}  # plate → unprocessed_count
+for idx, (plate, unprocessed_count) in enumerate(violation_vehicles):
+    if plate in processed:
+        if (idx + 1) % 50 == 0:
+            print(f"  [{idx+1}/{len(violation_vehicles)}] {plate}: skip (already processed)")
+        continue
+
+    print(f"  [{idx+1}/{len(violation_vehicles)}] {plate}: {unprocessed_count} violations [first pass]")
+
+    success, nv, np, nf, search_start_time = _query_one_vehicle(
+        plate, unprocessed_count, search_start_time)
+
+    if success:
+        # Save progress (续跑)
+        h(['save-detail-progress', '--phase', 'collect',
+            '--vehicle-index', str(idx + 1), '--plate', plate,
+            '--detail-page', '-1',
+            '--company', company, '--batch-id', batch_id])
+    else:
+        first_pass_failed[plate] = unprocessed_count
+
+
+# ── Second pass: retry all failed vehicles ──
+
+failed_vehicles = {}  # Final failures after second pass
+if first_pass_failed:
+    print(f"\n=== Second pass: retrying {len(first_pass_failed)} failed vehicles ===")
+    # Reset search_start_time to allow immediate start (no 10s floor between passes)
+    retry_search_start = None
+    for retry_idx, (plate, unprocessed_count) in enumerate(first_pass_failed.items()):
+        print(f"  [{retry_idx+1}/{len(first_pass_failed)}] {plate}: {unprocessed_count} violations [second pass - final retry]")
+
+        success, nv, np, nf, retry_search_start = _query_one_vehicle(
+            plate, unprocessed_count, retry_search_start)
+
+        if success:
+            print(f"    ✓ recovered on second pass: {nv} new violations")
+            # Save progress for recovered vehicles too
+            h(['save-detail-progress', '--phase', 'collect',
+                '--vehicle-index', str(len(violation_vehicles) + retry_idx + 1),
+                '--plate', plate,
+                '--detail-page', '-1',
+                '--company', company, '--batch-id', batch_id])
+        else:
+            failed_vehicles[plate] = unprocessed_count
+            print(f"    ✗ still failed after second pass")
 
 success_count = len(processed)
 
@@ -260,9 +309,10 @@ conn.close()
 print(f"\n=== Phase 2 complete ===")
 print(f"  Vehicles in query list: {len(violation_vehicles)}")
 print(f"  Successfully queried:  {success_count}")
-print(f"  Failed (will retry):   {len(failed_vehicles)}")
+print(f"  Failed (final):        {len(failed_vehicles)}")
 if failed_vehicles:
     print(f"  Failed plates: {', '.join(sorted(failed_vehicles))}")
+    print(f"  (will retry on next batch run)")
 print(f"  New violations: {new_violations_total}")
 print(f"  New points:     {new_points_total}")
 print(f"  New fine:       {new_fine_total}")

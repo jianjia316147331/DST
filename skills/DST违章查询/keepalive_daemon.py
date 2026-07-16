@@ -453,7 +453,7 @@ def _cleanup_stale_tabs(instance_port, keep_tab_id, log):
 
 def _cleanup_tab_registry(project_root, company, log):
     """Remove this daemon's entry from tab_registry.json."""
-    registry_path = os.path.join(project_root, "data", "tab_registry.json")
+    registry_path = os.path.join(project_root, "violation_query", "data", "tab_registry.json")
     if not os.path.exists(registry_path):
         return
     try:
@@ -541,13 +541,33 @@ def _verify_tab(tab_id, instance_port, log):
         url_js = "(function(){return window.location.href;})()"
         url_result = _run_pinchtab(["eval", url_js],
                                    instance_port=instance_port, timeout=5)
-        current_url = url_result.stdout.strip()
+        current_url = (url_result.stdout or "").strip()
+        stderr_text = (url_result.stderr or "").strip()
+        rc = url_result.returncode
+
+        # Check for dead-tab indicators first
+        stderr_lower = stderr_text.lower()
+        if "404" in stderr_lower or "tab not found" in stderr_lower:
+            log.warning(f"Tab {tab_id} verification failed — tab not found in browser "
+                        f"(rc={rc}, stderr: {stderr_text[:120]})")
+            return False
+
+        if rc != 0:
+            log.warning(f"Tab {tab_id} verification failed — non-zero exit code "
+                        f"(rc={rc}, stderr: {stderr_text[:120]})")
+            return False
+
+        if not current_url:
+            log.warning(f"Tab {tab_id} verification failed — empty URL returned "
+                        f"(rc={rc}, stderr: {stderr_text[:120]})")
+            return False
+
         if "122.gov.cn" in current_url or "about:blank" in current_url:
             log.debug(f"Tab {tab_id} verified: {current_url[:80]}")
             return True
 
         log.warning(f"Tab {tab_id} verification failed — "
-                    f"current URL: {current_url[:80]}")
+                    f"unexpected URL: {current_url[:120]}")
         return False
     except Exception as e:
         log.warning(f"Tab verify exception: {e}")
@@ -686,7 +706,7 @@ def _heartbeat(instance_port, log):
 
     Returns:
         True  — heartbeat succeeded (page responsive, JS executed)
-        False — heartbeat failed (pinchtab timeout / eval error)
+        False — heartbeat failed (pinchtab timeout / eval error / tab dead)
     """
     try:
         # Random scroll: pick a y-offset in [100, 1200] to simulate reading
@@ -696,8 +716,18 @@ def _heartbeat(instance_port, log):
         scroll_result = _run_pinchtab(
             ["eval", scroll_js], instance_port=instance_port, timeout=10
         )
+        # Check returncode AND detect dead-tab indicators
+        # pinchtab eval on a dead tab returns exit 0 + empty stdout + "404" in stderr
+        scroll_stderr = (scroll_result.stderr or "").lower()
         if scroll_result.returncode != 0:
-            log.warning(f"Heartbeat scroll failed: {scroll_result.stderr[:100]}")
+            log.warning(f"Heartbeat scroll failed (rc={scroll_result.returncode}): "
+                        f"{scroll_result.stderr[:100]}")
+            return False
+        if "404" in scroll_stderr or "tab not found" in scroll_stderr:
+            log.warning(f"Heartbeat scroll: tab appears DEAD (stderr: {scroll_result.stderr[:100]})")
+            return False
+        if not (scroll_result.stdout or "").strip():
+            log.warning("Heartbeat scroll: empty stdout — tab may be dead")
             return False
 
         # Lightweight ping: read a known DOM element to verify page is alive
@@ -711,8 +741,16 @@ def _heartbeat(instance_port, log):
         ping_result = _run_pinchtab(
             ["eval", ping_js], instance_port=instance_port, timeout=10
         )
+        ping_stderr = (ping_result.stderr or "").lower()
         if ping_result.returncode != 0:
-            log.warning(f"Heartbeat ping failed: {ping_result.stderr[:100]}")
+            log.warning(f"Heartbeat ping failed (rc={ping_result.returncode}): "
+                        f"{ping_result.stderr[:100]}")
+            return False
+        if "404" in ping_stderr or "tab not found" in ping_stderr:
+            log.warning(f"Heartbeat ping: tab appears DEAD (stderr: {ping_result.stderr[:100]})")
+            return False
+        if not (ping_result.stdout or "").strip():
+            log.warning("Heartbeat ping: empty stdout — tab may be dead")
             return False
 
         # Occasionally (1/5 chance) dismiss any popups that may have appeared
