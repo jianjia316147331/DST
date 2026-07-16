@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pinchtab:*)",
+      "Bash(ls:*)",
+      "Bash(mkdir:*)",
+      "Bash(cd:*)",
+      "Bash(cat:*)",
+      "Bash(lark-cli:*)",
+      "Bash(lark-cli contact *)",
+      "Bash(lark-cli im *)",
+      "Bash(lark-cli event *)",
+      "Bash(lark-cli base *)",
+      "Bash(lark-cli docs *)",
+      "Bash(lark-cli api *)"
+    ]
+  }
+}

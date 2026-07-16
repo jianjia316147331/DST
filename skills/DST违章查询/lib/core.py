@@ -713,26 +713,49 @@ def _clean_stale_files(query_dir):
                 pass
 
         # Clean 7d+ entries from tab_registry.json
-        # tab_registry.json is a flat dict: {label: {tab_id, pid, created_at, ...}}
+        # Supports both formats:
+        #   - flat dict:  {label: {tab_id, pid, created_at, ...}}
+        #   - entries array: {"entries": [{tab_id, created_at, ...}], "cleaned_at": "..."}
         reg_path = os.path.join(data_dir, "tab_registry.json")
         if os.path.exists(reg_path):
             try:
                 with open(reg_path, "r", encoding="utf-8") as f:
                     registry = json.load(f)
                 removed = 0
-                for label, info in list(registry.items()):
-                    created = info.get("created_at", "")
-                    if created:
-                        try:
-                            ts = datetime.strptime(created[:19], "%Y-%m-%dT%H:%M:%S").timestamp()
-                            if ts < cutoff_7d:
-                                del registry[label]
-                                removed += 1
-                        except (ValueError, OSError):
-                            pass
-                if removed > 0:
-                    with open(reg_path, "w", encoding="utf-8") as f:
-                        json.dump(registry, f, ensure_ascii=False, indent=2)
+                if "entries" in registry:
+                    # New format: entries array
+                    fresh = []
+                    for entry in registry.get("entries", []):
+                        created = entry.get("created_at", "")
+                        if created:
+                            try:
+                                ts = datetime.strptime(created[:19], "%Y-%m-%dT%H:%M:%S").timestamp()
+                                if ts < cutoff_7d:
+                                    removed += 1
+                                    continue
+                            except (ValueError, OSError):
+                                pass
+                        fresh.append(entry)
+                    if removed > 0:
+                        registry["entries"] = fresh
+                        registry["cleaned_at"] = datetime.now().isoformat()
+                        with open(reg_path, "w", encoding="utf-8") as f:
+                            json.dump(registry, f, ensure_ascii=False, indent=2)
+                else:
+                    # Old format: flat dict
+                    for label, info in list(registry.items()):
+                        created = info.get("created_at", "")
+                        if created:
+                            try:
+                                ts = datetime.strptime(created[:19], "%Y-%m-%dT%H:%M:%S").timestamp()
+                                if ts < cutoff_7d:
+                                    del registry[label]
+                                    removed += 1
+                            except (ValueError, OSError):
+                                pass
+                    if removed > 0:
+                        with open(reg_path, "w", encoding="utf-8") as f:
+                            json.dump(registry, f, ensure_ascii=False, indent=2)
                 counts["tab_entries"] = removed
             except (json.JSONDecodeError, OSError):
                 pass
@@ -798,6 +821,7 @@ def cmd_release_tab():
         return
 
     # Find label for this tab_id in the registry
+    # Supports both flat dict and entries array formats
     label = None
     try:
         registry_path = os.path.join(
@@ -806,10 +830,16 @@ def cmd_release_tab():
         if os.path.exists(registry_path):
             with open(registry_path, "r", encoding="utf-8") as f:
                 registry = json.load(f)
-            for lbl, info in registry.items():
-                if info.get("tab_id") == tab_id:
-                    label = lbl
-                    break
+            if "entries" in registry:
+                for entry in registry["entries"]:
+                    if entry.get("tab_id") == tab_id:
+                        label = entry.get("label", "")
+                        break
+            else:
+                for lbl, info in registry.items():
+                    if info.get("tab_id") == tab_id:
+                        label = lbl
+                        break
     except Exception:
         pass
 
@@ -1031,11 +1061,18 @@ def _touch_tab_activity(tab_id):
         with open(registry_path, "r", encoding="utf-8") as f:
             registry = json.load(f)
         updated = False
-        for info in registry.values():
-            if info.get("tab_id") == tab_id:
-                info["last_activity"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-                updated = True
-                break
+        if "entries" in registry:
+            for entry in registry["entries"]:
+                if entry.get("tab_id") == tab_id:
+                    entry["last_activity"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                    updated = True
+                    break
+        else:
+            for info in registry.values():
+                if info.get("tab_id") == tab_id:
+                    info["last_activity"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                    updated = True
+                    break
         if updated:
             with open(registry_path, "w", encoding="utf-8") as f:
                 json.dump(registry, f, ensure_ascii=False, indent=2)

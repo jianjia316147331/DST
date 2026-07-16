@@ -31,15 +31,15 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.sync import read_node_config, write_node_config, check_cloud_connectivity, export_for_sync
+from session_bridge import SessionBridge
 
 
 # ── Configuration ──────────────────────────────────────────────
 
 WEBSOCKET_RECONNECT_DELAY = 5   # seconds
-HEARTBEAT_INTERVAL = 30          # seconds, 设备心跳上报
-KEEPALIVE_REPORT_INTERVAL = 60   # seconds, 保活状态上报
-SYNC_INTERVAL = 1800             # 30 minutes, 默认周期性同步（控制台可通过 register_ack 下发覆盖）
-REGISTER_TIMEOUT = 15            # seconds, 等待 register_ack 超时
+HEARTBEAT_INTERVAL = 10          # seconds
+KEEPALIVE_REPORT_INTERVAL = 300  # 5 minutes
+SYNC_INTERVAL = 1800             # 30 minutes periodic sync fallback
 CLAUDE_PATH = "claude"
 
 
@@ -111,367 +111,6 @@ def check_health():
         sys.exit(1)
 
 
-def run_sync_now():
-    """One-shot: export all local data and push to central console via WebSocket."""
-    import asyncio, sqlite3, time
-    from lib.db import _get_db_path, _init_db
-
-    config = read_node_config()
-    if not config:
-        print("❌ 未配置，请先运行 --setup")
-        sys.exit(1)
-
-    node_id = config["node_id"]
-    cloud_ws_url = config["cloud_ws_url"]
-
-    # Check connectivity first
-    ok, err = check_cloud_connectivity(cloud_ws_url)
-    if not ok:
-        print(f"❌ 控制台不可达: {err}")
-        sys.exit(1)
-
-    # Gather all company names from local DB
-    _init_db()
-    db_path = _get_db_path()
-    conn = sqlite3.connect(db_path)
-    cur = conn.execute("SELECT DISTINCT name FROM companies")
-    company_names = [r[0] for r in cur.fetchall()]
-    conn.close()
-
-    if not company_names:
-        print("⚠️ 本地数据库无公司数据，跳过同步")
-        sys.exit(0)
-
-    print(f"📦 准备同步 {len(company_names)} 家公司...")
-
-    async def _do_sync():
-        # Parse URL
-        url = cloud_ws_url.replace("ws://", "").replace("wss://", "").replace("http://", "").replace("https://", "")
-        if "/" in url:
-            host_part, path = url.split("/", 1)
-            path = "/" + path
-        else:
-            host_part, path = url, "/"
-        if ":" in host_part:
-            host, port_str = host_part.rsplit(":", 1)
-            port = int(port_str)
-        else:
-            host, port = host_part, 80
-
-        reader, writer = await asyncio.open_connection(host, port)
-
-        # WebSocket upgrade handshake
-        ws_key = os.urandom(16)
-        ws_key_b64 = __import__('base64').b64encode(ws_key).decode('ascii')
-        request = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {host}:{port}\r\n"
-            f"Upgrade: websocket\r\n"
-            f"Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {ws_key_b64}\r\n"
-            f"Sec-WebSocket-Version: 13\r\n"
-            f"\r\n"
-        )
-        writer.write(request.encode())
-        await writer.drain()
-
-        # Read HTTP upgrade response
-        response = b""
-        while b"\r\n\r\n" not in response:
-            chunk = await reader.read(1024)
-            if not chunk:
-                print("❌ WebSocket 握手失败: 连接关闭")
-                return
-            response += chunk
-
-        if b"101" not in response:
-            first_line = response.split(b'\r\n')[0].decode()
-            print(f"❌ WebSocket 握手失败: {first_line}")
-            return
-        print("✅ WebSocket 已连接")
-
-        def _send_frame(w, payload_bytes):
-            frame = bytearray()
-            frame.append(0x81)
-            length = len(payload_bytes)
-            if length < 126:
-                frame.append(length | 0x80)
-            elif length < 65536:
-                frame.append(126 | 0x80)
-                frame.extend(length.to_bytes(2, "big"))
-            else:
-                frame.append(127 | 0x80)
-                frame.extend(length.to_bytes(8, "big"))
-            mask_key = os.urandom(4)
-            frame.extend(mask_key)
-            masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload_bytes))
-            frame.extend(masked)
-            w.write(bytes(frame))
-
-        async def _recv_frame(r):
-            header = await asyncio.wait_for(r.readexactly(2), timeout=10)
-            opcode = header[0] & 0x0F
-            masked = header[1] & 0x80
-            length = header[1] & 0x7F
-            if opcode == 0x08:
-                return None
-            if opcode == 0x09:
-                return None
-            if length == 126:
-                length = int.from_bytes(await r.readexactly(2), "big")
-            elif length == 127:
-                length = int.from_bytes(await r.readexactly(8), "big")
-            if masked:
-                mask_key = await r.readexactly(4)
-            payload = await r.readexactly(length)
-            if masked:
-                payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-            try:
-                return json.loads(payload.decode("utf-8"))
-            except Exception:
-                return None
-
-        # Send sync for each company
-        total = {"companies": 0, "vehicles": 0, "violations": 0}
-        for i, company_name in enumerate(company_names):
-            result = export_for_sync(company_name=company_name, node_id=node_id)
-            if not result.get("ok"):
-                print(f"  ⚠️ {company_name}: 导出失败 - {result.get('error')}")
-                continue
-
-            n_v = len(result.get("vehicles", []))
-            n_vi = len(result.get("violations", []))
-            if n_v == 0 and n_vi == 0:
-                print(f"  ⏭️ {company_name}: 无数据")
-                continue
-
-            msg = {
-                "type": "sync_data",
-                "company_name": company_name,
-                "node_id": node_id,
-                "hostname": socket.gethostname(),
-                "companies": result["companies"],
-                "vehicles": result["vehicles"],
-                "violations": result["violations"],
-            }
-            _send_frame(writer, json.dumps(msg, ensure_ascii=False).encode("utf-8"))
-            await writer.drain()
-            print(f"  📤 {company_name}: {len(result['companies'])}司 / {n_v}车 / {n_vi}违章")
-
-            total["companies"] += len(result["companies"])
-            total["vehicles"] += n_v
-            total["violations"] += n_vi
-
-            # Wait for sync_ack
-            try:
-                ack = await _recv_frame(reader)
-                if ack and ack.get("type") == "sync_ack":
-                    status = "✅" if ack.get("ok") else "❌"
-                    print(f"    {status} 控制台确认: {ack.get('stats', ack.get('message', ''))}")
-            except Exception as e:
-                print(f"    ⚠️ 未收到确认: {e}")
-
-            if i < len(company_names) - 1:
-                await asyncio.sleep(1)
-
-        # Graceful close
-        close_frame = bytearray([0x88, 0x80, 0, 0, 0, 0])  # opcode=0x08, masked, no payload
-        writer.write(bytes(close_frame))
-        await writer.drain()
-        writer.close()
-        # wait_closed() not available in Python < 3.8
-        if hasattr(writer, 'wait_closed'):
-            await writer.wait_closed()
-
-        return total
-
-    loop = asyncio.new_event_loop()
-    try:
-        totals = loop.run_until_complete(_do_sync())
-        if totals:
-            print(f"\n✅ 同步完成: {totals['companies']}司 / {totals['vehicles']}车 / {totals['violations']}违章")
-    except Exception as e:
-        print(f"❌ 同步失败: {e}")
-        sys.exit(1)
-    finally:
-        loop.close()
-
-
-def run_report_keepalive():
-    """One-shot: gather keepalive status and push to central console via WebSocket."""
-    import asyncio, sqlite3
-    from lib.db import _get_db_path, _init_db
-    from lib.core import _get_data_dir
-
-    config = read_node_config()
-    if not config:
-        print("❌ 未配置，请先运行 --setup")
-        sys.exit(1)
-
-    node_id = config["node_id"]
-    cloud_ws_url = config["cloud_ws_url"]
-
-    ok, err = check_cloud_connectivity(cloud_ws_url)
-    if not ok:
-        print(f"❌ 控制台不可达: {err}")
-        sys.exit(1)
-
-    # Gather keepalive status
-    _init_db()
-    db_path = _get_db_path()
-    if not os.path.exists(db_path):
-        print("⚠️ 数据库不存在")
-        sys.exit(0)
-
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    cur = conn.execute("SELECT * FROM profiles")
-    profiles = [dict(r) for r in cur.fetchall()]
-    conn.close()
-
-    if not profiles:
-        print("⚠️ 无 Profile 数据")
-        sys.exit(0)
-
-    companies_status = []
-    for p in profiles:
-        status = {
-            "company_name": p.get("company_name", ""),
-            "profile_name": p.get("profile_name", ""),
-            "is_logged_in": bool(p.get("is_logged_in", 0)),
-        }
-
-        # Check keepalive systemd service
-        profile_name = p.get("profile_name", "")
-        service_name = f"keepalive-{profile_name}"
-        try:
-            r = subprocess.run(
-                ["systemctl", "--user", "is-active", service_name],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8', timeout=5
-            )
-            status["keepalive_alive"] = r.stdout.strip() == "active"
-        except Exception:
-            status["keepalive_alive"] = False
-
-        # Read health file
-        health_file = os.path.join(_get_data_dir(), f"keepalive_health_{p['company_name']}.json")
-        if os.path.exists(health_file):
-            try:
-                with open(health_file, "r") as f:
-                    health = json.load(f)
-                status["last_cycle"] = health.get("last_check", "")
-                status["cycle_count"] = health.get("cycle_count", 0)
-                status["health_state"] = health.get("state", "unknown")
-            except Exception:
-                status["last_cycle"] = None
-                status["health_state"] = "error"
-        else:
-            status["last_cycle"] = None
-            status["health_state"] = "no_health_file"
-
-        companies_status.append(status)
-
-    print(f"📦 准备上报 {len(companies_status)} 个公司保活状态:")
-    for s in companies_status:
-        alive = "✅" if s["keepalive_alive"] else "❌"
-        login = "✅" if s["is_logged_in"] else "❌"
-        print(f"  {alive} {s['company_name']}: keepalive={'alive' if s['keepalive_alive'] else 'dead'} login={login}")
-
-    async def _do_report():
-        url = cloud_ws_url.replace("ws://", "").replace("wss://", "").replace("http://", "").replace("https://", "")
-        if "/" in url:
-            host_part, path = url.split("/", 1)
-            path = "/" + path
-        else:
-            host_part, path = url, "/"
-        if ":" in host_part:
-            host, port_str = host_part.rsplit(":", 1)
-            port = int(port_str)
-        else:
-            host, port = host_part, 80
-
-        reader, writer = await asyncio.open_connection(host, port)
-
-        ws_key = os.urandom(16)
-        ws_key_b64 = __import__('base64').b64encode(ws_key).decode('ascii')
-        request = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {host}:{port}\r\n"
-            f"Upgrade: websocket\r\n"
-            f"Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {ws_key_b64}\r\n"
-            f"Sec-WebSocket-Version: 13\r\n"
-            f"\r\n"
-        )
-        writer.write(request.encode())
-        await writer.drain()
-
-        response = b""
-        while b"\r\n\r\n" not in response:
-            chunk = await reader.read(1024)
-            if not chunk:
-                print("❌ WebSocket 握手失败")
-                return
-            response += chunk
-
-        if b"101" not in response:
-            first_line = response.split(b'\r\n')[0].decode()
-            print(f"❌ WebSocket 握手失败: {first_line}")
-            return
-        print("✅ WebSocket 已连接")
-
-        # Build and send keepalive_status messages — one per company
-        hostname = socket.gethostname()
-        for cs in companies_status:
-            msg = {
-                "type": "keepalive_status",
-                "company_name": cs["company_name"],
-                "node_id": node_id,
-                "hostname": hostname,
-                "is_logged_in": cs["is_logged_in"],
-                "keepalive_alive": cs["keepalive_alive"],
-                "last_cycle": cs.get("last_cycle"),
-                "health_state": cs.get("health_state"),
-            }
-            payload = json.dumps(msg, ensure_ascii=False).encode("utf-8")
-
-            frame = bytearray()
-            frame.append(0x81)
-            length = len(payload)
-            if length < 126:
-                frame.append(length | 0x80)
-            elif length < 65536:
-                frame.append(126 | 0x80)
-                frame.extend(length.to_bytes(2, "big"))
-            else:
-                frame.append(127 | 0x80)
-                frame.extend(length.to_bytes(8, "big"))
-            mask_key = os.urandom(4)
-            frame.extend(mask_key)
-            masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
-            frame.extend(masked)
-            writer.write(bytes(frame))
-            await writer.drain()
-
-            print(f"  📤 保活状态已上报: {cs['company_name']}")
-
-        # Graceful close
-        close_frame = bytearray([0x88, 0x80, 0, 0, 0, 0])
-        writer.write(bytes(close_frame))
-        await writer.drain()
-        writer.close()
-
-    loop = asyncio.new_event_loop()
-    try:
-        loop.run_until_complete(_do_report())
-        print("✅ 上报完成")
-    except Exception as e:
-        print(f"❌ 上报失败: {e}")
-        sys.exit(1)
-    finally:
-        loop.close()
-
-
 # ── WebSocket Client ────────────────────────────────────────────
 
 class NodeAgent:
@@ -486,23 +125,17 @@ class NodeAgent:
         self._heartbeat_task = None
         self._keepalive_task = None
         self._sync_task = None
-        self._sync_interval = SYNC_INTERVAL  # 可由控制台 register_ack 下发覆盖
         self._company_sessions = set()  # company IDs with active sessions
-        self.hostname = socket.gethostname()  # 设备主机名，上报时携带
-        # 心跳数据采集缓存
-        self._device_config = None          # 设备配置（静态，首次采集后缓存）
-        self._prev_cpu_stat = None          # 上次 /proc/stat 读数，用于计算 CPU%
-        self._prev_proc_cpu = {}            # {pid: (utime+stime, timestamp)} 进程 CPU 基线
+        self._register_event = asyncio.Event()  # 建联确认
+        self._writer = None  # WS writer for sending
+        self.bridge = None   # SessionBridge — initialized after register_ack
 
     async def start(self):
         """Connect to cloud server and run main loop."""
         self._running = True
         print(f"[node_agent] {self.node_id} 启动, 控制台: {self.cloud_ws_url}")
 
-        # Start periodic tasks
-        self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
-        self._keepalive_task = asyncio.ensure_future(self._keepalive_report_loop())
-        self._sync_task = asyncio.ensure_future(self._periodic_sync_loop())
+        # Periodic tasks will be started AFTER register_ack is received
 
         # Main WebSocket connection loop
         while self._running:
@@ -510,6 +143,7 @@ class NodeAgent:
                 await self._connect_ws()
             except Exception as e:
                 print(f"[node_agent] WebSocket 错误: {e}, {WEBSOCKET_RECONNECT_DELAY}s 后重连...")
+                self._register_event.clear()  # reset for reconnection
                 await asyncio.sleep(WEBSOCKET_RECONNECT_DELAY)
 
     async def stop(self):
@@ -538,7 +172,7 @@ class NodeAgent:
     async def _connect_ws_native(self):
         """Native asyncio WebSocket fallback."""
         # Parse URL
-        url = self.cloud_ws_url.replace("ws://", "").replace("wss://", "").replace("http://", "").replace("https://", "")
+        url = self.cloud_ws_url.replace("ws://", "").replace("wss://", "")
         if "/" in url:
             host_part, path = url.split("/", 1)
             path = "/" + path
@@ -586,52 +220,66 @@ class NodeAgent:
 
         print(f"[node_agent] WS 已连接 (native)")
 
-        # Send register with device specs
-        device = self._gather_device_config()
+        # Save writer for sending
+        self._writer = writer
+
+        # ── Gather keepalive services ──
+        keepalive_services = self._detect_keepalive_services()
+
+        # Send register
+        hostname = socket.gethostname()
         await self._ws_send_native(writer, {
             "type": "register",
             "node_id": self.node_id,
-            "hostname": self.hostname,
+            "node_name": self.node_id,
+            "hostname": hostname,
             "max_concurrency": 15,
-            "cpu_model": device.get("cpu_model", "unknown"),
-            "cpu_cores": device.get("cpu_cores", 1),
-            "memory_total_gb": device.get("memory_total_gb", 0),
+            "memory_total_gb": 4,
+            "cpu_cores": os.cpu_count() or 4,
+            "keepalive_services": keepalive_services,
         })
 
-        # ── 等待 register_ack（必须收到控制台回复才算连接成功）──
-        try:
-            while True:
-                msg = await asyncio.wait_for(
-                    self._ws_recv_native(reader), timeout=REGISTER_TIMEOUT)
-                if msg is None:
-                    print("[node_agent] WS 连接在等待注册确认时关闭")
-                    writer.close()
-                    return
-                if msg.get("type") == "register_ack":
-                    # 解析控制台下发的同步频率
-                    sync_interval = msg.get("sync_interval")
-                    if sync_interval and isinstance(sync_interval, (int, float)) and sync_interval > 0:
-                        self._sync_interval = int(sync_interval)
-                        print(f"[node_agent] 控制台下发同步频率: {self._sync_interval}s")
-                    print(f"[node_agent] 注册确认: {msg.get('message', 'OK')}")
+        # Start read loop first (so we can receive register_ack)
+        print(f"[node_agent] 等待建联确认 (register_ack)...")
+
+        async def _read_and_handle():
+            """Read loop: receive messages and dispatch."""
+            while self._running:
+                try:
+                    msg = await self._ws_recv_native(reader)
+                    if msg is None:
+                        break
+                    # register_ack is handled inline to set the event
+                    if msg.get("type") == "register_ack":
+                        print(f"[node_agent] 注册确认: {msg.get('message', 'OK')}")
+                        if not self._register_event.is_set():
+                            self._register_event.set()
+                            self._start_periodic_loops()
+                    else:
+                        try:
+                            await self._handle_message(msg)
+                        except Exception as e:
+                            print(f"[node_agent] 消息处理异常 ({msg.get('type')}): {e}")
+                except Exception as e:
+                    print(f"[node_agent] 读取错误: {e}")
                     break
-                else:
-                    print(f"[node_agent] 注册期间收到非预期消息: {msg.get('type')}")
+
+        # Wait for register_ack with timeout
+        read_task = asyncio.ensure_future(_read_and_handle())
+        try:
+            await asyncio.wait_for(self._register_event.wait(), timeout=30)
+            print(f"[node_agent] 建联确认成功")
         except asyncio.TimeoutError:
-            print(f"[node_agent] 注册超时({REGISTER_TIMEOUT}s)，未收到 register_ack")
+            print(f"[node_agent] 建联确认超时 (30s), 将重连...")
+            read_task.cancel()
             writer.close()
             return
 
-        # Read loop
-        while self._running:
-            try:
-                msg = await self._ws_recv_native(reader)
-                if msg is None:
-                    break
-                await self._handle_message(msg)
-            except Exception as e:
-                print(f"[node_agent] 读取错误: {e}")
-                break
+        # Main loop: just wait for read task
+        try:
+            await read_task
+        except asyncio.CancelledError:
+            pass
 
         writer.close()
 
@@ -701,11 +349,68 @@ class NodeAgent:
 
     def _ws_send(self, msg):
         """Send a message via WebSocket (thread-safe)."""
-        if self.ws and hasattr(self.ws, 'send'):
+        try:
+            if self._writer is not None:
+                loop = asyncio.get_event_loop()
+                # call_soon_threadsafe works from any thread
+                loop.call_soon_threadsafe(
+                    lambda m=msg: asyncio.ensure_future(
+                        self._ws_send_native(self._writer, m)
+                    )
+                )
+        except RuntimeError:
+            # No event loop in this thread — fall back to direct send
             try:
-                self.ws.send(json.dumps(msg, ensure_ascii=False))
+                if self._running and self._writer is not None:
+                    payload = json.dumps(msg, ensure_ascii=False).encode("utf-8")
+                    frame = bytearray()
+                    frame.append(0x81)
+                    length = len(payload)
+                    if length < 126:
+                        frame.append(length | 0x80)
+                    elif length < 65536:
+                        frame.append(126 | 0x80)
+                        frame.extend(length.to_bytes(2, "big"))
+                    else:
+                        frame.append(127 | 0x80)
+                        frame.extend(length.to_bytes(8, "big"))
+                    mask_key = os.urandom(4)
+                    frame.extend(mask_key)
+                    frame.extend(bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload)))
+                    self._writer.write(bytes(frame))
             except Exception as e:
                 print(f"[node_agent] 发送失败: {e}")
+        except Exception as e:
+            print(f"[node_agent] 发送失败: {e}")
+
+    def _detect_keepalive_services(self):
+        """Detect which keepalive services are installed on this device."""
+        import glob
+        services = []
+        # Check systemd user services
+        service_dir = os.path.expanduser("~/.config/systemd/user")
+        if os.path.isdir(service_dir):
+            for path in glob.glob(os.path.join(service_dir, "keepalive-watchdog-profile_*.service")):
+                svc = os.path.basename(path).replace(".service", "")
+                services.append(svc)
+        return services
+
+    def _start_periodic_loops(self):
+        """Start heartbeat, keepalive, and sync loops after register_ack."""
+        if not self._heartbeat_task or self._heartbeat_task.cancelled():
+            self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
+        if not self._keepalive_task or self._keepalive_task.cancelled():
+            self._keepalive_task = asyncio.ensure_future(self._keepalive_report_loop())
+        if not self._sync_task or self._sync_task.cancelled():
+            self._sync_task = asyncio.ensure_future(self._periodic_sync_loop())
+
+        # Initialize SessionBridge
+        self.bridge = SessionBridge(ws_send=self._ws_send, claude_path=CLAUDE_PATH)
+
+        # Start reporting schedule checker
+        import threading
+        t = threading.Thread(target=self._reporting_schedule_check_loop, daemon=True)
+        t.start()
 
     # ── Message Handler ─────────────────────────────────────
 
@@ -715,11 +420,8 @@ class NodeAgent:
         print(f"[node_agent] 收到: {msg_type}")
 
         if msg_type == "register_ack":
-            sync_interval = msg.get("sync_interval")
-            if sync_interval and isinstance(sync_interval, (int, float)) and sync_interval > 0:
-                self._sync_interval = int(sync_interval)
-                print(f"[node_agent] 控制台下发同步频率: {self._sync_interval}s")
             print(f"[node_agent] 注册确认: {msg.get('message', 'OK')}")
+            self._register_event.set()
 
         elif msg_type == "assign_task":
             await self._handle_assign_task(msg)
@@ -736,12 +438,43 @@ class NodeAgent:
         elif msg_type == "trigger_login":
             await self._handle_trigger_login(msg)
 
+        elif msg_type == "start_keepalive_login":
+            await self._handle_start_keepalive_login(msg)
+
         elif msg_type == "trigger_sync":
             asyncio.ensure_future(self._run_sync())
+
+        elif msg_type == "reporting_schedule_config":
+            self._handle_reporting_schedule_config(msg)
 
         elif msg_type == "sync_ack":
             status = msg.get("ok") and "成功" or "失败"
             print(f"[node_agent] 同步{status}: {msg.get('stats', '')}")
+
+        # ── Session bridge messages ──
+        elif msg_type == "session_create":
+            if self.bridge:
+                await self.bridge.create(
+                    session_id=msg.get("session_id", ""),
+                    prompt=msg.get("prompt", ""),
+                    filter_mode=msg.get("filter_mode", "text_only"),
+                    markers=msg.get("markers"),
+                )
+
+        elif msg_type == "session_message":
+            if self.bridge:
+                await self.bridge.send(
+                    session_id=msg.get("session_id", ""),
+                    text=msg.get("text", ""),
+                )
+
+        elif msg_type == "session_cancel":
+            if self.bridge:
+                await self.bridge.cancel(msg.get("session_id", ""))
+
+        elif msg_type == "session_list":
+            if self.bridge:
+                self.bridge.list_sessions()
 
     async def _handle_assign_task(self, msg):
         """Spawn a Claude Code subprocess to run the query."""
@@ -756,10 +489,10 @@ class NodeAgent:
         prompt = f"查询{company_name}的车辆违章，省份{province}"
         try:
             proc = subprocess.Popen(
-                [CLAUDE_PATH, "--session", session_id, "--prompt", prompt],
+                [CLAUDE_PATH, "-p", prompt],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                universal_newlines=True,
                 bufsize=1,
             )
         except FileNotFoundError:
@@ -861,10 +594,10 @@ class NodeAgent:
 
         try:
             proc = subprocess.Popen(
-                [CLAUDE_PATH, "--session", session_id, "--prompt", prompt],
+                [CLAUDE_PATH, "-p", prompt],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                universal_newlines=True,
                 bufsize=1,
             )
         except FileNotFoundError:
@@ -914,6 +647,151 @@ class NodeAgent:
 
         t = threading.Thread(target=_monitor_qr, daemon=True)
         t.start()
+
+    async def _handle_start_keepalive_login(self, msg):
+        """Handle start_keepalive_login — 激活保活服务登录（路径A）。"""
+        company_name = msg.get("company_name", "")
+        profile_name = msg.get("profile_name", "")
+        instance_port = msg.get("instance_port")
+
+        print(f"[node_agent] 保活登录: {company_name} (profile={profile_name})")
+
+        # Determine service name
+        svc_name = None
+        if profile_name:
+            svc_name = profile_name.replace("profile_", "keepalive-watchdog-profile_")
+
+        # Try systemctl first
+        started = False
+        if svc_name:
+            try:
+                r = subprocess.run(
+                    ["systemctl", "--user", "restart", svc_name],
+                    capture_output=True, text=True, timeout=15
+                )
+                if r.returncode == 0:
+                    started = True
+                    print(f"[node_agent] systemctl restart {svc_name} 成功")
+            except Exception as e:
+                print(f"[node_agent] systemctl 失败: {e}")
+
+        # Fallback: spawn directly
+        if not started:
+            skill_dir = os.path.dirname(os.path.abspath(__file__))
+            daemon_path = os.path.join(skill_dir, "keepalive_daemon.py")
+            if os.path.exists(daemon_path):
+                try:
+                    cmd = [sys.executable, daemon_path, company_name,
+                           "--auto-recover", "--no-daemon"]
+                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                    started = True
+                    print(f"[node_agent] 直接 spawn keepalive_daemon: {company_name}")
+                except Exception as e:
+                    print(f"[node_agent] spawn 失败: {e}")
+
+        if not started:
+            self._ws_send({
+                "type": "keepalive_login_result",
+                "company_name": company_name,
+                "ok": False,
+                "reason": "service_not_found",
+            })
+            return
+
+        # Start polling health file in background
+        asyncio.ensure_future(self._poll_keepalive_progress(company_name))
+
+    async def _poll_keepalive_progress(self, company_name):
+        """轮询 health file，上报保活登录进度。"""
+        from lib.core import _get_data_dir
+        health_file = os.path.join(_get_data_dir(),
+                                   f"keepalive_health_{company_name}.json")
+
+        last_progress = None
+        timeout = 600  # 10 分钟超时
+        start = time.time()
+
+        while time.time() - start < timeout:
+            await asyncio.sleep(3)
+
+            if not os.path.exists(health_file):
+                continue
+
+            try:
+                with open(health_file, "r") as f:
+                    health = json.load(f)
+            except Exception:
+                continue
+
+            state = health.get("state", "")
+            progress = health.get("progress", state)
+
+            if progress != last_progress:
+                last_progress = progress
+                self._ws_send({
+                    "type": "keepalive_login_progress",
+                    "company_name": company_name,
+                    "progress": progress,
+                    "state": state,
+                    "last_check": health.get("last_check", ""),
+                })
+
+            # Check terminal states
+            if state == "ok" and progress == "logged_in":
+                self._ws_send({
+                    "type": "keepalive_login_result",
+                    "company_name": company_name,
+                    "ok": True,
+                })
+                return
+
+            if state == "login_expired" or state == "exited":
+                self._ws_send({
+                    "type": "keepalive_login_result",
+                    "company_name": company_name,
+                    "ok": False,
+                    "reason": state,
+                })
+                return
+
+        # Timeout
+        self._ws_send({
+            "type": "keepalive_login_result",
+            "company_name": company_name,
+            "ok": False,
+            "reason": "timeout",
+        })
+
+    def _handle_reporting_schedule_config(self, msg):
+        """Handle reporting schedule config from cloud server."""
+        schedules = msg.get("schedules", [])
+        self._reporting_schedules = schedules
+        print(f"[node_agent] 收到定时上报配置: {len(schedules)} 个计划")
+
+    def _reporting_schedule_check_loop(self):
+        """Check every 30s if any schedule time matches current time."""
+        while self._running:
+            time.sleep(30)
+            schedules = getattr(self, '_reporting_schedules', [])
+            if not schedules:
+                continue
+
+            now = datetime.now()
+            current_time = now.strftime("%H:%M")
+
+            for sched in schedules:
+                if not sched.get("enabled"):
+                    continue
+                times = sched.get("times", [])
+                if isinstance(times, str):
+                    try:
+                        times = json.loads(times)
+                    except Exception:
+                        continue
+                if current_time in times:
+                    print(f"[node_agent] 定时上报触发: {current_time}")
+                    asyncio.ensure_future(self._run_sync())
 
     # ── Process Output ────────────────────────────────────────
 
@@ -1016,10 +894,8 @@ class NodeAgent:
 
         self._ws_send({
             "type": "sync_data",
-            "company_name": company_name,
-            "node_id": self.node_id,
-            "hostname": self.hostname,
             "task_id": task_id,
+            "node_id": self.node_id,
             "companies": result["companies"],
             "vehicles": result["vehicles"],
             "violations": result["violations"],
@@ -1043,514 +919,156 @@ class NodeAgent:
             await self._sync_company(name)
             await asyncio.sleep(5)  # throttle
 
-    # ── Heartbeat Data Gather ─────────────────────────────────
+    # ── Periodic Loops ────────────────────────────────────────
 
-    def _gather_device_config(self):
-        """Gather static device configuration (cached after first call)."""
-        if self._device_config is not None:
-            return self._device_config
-        config = {}
-        try:
-            config["cpu_cores"] = os.cpu_count() or 1
-            with open("/proc/cpuinfo", "r") as f:
-                for line in f:
-                    if line.startswith("model name"):
-                        config["cpu_model"] = line.split(":")[1].strip()
-                        break
-            if "cpu_model" not in config:
-                config["cpu_model"] = "unknown"
-        except Exception:
-            config["cpu_model"] = "unknown"
-            config["cpu_cores"] = os.cpu_count() or 1
-        try:
-            mem_total_kb = 0
-            with open("/proc/meminfo", "r") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        mem_total_kb = int(line.split()[1])
-                        break
-            config["memory_total_gb"] = round(mem_total_kb / (1024 * 1024), 2)
-        except Exception:
-            config["memory_total_gb"] = 0
-        self._device_config = config
-        return config
+    async def _heartbeat_loop(self):
+        """Send heartbeat every HEARTBEAT_INTERVAL seconds."""
+        while self._running:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            metrics = self._get_system_metrics()
+            proc_count = len(metrics.get("important_processes", []))
+            print(f"[node_agent] heartbeat: cpu={metrics.get('cpu_percent')}% mem={metrics.get('memory_percent')}% processes={metrics.get('process_count')} important={proc_count}")
+            self._ws_send({
+                "type": "heartbeat",
+                "node_id": self.node_id,
+                "active_sessions": len(self._tasks),
+                **metrics,
+            })
 
-    def _read_cpu_stat(self):
-        """Read /proc/stat first line, return dict of cpu times."""
+    def _get_system_metrics(self):
+        """Collect system resource metrics. Uses psutil if available, falls back to /proc."""
         try:
-            with open("/proc/stat", "r") as f:
-                parts = f.readline().split()
-            if parts[0] != "cpu":
-                return None
+            import psutil
+            cpu = psutil.cpu_percent(interval=1)
+            cpu_count = psutil.cpu_count()
+            mem = psutil.virtual_memory()
+            disk = psutil.disk_usage('/')
+            net = psutil.net_io_counters()
+            uptime = int(time.time() - psutil.boot_time())
+            proc_count = len(psutil.pids())
             return {
-                "user": int(parts[1]), "nice": int(parts[2]),
-                "system": int(parts[3]), "idle": int(parts[4]),
-                "iowait": int(parts[5]) if len(parts) > 5 else 0,
-                "irq": int(parts[6]) if len(parts) > 6 else 0,
-                "softirq": int(parts[7]) if len(parts) > 7 else 0,
-                "steal": int(parts[8]) if len(parts) > 8 else 0,
+                "cpu_percent": round(cpu, 2),
+                "cpu_count": cpu_count,
+                "memory_total_gb": round(mem.total / (1024**3), 2),
+                "memory_used_gb": round(mem.used / (1024**3), 2),
+                "memory_percent": round(mem.percent, 2),
+                "disk_total_gb": round(disk.total / (1024**3), 2),
+                "disk_used_gb": round(disk.used / (1024**3), 2),
+                "disk_percent": round(disk.percent, 2),
+                "net_bytes_sent_mb": round(net.bytes_sent / (1024**2), 2),
+                "net_bytes_recv_mb": round(net.bytes_recv / (1024**2), 2),
+                "uptime_seconds": uptime,
+                "process_count": proc_count,
+                "processes": self._get_important_processes(),
             }
-        except Exception:
-            return None
-
-    def _gather_system_usage(self):
-        """Gather total system CPU% and memory usage."""
-        result = {"cpu_percent": 0.0, "memory_percent": 0.0,
-                   "memory_used_gb": 0.0, "memory_total_gb": 0.0}
-        # CPU
-        curr = self._read_cpu_stat()
-        if curr and self._prev_cpu_stat:
-            prev_total = sum(self._prev_cpu_stat.values())
-            curr_total = sum(curr.values())
-            total_delta = curr_total - prev_total
-            if total_delta > 0:
-                idle_delta = curr["idle"] - self._prev_cpu_stat["idle"]
-                result["cpu_percent"] = round(
-                    100.0 * (total_delta - idle_delta) / total_delta, 1)
-        if curr:
-            self._prev_cpu_stat = curr
-        # Memory
-        try:
-            mem_total = 0; mem_avail = 0
-            with open("/proc/meminfo", "r") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        mem_total = int(line.split()[1])
-                    elif line.startswith("MemAvailable:"):
-                        mem_avail = int(line.split()[1])
-                    if mem_total and mem_avail:
-                        break
-            if mem_total > 0:
-                result["memory_total_gb"] = round(mem_total / (1024 * 1024), 2)
-                result["memory_used_gb"] = round((mem_total - mem_avail) / (1024 * 1024), 2)
-                result["memory_percent"] = round(
-                    100.0 * (mem_total - mem_avail) / mem_total, 1)
-        except Exception:
-            pass
-        return result
-
-    def _get_proc_cpu_mem(self, pid):
-        """Get CPU% (since last call) and RSS (MB) for a process. Returns (cpu_pct, mem_mb)."""
-        cpu_pct = 0.0
-        mem_mb = 0.0
-        try:
-            with open(f"/proc/{pid}/stat", "r") as f:
-                stat_parts = f.read().split()
-            # field 14=utime, 15=stime (1-indexed)
-            utime = int(stat_parts[13])
-            stime = int(stat_parts[14])
-            now = time.time()
-            key = str(pid)
-            if key in self._prev_proc_cpu:
-                prev_total, prev_ts = self._prev_proc_cpu[key]
-                delta_t = now - prev_ts
-                if delta_t > 0:
-                    cpu_pct = round(100.0 * (utime + stime - prev_total) /
-                                    (delta_t * os.sysconf('SC_CLK_TCK')), 1)
-            self._prev_proc_cpu[key] = (utime + stime, now)
-        except Exception:
-            pass
-        try:
-            with open(f"/proc/{pid}/status", "r") as f:
-                for line in f:
-                    if line.startswith("VmRSS:"):
-                        mem_mb = round(int(line.split()[1]) / 1024, 1)
-                        break
-        except Exception:
-            pass
-        return (cpu_pct, mem_mb)
-
-    def _gather_browser_usage(self):
-        """Gather Chrome browser instances, tabs, CPU, and memory usage."""
-        instances = []
-        seen_ports = set()
-        try:
-            # Find chromium processes and extract debug ports
-            for entry in os.listdir("/proc"):
-                if not entry.isdigit():
-                    continue
-                try:
-                    with open(f"/proc/{entry}/cmdline", "rb") as f:
-                        cmdline = f.read().replace(b'\0', b' ').decode('utf-8', errors='replace')
-                except Exception:
-                    continue
-                if "chromium-browser" not in cmdline and "chrome" not in cmdline.lower():
-                    continue
-                # Extract --remote-debugging-port
-                port = None
-                profile = "unknown"
-                parts = cmdline.split()
-                for i, p in enumerate(parts):
-                    if p.startswith("--remote-debugging-port="):
-                        port = p.split("=")[1]
-                    if p.startswith("--user-data-dir="):
-                        profile = p.split("=")[1].split("/")[-1]
-                if not port or port in seen_ports:
-                    continue
-                seen_ports.add(port)
-                pid = int(entry)
-                cpu_pct, mem_mb = self._get_proc_cpu_mem(pid)
-                # Get tabs via Chrome DevTools Protocol /json endpoint
-                tabs = []
-                tab_count = 0
-                try:
-                    import urllib.request
-                    req = urllib.request.urlopen(
-                        f"http://127.0.0.1:{port}/json", timeout=5)
-                    tab_list = json.loads(req.read().decode("utf-8"))
-                    tab_count = len(tab_list)
-                    for t in tab_list:
-                        tabs.append({
-                            "id": t.get("id", "")[:16],
-                            "title": (t.get("title", "") or "")[:60],
-                            "url": (t.get("url", "") or "")[:120],
-                        })
-                except Exception:
-                    pass
-                instances.append({
-                    "profile": profile,
-                    "debug_port": int(port),
-                    "cpu_percent": cpu_pct,
-                    "memory_mb": mem_mb,
-                    "tab_count": tab_count,
-                    "tabs": tabs,
-                })
-        except Exception:
-            pass
-        total_cpu = round(sum(i["cpu_percent"] for i in instances), 1)
-        total_mem = round(sum(i["memory_mb"] for i in instances), 1)
-        return {"instances": instances, "total_cpu_percent": total_cpu,
-                "total_memory_mb": total_mem}
-
-    def _gather_service_status(self):
-        """Gather all skill services with status and resource usage.
-
-        设计原则：
-        - 固定清单（FIXED_SERVICES）：已知的 systemd 服务，无论是否运行都必须上报
-        - 动态发现（DYNAMIC）：运行时扫描 /proc 发现的临时任务进程
-
-        当前技能全部进程/服务清单：
-        ┌─────────────────────────────────────────────────────┐
-        │ 类型        │ 服务/脚本                  │ 上报方式 │
-        ├─────────────────────────────────────────────────────┤
-        │ 通信服务    │ dst-node-agent.service     │ 固定     │
-        │ 浏览器服务  │ pinchtab.service           │ 固定     │
-        │ 保活看门狗  │ keepalive-watchdog-*.timer │ 固定     │
-        │ 保活服务    │ keepalive-*.service        │ 固定     │
-        │ 清理服务    │ cleanup-dst.timer          │ 固定     │
-        │ 查询服务    │ scan_vehicles.py           │ 动态     │
-        │ 查询服务    │ collect_violations.py      │ 动态     │
-        └─────────────────────────────────────────────────────┘
-
-        辅助脚本（不独立运行，无需上报）：
-        - cookie_persist.py → pinchtab drop-in 触发
-        - session_manager.py / tab_session.py → 库模块
-        - pinchtab_client.py → 库模块
-        - violation_helper.py → CLI 调度入口
-        - _split_helper.py → 一次性工具
-        """
-        services = []
-
-        # ── 辅助函数 ──
-
-        def _read_proc_cmdline(pid):
-            """Read /proc/<pid>/cmdline, return clean arg list (no truncation)."""
+        except ImportError:
+            # Fallback: /proc filesystem
+            metrics = {"cpu_percent": 0, "cpu_count": os.cpu_count() or 1,
+                       "memory_total_gb": 0, "memory_used_gb": 0, "memory_percent": 0,
+                       "disk_total_gb": 0, "disk_used_gb": 0, "disk_percent": 0,
+                       "net_bytes_sent_mb": 0, "net_bytes_recv_mb": 0,
+                       "uptime_seconds": 0, "process_count": 0,
+                       "important_processes": self._get_important_processes()}
             try:
-                with open(f"/proc/{pid}/cmdline", "rb") as f:
-                    raw = f.read()
-                return [a.decode("utf-8", errors="replace") for a in raw.split(b'\0') if a]
-            except Exception:
-                return []
-
-        def _extract_company(args):
-            """Extract --company value from cmdline args, clean quotes/escapes."""
-            for i, a in enumerate(args):
-                if a == "--company" and i + 1 < len(args):
-                    return args[i + 1].strip().strip('"').strip("'").strip()[:60]
-            return ""
-
-        def _systemctl(unit, user=True):
-            """Run systemctl is-active, return status string."""
-            try:
-                cmd = ["systemctl", "--user", "is-active", unit, "--no-pager"] if user else \
-                      ["systemctl", "is-active", unit, "--no-pager"]
-                r = subprocess.run(cmd, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, encoding='utf-8', timeout=5)
-                return r.stdout.strip()
-            except Exception:
-                return "unknown"
-
-        def _make_svc(name, unit, pid=None, company=None):
-            """Build a service entry dict."""
-            cpu_pct, mem_mb = 0.0, 0.0
-            if pid:
-                cpu_pct, mem_mb = self._get_proc_cpu_mem(pid)
-            svc = {"name": name, "unit": unit,
-                   "status": _systemctl(unit, user=(unit != "dst-node-agent.service")),
-                   "pid": pid, "cpu_percent": cpu_pct, "memory_mb": mem_mb}
-            if company:
-                svc["company"] = company
-            return svc
-
-        def _find_pid_by_cmdline(match_fn):
-            """Find PID by scanning /proc/*/cmdline with a match function."""
-            try:
-                for entry in os.listdir("/proc"):
-                    if not entry.isdigit():
-                        continue
-                    args = _read_proc_cmdline(entry)
-                    if args and match_fn(args):
-                        return int(entry), args
+                with open('/proc/meminfo') as f:
+                    meminfo = {}
+                    for line in f:
+                        parts = line.split(':')
+                        if len(parts) == 2:
+                            meminfo[parts[0].strip()] = int(parts[1].strip().split()[0])
+                total = meminfo.get('MemTotal', 0)
+                avail = meminfo.get('MemAvailable', 0)
+                if total > 0:
+                    metrics['memory_total_gb'] = round(total / (1024**2), 2)
+                    metrics['memory_used_gb'] = round((total - avail) / (1024**2), 2)
+                    metrics['memory_percent'] = round((total - avail) / total * 100, 2)
             except Exception:
                 pass
-            return None, []
-
-        # ── 构建全量 unit 列表（一次 systemctl 查询 service + timer）──
-        all_units = {}  # unit_name → line
-        for args in [
-            ["systemctl", "--user", "list-units", "--type=service",
-             "--no-pager", "--no-legend"],
-            ["systemctl", "--user", "list-units", "--type=timer",
-             "--no-pager", "--no-legend"],
-            ["systemctl", "list-units", "--type=service",
-             "--no-pager", "--no-legend"],
-        ]:
             try:
-                r = subprocess.run(args, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, encoding='utf-8', timeout=5)
-                for line in r.stdout.split('\n'):
-                    if not line.strip():
-                        continue
-                    unit = line.split()[0]
-                    if unit not in all_units:
-                        all_units[unit] = line
+                with open('/proc/loadavg') as f:
+                    metrics['cpu_percent'] = round(float(f.read().split()[0]) * 100 / metrics['cpu_count'], 2)
             except Exception:
                 pass
+            try:
+                metrics['uptime_seconds'] = int(float(open('/proc/uptime').read().split()[0]))
+            except Exception:
+                pass
+            try:
+                metrics['process_count'] = len([d for d in os.listdir('/proc') if d.isdigit()])
+            except Exception:
+                pass
+            return metrics
 
-        # ── 固定清单 ──
-
-        # 1. 通信服务 — dst-node-agent (system service)
-        pid, _ = _find_pid_by_cmdline(
-            lambda args: any("node_agent.py" in a for a in args))
-        services.append(_make_svc("通信服务", "dst-node-agent.service", pid))
-
-        # 2. 浏览器服务 — pinchtab
-        chrome_pid = None
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
-                continue
-            args = _read_proc_cmdline(entry)
-            cmd0 = args[0] if args else ""
-            if ("chrome" in cmd0.lower() or "chromium" in cmd0.lower()) and not any(
-                    a.startswith("--type=") for a in args):
-                chrome_pid = int(entry)
-                break
-        services.append(_make_svc("浏览器服务", "pinchtab.service", chrome_pid))
-
-        # 3. 保活看门狗 — keepalive-watchdog-* (oneshot timer, per company)
-        #    看门狗是 oneshot service + timer，状态以 timer 为准
-        #    同时查 service 和 timer（可能只安装了其中一种）
-        wd_timers = sorted(
-            [u for u in all_units if u.startswith("keepalive-watchdog-") and u.endswith(".timer")])
-        wd_services = sorted(
-            [u for u in all_units if u.startswith("keepalive-watchdog-") and u.endswith(".service")])
-        wd_units = wd_timers if wd_timers else wd_services
-
-        if not wd_units:
-            services.append({
-                "name": "保活看门狗", "unit": "keepalive-watchdog-*.timer",
-                "status": "not-installed",
-                "pid": None, "cpu_percent": 0.0, "memory_mb": 0.0,
-            })
-        else:
-            for unit in wd_units:
-                # 从 unit description 或看门狗脚本参数中提取公司名
-                company = ""
-                unit_prefix = unit.replace(".timer", "").replace(".service", "")
-                for entry in os.listdir("/proc"):
-                    if not entry.isdigit():
-                        continue
-                    args = _read_proc_cmdline(entry)
-                    if args and any("keepalive_watchdog.sh" in a for a in args) \
-                       and any(unit_prefix in a for a in args):
-                        company = _extract_company(args) or ""
-                        break
-                svc = _make_svc("保活看门狗", unit, company=company)
-                services.append(svc)
-
-        # 4. 保活服务 — keepalive-* (daemon, per company, exclude watchdog)
-        kp_units = sorted(
-            [u for u in all_units
-             if u.startswith("keepalive-") and not u.startswith("keepalive-watchdog-")])
-        kp_pids = sorted(
-            [int(e) for e in os.listdir("/proc") if e.isdigit()
-             and any("keepalive_daemon.py" in a
-                     for a in _read_proc_cmdline(e))])
-        if not kp_units:
-            services.append({
-                "name": "保活服务", "unit": "keepalive-*.service",
-                "status": "not-installed",
-                "pid": None, "cpu_percent": 0.0, "memory_mb": 0.0,
-            })
-        else:
-            for i, unit in enumerate(kp_units):
-                pid = kp_pids[i] if i < len(kp_pids) else None
-                company = _extract_company(_read_proc_cmdline(pid)) if pid else ""
-                services.append(_make_svc("保活服务", unit, pid, company))
-
-        # 5. 清理服务 — cleanup-dst (oneshot timer)
-        pid, _ = _find_pid_by_cmdline(
-            lambda args: any("cleanup_daemon.py" in a for a in args))
-        svc = _make_svc("清理服务", "cleanup-dst.timer", pid)
-        if "cleanup-dst.timer" in all_units or "cleanup-dst.service" in all_units:
-            svc["status"] = _systemctl("cleanup-dst.timer", user=True)
-        services.append(svc)
-
-        # ── 动态发现：扫描所有 /proc 进程，识别 skill 相关但不在固定清单中的进程 ──
-
-        seen_pids = {s["pid"] for s in services if s.get("pid")}
-
-        # 6. 查询服务 — scan_vehicles / collect_violations
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
-                continue
-            pid = int(entry)
-            if pid in seen_pids:
-                continue
-            args = _read_proc_cmdline(entry)
-            if not args:
-                continue
-            is_scan = any("scan_vehicles.py" in a for a in args)
-            is_collect = any("collect_violations.py" in a for a in args)
-            if not is_scan and not is_collect:
-                continue
-            qtype = "scan" if is_scan else "collect"
-            company = _extract_company(args)
-            cpu_pct, mem_mb = self._get_proc_cpu_mem(pid)
-            services.append({
-                "name": f"查询服务({qtype})", "unit": None,
-                "status": "running", "pid": pid,
-                "cpu_percent": cpu_pct, "memory_mb": mem_mb,
-                "company": company,
-            })
-            seen_pids.add(pid)
-
-        return services
-
-    def _gather_agent_usage(self):
-        """Gather Claude AI agent processes grouped by session (TTY).
-        Only reports active (running) sessions.
+    def _get_important_processes(self):
+        """Collect all running processes with real name and description.
+        Returns a flat list sorted by memory usage (highest first).
         """
-        sessions = []
+        processes = []
+        # Process name → description mapping
+        NAME_MAP = {
+            "node_agent.py": ("节点代理", "WebSocket 守护进程，负责与中央控制台通信"),
+            "keepalive_daemon.py": ("保活服务", "保持 12123 登录态，自动恢复二维码登录"),
+            "claude": ("Claude 会话", "AI 查询引擎，执行违章查询/登录任务"),
+            "pinchtab server": ("PinchTab 服务", "浏览器实例管理主进程"),
+            "pinchtab bridge": ("PinchTab 桥接", "浏览器标签页桥接进程"),
+            "chrome": ("Chrome 浏览器", "PinchTab 管理的浏览器进程"),
+            "session_bridge.py": ("会话桥接", "通用 Claude 会话桥接模块"),
+        }
         try:
-            r = subprocess.run(["ps", "aux"], stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, encoding='utf-8', timeout=5)
-            for line in r.stdout.split('\n'):
-                if "grep" in line:
-                    continue
-                # Match claude main process (not subprocesses like bash/shell)
-                is_claude = False
+            r = subprocess.run(
+                ["ps", "aux", "--sort=-%mem"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                universal_newlines=True, timeout=5
+            )
+            lines = r.stdout.strip().split('\n')
+            for line in lines[1:]:
                 parts = line.split(None, 10)
                 if len(parts) < 11:
                     continue
                 cmd = parts[10]
-                # Match 'claude' as the binary name (not path arguments)
-                cmd_base = parts[10].split()[0] if parts[10].strip() else ""
-                if cmd_base.endswith("/claude") or cmd_base == "claude":
-                    is_claude = True
-                if not is_claude:
-                    # Also match claude in arguments like 'node ... claude ...'
-                    if " claude " not in f" {cmd} " and not cmd.startswith("claude "):
-                        continue
-                    # But exclude: node_agent, keepalive, pinchtab, scan, collect
-                    if any(x in cmd for x in ["node_agent", "keepalive_daemon",
-                                               "scan_vehicles", "collect_violations",
-                                               "cleanup_daemon", "pinchtab"]):
-                        continue
-                try:
-                    pid = int(parts[1])
-                except ValueError:
-                    continue
-                tty = parts[6] if parts[6] != "?" else "bg"
-                cpu_pct_str = parts[2]
-                mem_pct_str = parts[3]
-                try:
-                    cpu_pct_val = float(cpu_pct_str)
-                except ValueError:
-                    cpu_pct_val = 0.0
-                cpu_pct, mem_mb = self._get_proc_cpu_mem(pid)
-                sessions.append({
-                    "session_id": tty,
-                    "pid": pid,
-                    "cpu_percent": cpu_pct,
-                    "memory_mb": mem_mb,
+                cpu = float(parts[2])
+                mem = float(parts[3])
+                rss_mb = round(int(parts[5]) / 1024, 1)
+
+                # Determine process name and description
+                proc_name = cmd.strip().split()[0].split('/')[-1] if cmd.strip() else "unknown"
+                # Try to find a better name from the command
+                desc = ""
+                for pattern, (display_name, display_desc) in NAME_MAP.items():
+                    if pattern in cmd:
+                        proc_name = display_name
+                        desc = display_desc
+                        break
+
+                # For Chrome renderer/GPU/utility processes, unify as "Chrome 浏览器"
+                if "chrome" in proc_name.lower() or "chromium" in proc_name.lower():
+                    proc_name = "Chrome 浏览器"
+                    if not desc:
+                        desc = "PinchTab 管理的浏览器进程"
+
+                processes.append({
+                    "name": proc_name,
+                    "description": desc,
+                    "pid": int(parts[1]),
+                    "cpu_percent": cpu,
+                    "mem_percent": mem,
+                    "rss_mb": rss_mb,
+                    "command": cmd[:200],
                 })
-        except Exception:
-            pass
-        total_cpu = round(sum(s["cpu_percent"] for s in sessions), 1)
-        total_mem = round(sum(s["memory_mb"] for s in sessions), 1)
-        return {"sessions": sessions, "total_cpu_percent": total_cpu,
-                "total_memory_mb": total_mem}
-
-    def _gather_heartbeat_data(self):
-        """Orchestrate all heartbeat data gathering and compute 'other' usage."""
-        device = self._gather_device_config()
-        system = self._gather_system_usage()
-        browser = self._gather_browser_usage()
-        services = self._gather_service_status()
-        agent = self._gather_agent_usage()
-
-        # Calculate "other" = system total - sum of tracked categories
-        svc_total_cpu = sum(s.get("cpu_percent", 0) for s in services)
-        svc_total_mem = sum(s.get("memory_mb", 0) for s in services)
-        tracked_cpu = browser.get("total_cpu_percent", 0) + svc_total_cpu + agent.get("total_cpu_percent", 0)
-        tracked_mem = browser.get("total_memory_mb", 0) + svc_total_mem + agent.get("total_memory_mb", 0)
-        sys_mem_mb = system.get("memory_used_gb", 0) * 1024
-        other_cpu = round(max(0, system.get("cpu_percent", 0) - tracked_cpu), 1)
-        other_mem = round(max(0, sys_mem_mb - tracked_mem), 1)
-
-        return {
-            "device_config": device,
-            "system_usage": system,
-            "browser_usage": browser,
-            "services": services,
-            "agent_usage": agent,
-            "other_usage": {"cpu_percent": other_cpu, "memory_mb": other_mem},
-        }
-
-    # ── Periodic Loops ────────────────────────────────────────
-
-    async def _heartbeat_loop(self):
-        """Send detailed heartbeat every HEARTBEAT_INTERVAL seconds (30s)."""
-        while self._running:
-            await asyncio.sleep(HEARTBEAT_INTERVAL)
-            data = self._gather_heartbeat_data()
-            self._ws_send({
-                "type": "heartbeat",
-                "node_id": self.node_id,
-                "hostname": self.hostname,
-                "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-                "active_sessions": len(self._tasks),
-                **data,
-            })
+        except Exception as e:
+            print("[node_agent] 进程采集失败: {}".format(e))
+        return processes
 
     async def _keepalive_report_loop(self):
-        """Report keepalive status per company every KEEPALIVE_REPORT_INTERVAL (60s).
-        Each message carries company_name as primary field + device info for verification.
-        """
+        """Report keepalive status for all companies every KEEPALIVE_REPORT_INTERVAL."""
         while self._running:
             await asyncio.sleep(KEEPALIVE_REPORT_INTERVAL)
             companies_status = self._gather_keepalive_status()
-            for company in companies_status:
+            if companies_status:
                 self._ws_send({
                     "type": "keepalive_status",
-                    "company_name": company["company_name"],
                     "node_id": self.node_id,
-                    "hostname": self.hostname,
-                    "is_logged_in": company["is_logged_in"],
-                    "keepalive_alive": company["keepalive_alive"],
-                    "last_cycle": company.get("last_cycle"),
-                    "health_state": company.get("health_state"),
+                    "companies": companies_status,
                 })
 
     def _gather_keepalive_status(self):
@@ -1570,19 +1088,15 @@ class NodeAgent:
 
         result = []
         for p in profiles:
-            status = {
-                "company_name": p["company_name"],
-                "profile_name": p.get("profile_name", ""),
-                "is_logged_in": bool(p.get("is_logged_in", 0)),
-            }
+            status = {"name": p["company_name"], "is_logged_in": bool(p.get("is_logged_in", 0))}
 
             # Check keepalive systemd service
-            profile_name = p.get("profile_name", "")
-            service_name = f"keepalive-{profile_name}"
+            profile_name = p.get("profile_name", "").replace("profile_", "")
+            service_name = f"keepalive-watchdog-profile_{profile_name}"
             try:
                 r = subprocess.run(
-                    ["systemctl", "--user", "is-active", service_name],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8', timeout=5
+                    ["systemctl", "is-active", service_name],
+                    capture_output=True, text=True, timeout=5
                 )
                 status["keepalive_alive"] = r.stdout.strip() == "active"
             except Exception:
@@ -1606,11 +1120,10 @@ class NodeAgent:
         return result
 
     async def _periodic_sync_loop(self):
-        """Periodic full sync fallback. Interval defaults to SYNC_INTERVAL (1800s),
-        but can be overridden by register_ack.sync_interval from the control console."""
+        """Periodic full sync fallback every SYNC_INTERVAL seconds."""
         while self._running:
-            await asyncio.sleep(self._sync_interval)
-            print(f"[node_agent] 定时全量同步 (间隔={self._sync_interval}s)...")
+            await asyncio.sleep(SYNC_INTERVAL)
+            print("[node_agent] 定时全量同步...")
             await self._run_sync()
 
 
@@ -1627,12 +1140,6 @@ def main():
             return
         elif cmd == "--help" or cmd == "-h":
             print(__doc__)
-            return
-        elif cmd == "--sync-now":
-            run_sync_now()
-            return
-        elif cmd == "--report-keepalive":
-            run_report_keepalive()
             return
 
     # Start daemon
