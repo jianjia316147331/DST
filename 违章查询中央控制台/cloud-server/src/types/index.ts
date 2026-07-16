@@ -33,6 +33,7 @@ export interface Node {
   memory_total_gb: number | null;
   cpu_cores: number | null;
   last_heartbeat: Date | null;
+  last_sync_at: Date | null;
   created_at: Date;
 }
 
@@ -92,6 +93,60 @@ export interface Schedule {
   created_at: Date;
 }
 
+export interface Vehicle {
+  id: number;
+  company_id: number;
+  node_id: number | null;
+  plate_number: string;
+  plate_type: string;
+  plate_type_label: string;
+  status_code: string;
+  status_label: string;
+  inspection_date: string;
+  unprocessed_count: number;
+  tag: string;
+  tag_batch_id: string;
+  query_date: string;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface Profile {
+  id: number;
+  node_id: number | null;
+  company_name: string;
+  profile_name: string;
+  profile_id: string;
+  platform_url: string;
+  instance_port: number | null;
+  last_login: Date | null;
+  is_logged_in: boolean;
+  created_at: Date;
+}
+
+export interface CompanyNodeBinding {
+  id: number;
+  company_id: number;
+  node_id: number;
+  is_active: boolean;
+  bound_at: Date;
+  unbound_at: Date | null;
+}
+
+export interface SyncLog {
+  id: number;
+  node_id: number;
+  sync_type: 'task_complete' | 'periodic' | 'manual';
+  task_id: number | null;
+  companies: number;
+  vehicles: number;
+  violations_ins: number;
+  violations_upd: number;
+  status: string;
+  error_message: string | null;
+  created_at: Date;
+}
+
 // WebSocket message types
 export type WsMessageType =
   // tray → cloud
@@ -103,9 +158,18 @@ export type WsMessageType =
   | 'task_completed'
   | 'task_failed'
   | 'log'
+  | 'sync_data'
+  | 'sync_ack'
+  | 'keepalive_status'
+  | 'qr_code'
+  | 'qr_expired'
+  | 'login_ok'
+  | 'login_failed'
   // cloud → tray
   | 'assign_task'
   | 'pause_task'
   | 'resume_task'
   | 'terminate_task'
-  | 'update_config';
+  | 'update_config'
+  | 'trigger_login'
+  | 'trigger_sync';

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Table, Button, Modal, Form, Input, Select, Space, Tag, message, Popconfirm } from 'antd';
-import { PlusOutlined, EditOutlined, DeleteOutlined, PlayCircleOutlined } from '@ant-design/icons';
+import { Table, Button, Modal, Form, Input, Select, Space, Tag, message, Popconfirm, Image } from 'antd';
+import { PlusOutlined, EditOutlined, DeleteOutlined, PlayCircleOutlined, QrcodeOutlined } from '@ant-design/icons';
 import api from '../api';
 
 interface Company {
@@ -45,6 +45,14 @@ export default function Companies() {
   const [form] = Form.useForm();
   const [provinceFilter, setProvinceFilter] = useState<string>();
   const [statusFilter, setStatusFilter] = useState<string>();
+  const [nodes, setNodes] = useState<{ id: number; node_name: string; status: string }[]>([]);
+  const [bindings, setBindings] = useState<Record<number, { node_id: number; node_name: string }>>({});
+  const [qrModalOpen, setQrModalOpen] = useState(false);
+  const [qrImage, setQrImage] = useState('');
+  const [qrCompanyName, setQrCompanyName] = useState('');
+  const [loginConfirmOpen, setLoginConfirmOpen] = useState(false);
+  const [loginCompany, setLoginCompany] = useState<Company | null>(null);
+  const [loginLoading, setLoginLoading] = useState(false);
 
   const fetch = (p = page, pf = provinceFilter, sf = statusFilter) => {
     setLoading(true);
@@ -54,6 +62,59 @@ export default function Companies() {
   };
 
   useEffect(() => { fetch(); }, []);
+
+  // Load nodes for binding
+  useEffect(() => {
+    api.get('/api/nodes').then(({ data: d }) => setNodes(d.data || []));
+  }, []);
+
+  // WebSocket for QR code and keepalive
+  useEffect(() => {
+    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws?client=frontend`;
+    const socket = new WebSocket(wsUrl);
+    socket.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'qr_code') {
+          setQrCompanyName(msg.company_name);
+          setQrImage(`data:image/png;base64,${msg.image_base64}`);
+          setQrModalOpen(true);
+        } else if (msg.type === 'login_ok') {
+          message.success(`${msg.company_name} 登录成功`);
+          setQrModalOpen(false);
+          setQrImage('');
+          fetch();
+        } else if (msg.type === 'login_failed') {
+          message.error(`${msg.company_name} 登录失败: ${msg.reason}`);
+        } else if (msg.type === 'keepalive_status') {
+          // Refresh to show updated account_status
+          fetch();
+        }
+      } catch { /* ignore */ }
+    };
+    return () => socket.close();
+  }, []);
+
+  // Step 1: Open login confirm modal
+  const handleLogin = (record: Company) => {
+    setLoginCompany(record);
+    setLoginConfirmOpen(true);
+  };
+
+  // Step 2: Actually trigger login
+  const startLogin = async () => {
+    if (!loginCompany) return;
+    setLoginLoading(true);
+    try {
+      await api.post('/api/sync/trigger-login', { company_name: loginCompany.name, company_id: loginCompany.id });
+      setLoginConfirmOpen(false);
+      message.success(`已向 ${loginCompany.name} 绑定的设备发送扫码登录指令，等待二维码...`);
+    } catch (err: any) {
+      message.error(err?.response?.data?.error || '触发登录失败');
+    } finally {
+      setLoginLoading(false);
+    }
+  };
 
   const openCreate = () => {
     setEditing(null);
@@ -119,13 +180,41 @@ export default function Companies() {
       title: '状态', dataIndex: 'account_status', width: 80,
       render: (s: string) => <Tag color={s === 'online' ? 'green' : 'default'}>{s === 'online' ? '在线' : '离线'}</Tag>,
     },
+    {
+      title: '绑定设备', width: 180,
+      render: (_: unknown, record: Company) => {
+        const binding = bindings[record.id];
+        return (
+          <Select
+            size="small"
+            placeholder="选择设备"
+            style={{ width: 160 }}
+            value={binding?.node_id}
+            onChange={async (nodeId) => {
+              try {
+                await api.put(`/api/companies/${record.id}/bind`, { node_id: nodeId });
+                setBindings(prev => ({ ...prev, [record.id]: { node_id: nodeId, node_name: nodes.find(n => n.id === nodeId)?.node_name || '' } }));
+                message.success('绑定成功');
+              } catch { message.error('绑定失败'); }
+            }}
+            options={nodes.map(n => ({
+              label: `${n.node_name}${n.status === 'online' ? ' ●在线' : ' ○离线'}`,
+              value: n.id,
+            }))}
+          />
+        );
+      },
+    },
     { title: '联系人', dataIndex: 'contact_name', width: 100 },
     { title: '电话', dataIndex: 'contact_phone', width: 130 },
     {
-      title: '操作', width: 200,
+      title: '操作', width: 280,
       render: (_: unknown, record: Company) => (
         <Space>
           <Button size="small" icon={<PlayCircleOutlined />} onClick={() => handleStartQuery(record)}>查询</Button>
+          {record.account_status === 'offline' && (
+            <Button size="small" icon={<QrcodeOutlined />} onClick={() => handleLogin(record)}>登录</Button>
+          )}
           <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(record)} />
           <Popconfirm title="确定删除?" onConfirm={() => handleDelete(record.id)}>
             <Button size="small" danger icon={<DeleteOutlined />} />
@@ -148,6 +237,52 @@ export default function Companies() {
 
       <Table rowKey="id" columns={columns} dataSource={data} loading={loading}
         pagination={{ current: page, total, pageSize: 20, onChange: (p) => { setPage(p); fetch(p); } }} />
+
+      {/* Step 1: Login confirm modal with "开始登录流程" button */}
+      <Modal
+        title={`${loginCompany?.name || ''} - 扫码登录`}
+        open={loginConfirmOpen}
+        onCancel={() => { setLoginConfirmOpen(false); setLoginCompany(null); }}
+        footer={null}
+        width={400}
+      >
+        <div style={{ textAlign: 'center', padding: '20px 0' }}>
+          <p style={{ fontSize: 14, color: '#666', marginBottom: 20 }}>
+            将为 <strong>{loginCompany?.name}</strong> 启动扫码登录流程
+          </p>
+          <p style={{ fontSize: 12, color: '#999', marginBottom: 24 }}>
+            点击下方按钮后，系统将通过绑定的 skill 设备打开登录页面并生成二维码
+          </p>
+          <Button
+            type="primary"
+            size="large"
+            icon={<QrcodeOutlined />}
+            loading={loginLoading}
+            onClick={startLogin}
+            block
+          >
+            开始登录流程
+          </Button>
+        </div>
+      </Modal>
+
+      {/* Step 2: QR code display modal */}
+      <Modal
+        title={`${qrCompanyName} - 扫码登录`}
+        open={qrModalOpen}
+        onCancel={() => { setQrModalOpen(false); setQrImage(''); }}
+        footer={null}
+        width={400}
+      >
+        {qrImage ? (
+          <div style={{ textAlign: 'center' }}>
+            <Image src={qrImage} alt="二维码" style={{ maxWidth: 300 }} preview={false} />
+            <p style={{ marginTop: 12, color: '#666' }}>请用 12123 App 扫描二维码登录</p>
+          </div>
+        ) : (
+          <div style={{ textAlign: 'center', padding: 40, color: '#999' }}>等待二维码生成...</div>
+        )}
+      </Modal>
 
       <Modal title={editing ? '编辑公司' : '新增公司'} open={modalOpen} onOk={handleSave} onCancel={() => setModalOpen(false)} width={600}>
         <Form form={form} layout="vertical">

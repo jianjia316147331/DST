@@ -18,8 +18,8 @@ export async function authGuard(request: FastifyRequest, reply: FastifyReply) {
 
 export async function whitelistGuard(request: FastifyRequest, reply: FastifyReply) {
   const payload = request.user as JwtPayload;
-  const { rows } = await pool.query(
-    'SELECT enabled FROM user_whitelist WHERE phone = $1',
+  const [rows] = await pool.query(
+    'SELECT enabled FROM user_whitelist WHERE phone = ?',
     [payload.phone]
   );
   if (rows.length === 0 || !rows[0].enabled) {

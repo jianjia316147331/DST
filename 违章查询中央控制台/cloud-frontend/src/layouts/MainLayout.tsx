@@ -14,6 +14,7 @@ import {
   AppleOutlined,
   WindowsOutlined,
   LogoutOutlined,
+  CarOutlined,
 } from '@ant-design/icons';
 import { useAuthStore } from '../stores/auth';
 
@@ -22,6 +23,7 @@ const { Sider, Content, Header } = Layout;
 const menuItems = [
   { key: '/', icon: <DashboardOutlined />, label: '工作台' },
   { key: '/companies', icon: <BankOutlined />, label: '企业管理' },
+  { key: '/vehicles', icon: <CarOutlined />, label: '车辆管理' },
   { key: '/tasks', icon: <ScheduleOutlined />, label: '查询任务' },
   { key: '/schedules', icon: <ClockCircleOutlined />, label: '定时计划' },
   { key: '/nodes', icon: <CloudServerOutlined />, label: '设备管理' },

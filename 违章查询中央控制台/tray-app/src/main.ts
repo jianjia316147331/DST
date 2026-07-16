@@ -1,4 +1,5 @@
 import { app, Tray, Menu, nativeImage, shell } from 'electron';
+import { spawn } from 'child_process';
 import WebSocket from 'ws';
 import * as os from 'os';
 import * as path from 'path';
@@ -170,6 +171,65 @@ function connectWs() {
             message: `${result.method}, pid=${result.pid}, session=${proc?.sessionId}` });
           updateTrayMenu();
         }
+        break;
+      }
+
+      case 'trigger_login': {
+        const { company_name, province_url } = msg as unknown as {
+          company_name: string; province_url: string;
+        };
+
+        const loginSessionId = `login-${company_name}-${Date.now()}`;
+        send({
+          type: 'log', level: 'INFO', category: 'login',
+          message: `启动扫码登录: ${company_name}${province_url ? ` (${province_url})` : ''}`,
+        });
+
+        // Use a special prompt that instructs Claude to only do login + keepalive
+        const loginPrompt = `启动${company_name}违章查询登录任务，本次只执行登录和保活不执行具体违章查询`;
+
+        const cmd = isWindows
+          ? (CLAUDE_PATH.endsWith('.cmd') ? CLAUDE_PATH : `${CLAUDE_PATH}.cmd`)
+          : CLAUDE_PATH;
+
+        const child = spawn(cmd, ['--session', loginSessionId, '--prompt', loginPrompt], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: { ...process.env },
+          shell: isWindows,
+        });
+
+        send({
+          type: 'log', level: 'INFO', category: 'login',
+          message: `Claude Code 已启动, pid=${child.pid}, session=${loginSessionId}`,
+        });
+
+        child.stdout?.on('data', (data: Buffer) => {
+          for (const line of data.toString().split('\n').filter(Boolean)) {
+            send({ type: 'stream_output', stream: 'stdout', line, seq: 0 });
+          }
+        });
+
+        child.stderr?.on('data', (data: Buffer) => {
+          for (const line of data.toString().split('\n').filter(Boolean)) {
+            send({ type: 'stream_output', stream: 'stderr', line, seq: 0 });
+          }
+        });
+
+        child.on('exit', (code) => {
+          send({
+            type: 'log', level: code === 0 ? 'INFO' : 'ERROR', category: 'login',
+            message: `扫码登录进程退出: ${company_name}, exit code=${code}`,
+          });
+        });
+
+        child.on('error', (err) => {
+          send({
+            type: 'log', level: 'ERROR', category: 'login',
+            message: `扫码登录进程错误: ${company_name}, ${err.message}`,
+          });
+        });
+
+        updateTrayMenu();
         break;
       }
 

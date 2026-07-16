@@ -1,11 +1,14 @@
 import { FastifyInstance } from 'fastify';
 import { WebSocket } from 'ws';
 import pool from '../db/index.js';
+import { upsertCompaniesList, upsertVehicle, upsertViolations } from '../db/sync.js';
 
 // Connected tray nodes: Map<node_id, WebSocket>
 const nodes = new Map<string, WebSocket>();
 // Frontend clients for streaming: Map<task_id, Set<WebSocket>>
 const taskSubscribers = new Map<number, Set<WebSocket>>();
+// Frontend general subscribers (receive all broadcasts)
+const frontendClients = new Set<WebSocket>();
 
 export function getNodeWs(nodeId: string): WebSocket | undefined {
   return nodes.get(nodeId);
@@ -29,17 +32,17 @@ async function handleMessage(ws: WebSocket, raw: string) {
       const nodeName = (msg.node_name as string) || (msg.hostname as string) || (msg.node_id as string);
       nodes.set(nodeName, ws);
 
-      const { rows } = await pool.query('SELECT id FROM nodes WHERE node_name = $1', [nodeName]);
+      const [rows] = await pool.query('SELECT id FROM nodes WHERE node_name = ?', [nodeName]);
       if (rows.length === 0) {
         await pool.query(
           `INSERT INTO nodes (node_name, hostname, max_concurrency, memory_total_gb, cpu_cores, status)
-           VALUES ($1, $2, $3, $4, $5, 'online')`,
+           VALUES (?, ?, ?, ?, ?, 'online')`,
           [nodeName, msg.hostname || nodeName, msg.max_concurrency || 15, msg.memory_total_gb || 0, msg.cpu_cores || 0]
         );
       } else {
         await pool.query(
-          `UPDATE nodes SET status='online', hostname=$1, max_concurrency=$2, memory_total_gb=$3,
-           cpu_cores=$4, last_heartbeat=NOW() WHERE node_name=$5`,
+          `UPDATE nodes SET status='online', hostname=?, max_concurrency=?, memory_total_gb=?,
+           cpu_cores=?, last_heartbeat=NOW() WHERE node_name=?`,
           [msg.hostname || '', msg.max_concurrency || 15, msg.memory_total_gb || 0, msg.cpu_cores || 0, nodeName]
         );
       }
@@ -49,8 +52,8 @@ async function handleMessage(ws: WebSocket, raw: string) {
     case 'heartbeat': {
       const nodeName = msg.node_id as string;
       await pool.query(
-        `UPDATE nodes SET status='online', active_sessions=$1, last_heartbeat=NOW()
-         WHERE node_name=$2`,
+        `UPDATE nodes SET status='online', active_sessions=?, last_heartbeat=NOW()
+         WHERE node_name=?`,
         [msg.active_sessions || 0, nodeName]
       );
       break;
@@ -73,9 +76,9 @@ async function handleMessage(ws: WebSocket, raw: string) {
       const { task_id, progress, progress_desc, processed_vehicles, total_vehicles,
         current_page, violations_found } = msg;
       await pool.query(
-        `UPDATE tasks SET progress=$1, progress_desc=$2, processed_vehicles=$3,
-         total_vehicles=$4, current_page=$5, violations_found=$6, updated_at=NOW()
-         WHERE id=$7`,
+        `UPDATE tasks SET progress=?, progress_desc=?, processed_vehicles=?,
+         total_vehicles=?, current_page=?, violations_found=?, updated_at=NOW()
+         WHERE id=?`,
         [progress, progress_desc, processed_vehicles, total_vehicles, current_page, violations_found, task_id]
       );
       break;
@@ -83,10 +86,10 @@ async function handleMessage(ws: WebSocket, raw: string) {
 
     case 'status_ack': {
       const { task_id, status, message } = msg;
-      await pool.query('UPDATE tasks SET status=$1, updated_at=NOW() WHERE id=$2', [status, task_id]);
+      await pool.query('UPDATE tasks SET status=?, updated_at=NOW() WHERE id=?', [status, task_id]);
       await pool.query(
         `INSERT INTO logs (task_id, level, category, message)
-         VALUES ($1, 'INFO', 'command', $2)`,
+         VALUES (?, 'INFO', 'command', ?)`,
         [task_id, message]
       );
       break;
@@ -95,8 +98,8 @@ async function handleMessage(ws: WebSocket, raw: string) {
     case 'task_completed': {
       const { task_id, violations_found, processed_vehicles } = msg;
       await pool.query(
-        `UPDATE tasks SET status='完成', progress='已完成', violations_found=$1,
-         processed_vehicles=$2, completed_at=NOW(), updated_at=NOW() WHERE id=$3`,
+        `UPDATE tasks SET status='完成', progress='已完成', violations_found=?,
+         processed_vehicles=?, completed_at=NOW(), updated_at=NOW() WHERE id=?`,
         [violations_found, processed_vehicles, task_id]
       );
       break;
@@ -105,7 +108,7 @@ async function handleMessage(ws: WebSocket, raw: string) {
     case 'task_failed': {
       const { task_id, error } = msg;
       await pool.query(
-        `UPDATE tasks SET status='完成', error_message=$1, completed_at=NOW(), updated_at=NOW() WHERE id=$2`,
+        `UPDATE tasks SET status='完成', error_message=?, completed_at=NOW(), updated_at=NOW() WHERE id=?`,
         [error, task_id]
       );
       break;
@@ -115,8 +118,159 @@ async function handleMessage(ws: WebSocket, raw: string) {
       const { task_id, level, category, message, detail } = msg;
       await pool.query(
         `INSERT INTO logs (task_id, level, category, message, detail)
-         VALUES ($1, $2, $3, $4, $5)`,
+         VALUES (?, ?, ?, ?, ?)`,
         [task_id || null, level || 'INFO', category || 'system', message, detail ? JSON.stringify(detail) : null]
+      );
+      break;
+    }
+
+    // ── Data sync ──
+    case 'sync_data': {
+      const { node_id, task_id, companies, vehicles, violations } = msg as {
+        node_id?: string; task_id?: number; companies?: any[]; vehicles?: any[]; violations?: any[];
+      };
+
+      try {
+        let stats = { companies: 0, vehicles: 0, violations_ins: 0, violations_upd: 0 };
+
+        if (Array.isArray(companies) && companies.length > 0) {
+          stats.companies = await upsertCompaniesList(companies);
+        }
+
+        if (Array.isArray(vehicles) && vehicles.length > 0) {
+          for (const v of vehicles) {
+            await upsertVehicle(node_id || null, v);
+            stats.vehicles++;
+          }
+        }
+
+        if (Array.isArray(violations) && violations.length > 0) {
+          const result = await upsertViolations(node_id || null, task_id || null, violations);
+          stats.violations_ins = result.inserted;
+          stats.violations_upd = result.updated;
+        }
+
+        // Update node last_sync_at
+        if (node_id) {
+          await pool.query(
+            'UPDATE nodes SET last_sync_at = NOW() WHERE node_name = ?',
+            [node_id]
+          );
+        }
+
+        // Log sync
+        const totalViolations = stats.violations_ins + stats.violations_upd;
+        await pool.query(
+          `INSERT INTO sync_logs (node_id, sync_type, task_id, companies, vehicles,
+             violations_ins, violations_upd, status)
+           SELECT id, 'task_complete', ?, ?, ?, ?, ?, 'success'
+           FROM nodes WHERE node_name = ? LIMIT 1`,
+          [task_id || null, stats.companies, stats.vehicles, stats.violations_ins, stats.violations_upd, node_id]
+        );
+
+        await pool.query(
+          `INSERT INTO logs (task_id, level, category, message, detail)
+           VALUES (?, 'INFO', 'system', ?, ?)`,
+          [task_id || null,
+           `数据同步完成: ${stats.vehicles}辆车, ${totalViolations}条违章 (${stats.violations_ins}新/${stats.violations_upd}更新)`,
+           JSON.stringify(stats)]
+        );
+
+        // Send ack
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'sync_ack', task_id, ok: true, stats,
+          }));
+        }
+      } catch (error: any) {
+        console.error('[Sync] Error:', error);
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'sync_ack', task_id, ok: false, error: error.message,
+          }));
+        }
+      }
+      break;
+    }
+
+    // ── Keepalive status report ──
+    case 'keepalive_status': {
+      const { companies: keepaliveCompanies } = msg as { companies?: Array<{ name: string; is_logged_in: boolean; keepalive_alive: boolean }> };
+      if (Array.isArray(keepaliveCompanies)) {
+        for (const c of keepaliveCompanies) {
+          const newStatus = (c.is_logged_in && c.keepalive_alive) ? 'online' : 'offline';
+          await pool.query(
+            `UPDATE companies SET account_status = ? WHERE name = ?`,
+            [newStatus, c.name]
+          );
+        }
+      }
+      // Forward to frontend
+      const broadcastPayload = JSON.stringify(msg);
+      for (const client of frontendClients) {
+        if (client.readyState === WebSocket.OPEN) client.send(broadcastPayload);
+      }
+      for (const [, subs] of taskSubscribers) {
+        for (const client of subs) {
+          if (client.readyState === WebSocket.OPEN) client.send(broadcastPayload);
+        }
+      }
+      break;
+    }
+
+    // ── QR code relay (node → frontend) ──
+    case 'qr_code':
+    case 'qr_expired': {
+      const relayPayload = JSON.stringify(msg);
+      for (const client of frontendClients) {
+        if (client.readyState === WebSocket.OPEN) client.send(relayPayload);
+      }
+      for (const [, subs] of taskSubscribers) {
+        for (const client of subs) {
+          if (client.readyState === WebSocket.OPEN) client.send(relayPayload);
+        }
+      }
+      break;
+    }
+
+    case 'login_ok': {
+      const relayPayload = JSON.stringify(msg);
+      for (const client of frontendClients) {
+        if (client.readyState === WebSocket.OPEN) client.send(relayPayload);
+      }
+      for (const [, subs] of taskSubscribers) {
+        for (const client of subs) {
+          if (client.readyState === WebSocket.OPEN) client.send(relayPayload);
+        }
+      }
+      const { company_name } = msg as unknown as { company_name: string };
+      await pool.query(
+        `UPDATE companies SET account_status = 'online' WHERE name = ?`,
+        [company_name]
+      );
+      await pool.query(
+        `INSERT INTO logs (level, category, message)
+         VALUES ('INFO', 'system', ?)`,
+        [`${company_name} 扫码登录成功`]
+      );
+      break;
+    }
+
+    case 'login_failed': {
+      const relayPayload = JSON.stringify(msg);
+      for (const client of frontendClients) {
+        if (client.readyState === WebSocket.OPEN) client.send(relayPayload);
+      }
+      for (const [, subs] of taskSubscribers) {
+        for (const client of subs) {
+          if (client.readyState === WebSocket.OPEN) client.send(relayPayload);
+        }
+      }
+      const { company_name, reason } = msg as unknown as { company_name: string; reason: string };
+      await pool.query(
+        `INSERT INTO logs (level, category, message)
+         VALUES ('WARN', 'system', ?)`,
+        [`${company_name} 扫码登录失败: ${reason}`]
       );
       break;
     }
@@ -130,7 +284,7 @@ export default async function wsHandler(app: FastifyInstance) {
     const clientType = url.searchParams.get('client') || 'frontend';
     const taskId = url.searchParams.get('task_id');
 
-    if (clientType === 'tray') {
+    if (clientType === 'tray' || clientType === 'node') {
       // Tray node connection - persistent
       socket.on('message', (data: Buffer) => {
         handleMessage(socket, data.toString());
@@ -139,7 +293,7 @@ export default async function wsHandler(app: FastifyInstance) {
       socket.on('close', () => {
         for (const [name, ws] of nodes) {
           if (ws === socket) {
-            pool.query("UPDATE nodes SET status='offline' WHERE node_name=$1", [name]).catch(() => {});
+            pool.query("UPDATE nodes SET status='offline' WHERE node_name=?", [name]).catch(() => {});
             nodes.delete(name);
             break;
           }
@@ -152,8 +306,10 @@ export default async function wsHandler(app: FastifyInstance) {
         unsubscribeTask(parseInt(taskId), socket);
       });
     } else {
-      // Frontend general connection - receives all task updates
+      // Frontend general connection - receives all task updates and broadcasts
+      frontendClients.add(socket);
       socket.on('close', () => {
+        frontendClients.delete(socket);
         for (const [, subs] of taskSubscribers) {
           subs.delete(socket);
         }

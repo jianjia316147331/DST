@@ -10,8 +10,8 @@ export default async function authRoutes(app: FastifyInstance) {
       return reply.status(400).send({ error: 'Invalid phone number' });
     }
 
-    const { rows } = await pool.query(
-      'SELECT id, phone, name, enabled FROM user_whitelist WHERE phone = $1',
+    const [rows] = await pool.query(
+      'SELECT id, phone, name, enabled FROM user_whitelist WHERE phone = ?',
       [phone]
     );
 

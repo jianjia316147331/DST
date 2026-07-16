@@ -3,7 +3,7 @@ import pool from '../db/index.js';
 
 export default async function whitelistRoutes(app: FastifyInstance) {
   app.get('/api/whitelist', { preHandler: [app.authenticate] }, async () => {
-    const { rows } = await pool.query('SELECT * FROM user_whitelist ORDER BY created_at DESC');
+    const [rows] = await pool.query('SELECT * FROM user_whitelist ORDER BY created_at DESC');
     return { data: rows };
   });
 
@@ -14,12 +14,14 @@ export default async function whitelistRoutes(app: FastifyInstance) {
       return reply.status(400).send({ error: 'Invalid phone number' });
     }
 
-    const { rows } = await pool.query(
-      `INSERT INTO user_whitelist (phone, name) VALUES ($1, $2)
-       ON CONFLICT (phone) DO UPDATE SET enabled = TRUE, name = COALESCE($2, user_whitelist.name)
-       RETURNING *`,
-      [phone, name || null]
+    await pool.query(
+      `INSERT INTO user_whitelist (phone, name) VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE enabled = 1, name = COALESCE(?, user_whitelist.name)`,
+      [phone, name || null, name || null]
     );
+
+    // Fetch back the inserted/updated row
+    const [rows] = await pool.query('SELECT * FROM user_whitelist WHERE phone = ?', [phone]);
 
     reply.status(201);
     return rows[0];
@@ -31,25 +33,27 @@ export default async function whitelistRoutes(app: FastifyInstance) {
 
     const sets: string[] = [];
     const params: unknown[] = [];
-    let idx = 1;
 
-    if (enabled !== undefined) { sets.push(`enabled = $${idx++}`); params.push(enabled); }
-    if (name !== undefined) { sets.push(`name = $${idx++}`); params.push(name); }
+    if (enabled !== undefined) { sets.push('enabled = ?'); params.push(enabled); }
+    if (name !== undefined) { sets.push('name = ?'); params.push(name); }
     if (sets.length === 0) return reply.status(400).send({ error: 'No valid fields' });
 
     params.push(id);
-    const { rows } = await pool.query(
-      `UPDATE user_whitelist SET ${sets.join(', ')} WHERE id = $${idx} RETURNING *`,
+    const [result] = await pool.query(
+      `UPDATE user_whitelist SET ${sets.join(', ')} WHERE id = ?`,
       params
     );
-    if (rows.length === 0) return reply.status(404).send({ error: 'User not found' });
+    if (result.affectedRows === 0) return reply.status(404).send({ error: 'User not found' });
+
+    // Fetch updated row
+    const [rows] = await pool.query('SELECT * FROM user_whitelist WHERE id = ?', [id]);
     return rows[0];
   });
 
   app.delete('/api/whitelist/:id', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string };
-    const { rowCount } = await pool.query('DELETE FROM user_whitelist WHERE id = $1', [id]);
-    if (rowCount === 0) return reply.status(404).send({ error: 'User not found' });
+    const [result] = await pool.query('DELETE FROM user_whitelist WHERE id = ?', [id]);
+    if (result.affectedRows === 0) return reply.status(404).send({ error: 'User not found' });
     return { success: true };
   });
 }

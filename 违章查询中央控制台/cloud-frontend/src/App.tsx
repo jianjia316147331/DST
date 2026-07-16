@@ -12,6 +12,8 @@ import Schedules from './pages/Schedules';
 import Nodes from './pages/Nodes';
 import Logs from './pages/Logs';
 import Settings from './pages/Settings';
+import Vehicles from './pages/Vehicles';
+import VehicleViolations from './pages/VehicleViolations';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const token = useAuthStore((s) => s.token);
@@ -39,6 +41,8 @@ export default function App() {
               <Route path="nodes" element={<Nodes />} />
               <Route path="logs" element={<Logs />} />
               <Route path="settings" element={<Settings />} />
+              <Route path="vehicles" element={<Vehicles />} />
+              <Route path="vehicles/:id" element={<VehicleViolations />} />
             </Route>
           </Routes>
         </BrowserRouter>

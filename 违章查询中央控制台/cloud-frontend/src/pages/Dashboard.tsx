@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Card, Row, Col, Statistic, Tag } from 'antd';
-import { BankOutlined, SyncOutlined, WarningOutlined, CheckCircleOutlined, CloudServerOutlined } from '@ant-design/icons';
+import { BankOutlined, SyncOutlined, WarningOutlined, CheckCircleOutlined, CloudServerOutlined, CarOutlined } from '@ant-design/icons';
 import api from '../api';
 
 interface Overview {
@@ -9,6 +9,9 @@ interface Overview {
   violations_today: number;
   completed_jobs: number;
   online_nodes: number;
+  total_vehicles: number;
+  total_violations: number;
+  unprocessed_violations: number;
 }
 
 export default function Dashboard() {
@@ -23,20 +26,31 @@ export default function Dashboard() {
   return (
     <div>
       <Row gutter={[16, 16]}>
-        <Col xs={24} sm={12} md={8} lg={4}>
+        <Col xs={24} sm={12} md={6}>
           <Card><Statistic title="公司总数" value={overview?.total_companies || 0} prefix={<BankOutlined />} /></Card>
         </Col>
-        <Col xs={24} sm={12} md={8} lg={4}>
+        <Col xs={24} sm={12} md={6}>
           <Card><Statistic title="活跃任务" value={overview?.active_jobs || 0} prefix={<SyncOutlined spin />} valueStyle={{ color: '#1677ff' }} /></Card>
         </Col>
-        <Col xs={24} sm={12} md={8} lg={4}>
-          <Card><Statistic title="今日违章" value={overview?.violations_today || 0} prefix={<WarningOutlined />} valueStyle={{ color: '#faad14' }} /></Card>
+        <Col xs={24} sm={12} md={6}>
+          <Card><Statistic title="车辆总数" value={overview?.total_vehicles || 0} prefix={<CarOutlined />} /></Card>
         </Col>
-        <Col xs={24} sm={12} md={8} lg={4}>
-          <Card><Statistic title="已完成任务" value={overview?.completed_jobs || 0} prefix={<CheckCircleOutlined />} valueStyle={{ color: '#52c41a' }} /></Card>
-        </Col>
-        <Col xs={24} sm={12} md={8} lg={4}>
+        <Col xs={24} sm={12} md={6}>
           <Card><Statistic title="在线节点" value={overview?.online_nodes || 0} prefix={<CloudServerOutlined />} /></Card>
+        </Col>
+      </Row>
+      <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
+        <Col xs={24} sm={12} md={6}>
+          <Card><Statistic title="违章总数" value={overview?.total_violations || 0} prefix={<WarningOutlined />} /></Card>
+        </Col>
+        <Col xs={24} sm={12} md={6}>
+          <Card><Statistic title="未处理违章" value={overview?.unprocessed_violations || 0} prefix={<WarningOutlined />} valueStyle={{ color: '#cf1322' }} /></Card>
+        </Col>
+        <Col xs={24} sm={12} md={6}>
+          <Card><Statistic title="今日新增" value={overview?.violations_today || 0} prefix={<WarningOutlined />} valueStyle={{ color: '#faad14' }} /></Card>
+        </Col>
+        <Col xs={24} sm={12} md={6}>
+          <Card><Statistic title="已完成任务" value={overview?.completed_jobs || 0} prefix={<CheckCircleOutlined />} valueStyle={{ color: '#52c41a' }} /></Card>
         </Col>
       </Row>
 
