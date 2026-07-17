@@ -143,7 +143,9 @@ class NodeAgent:
                 await self._connect_ws()
             except Exception as e:
                 print(f"[node_agent] WebSocket 错误: {e}, {WEBSOCKET_RECONNECT_DELAY}s 后重连...")
-                self._register_event.clear()  # reset for reconnection
+            # Whether normal disconnect or exception, clean up and delay before retry
+            self._cleanup_connection()
+            if self._running:
                 await asyncio.sleep(WEBSOCKET_RECONNECT_DELAY)
 
     async def stop(self):
@@ -164,6 +166,23 @@ class NodeAgent:
             except Exception:
                 pass
         print("[node_agent] 已停止")
+
+    async def _cleanup_connection(self):
+        """Cancel periodic tasks and clear stale state on disconnect."""
+        # Cancel periodic tasks
+        for task in [self._heartbeat_task, self._keepalive_task, self._sync_task]:
+            if task and not task.done():
+                task.cancel()
+        self._heartbeat_task = None
+        self._keepalive_task = None
+        self._sync_task = None
+        # Clear stale writer
+        self._writer = None
+        # Reset register event for next connection
+        self._register_event.clear()
+        # Clear bridge reference
+        self.bridge = None
+        print("[node_agent] 连接已断开，清理完成")
 
     async def _connect_ws(self):
         """Establish WebSocket connection using native TCP sockets (zero deps)."""
@@ -350,18 +369,20 @@ class NodeAgent:
     def _ws_send(self, msg):
         """Send a message via WebSocket (thread-safe)."""
         try:
-            if self._writer is not None:
+            writer = self._writer  # snapshot to avoid race with cleanup
+            if writer is not None:
                 loop = asyncio.get_event_loop()
                 # call_soon_threadsafe works from any thread
                 loop.call_soon_threadsafe(
-                    lambda m=msg: asyncio.ensure_future(
-                        self._ws_send_native(self._writer, m)
+                    lambda w=writer, m=msg: asyncio.ensure_future(
+                        self._safe_ws_send(w, m)
                     )
                 )
         except RuntimeError:
             # No event loop in this thread — fall back to direct send
             try:
-                if self._running and self._writer is not None:
+                writer = self._writer
+                if self._running and writer is not None:
                     payload = json.dumps(msg, ensure_ascii=False).encode("utf-8")
                     frame = bytearray()
                     frame.append(0x81)
@@ -377,11 +398,18 @@ class NodeAgent:
                     mask_key = os.urandom(4)
                     frame.extend(mask_key)
                     frame.extend(bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload)))
-                    self._writer.write(bytes(frame))
+                    writer.write(bytes(frame))
             except Exception as e:
                 print(f"[node_agent] 发送失败: {e}")
         except Exception as e:
             print(f"[node_agent] 发送失败: {e}")
+
+    async def _safe_ws_send(self, writer, msg):
+        """Send a WebSocket message with error suppression for stale connections."""
+        try:
+            await self._ws_send_native(writer, msg)
+        except Exception:
+            pass  # Connection likely closed, cleanup will handle it
 
     def _detect_keepalive_services(self):
         """Detect which keepalive services are installed on this device."""
