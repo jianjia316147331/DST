@@ -189,11 +189,10 @@ export default function Companies() {
       setLoginPath(result.path || 'keepalive');
       setSessionId(result.session_id || '');
       setChatMessages([]);
-      setKeepaliveSteps([]);
-      if (result.path === 'session') {
-        setQrModalOpen(true); // Reuse QR modal as chat dialog
-      }
-      message.success(`已向 ${loginCompany.name} 发送${result.path === 'session' ? '会话' : '保活'}登录指令`);
+      setKeepaliveSteps([{ step: '已发送登录指令，等待响应...', status: 'process' }]);
+      // Always open the streaming modal to show progress and wait for QR
+      setQrImage('');
+      setQrModalOpen(true);
     } catch (err: any) {
       message.error(err?.response?.data?.error || '触发登录失败');
     } finally {
