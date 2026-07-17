@@ -655,13 +655,20 @@ class NodeAgent:
                             if "__LOGIN_FAILED__" in text:
                                 reason = text.split("__LOGIN_FAILED__:")[-1].strip().split("\n")[0].strip() if ":" in text else "unknown"
                                 self._ws_send({"type": "login_failed", "company_name": company_name, "reason": reason})
-                    # Track progress from tool use
+                    # Track progress from tool use — send to frontend
                     elif etype == "user" and event.get("message", {}).get("content", []):
                         for block in event["message"]["content"]:
                             if block.get("type") == "tool_result":
                                 tool_id = block.get("tool_use_id", "")
                                 tool_content = str(block.get("content", ""))[:200]
                                 print(f"[node_agent] claude tool_result {tool_id[:20]}: {tool_content[:100]}")
+                                # Extract readable progress from tool result
+                                progress_text = tool_content[:120]
+                                self._ws_send({
+                                    "type": "keepalive_login_progress",
+                                    "company_name": company_name,
+                                    "progress": progress_text,
+                                })
                 # stdout exhausted
                 exit_code = proc.wait()
                 stderr_out = proc.stderr.read()
