@@ -203,7 +203,7 @@ export default function Companies() {
     setLoginLoading(true);
     try {
       // Determine mode: 'session' for interactive chat, 'keepalive' for passive monitoring
-      const mode: string = keepaliveSteps.length > 0 ? 'keepalive' : 'session';
+      const mode = 'keepalive';
       const { data: result } = await api.post('/api/sync/trigger-login', { company_name: loginCompany.name, company_id: loginCompany.id, mode });
       setLoginConfirmOpen(false);
       setLoginPath(mode);
