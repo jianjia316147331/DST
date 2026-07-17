@@ -54,7 +54,12 @@ export default async function syncRoutes(app: FastifyInstance) {
 
   // POST /api/sync/trigger-login — trigger 12123 login on the node bound to a company
   app.post('/api/sync/trigger-login', { preHandler: [app.authenticate] }, async (request, reply) => {
-    const { company_id, company_name, mode } = request.body as { company_id: number; company_name: string; mode?: string };
+    const { company_id, company_name } = request.body as { company_id: number; company_name: string };
+
+    // ── 模式判定（中央控制台统一控制）──
+    // "keepalive" = PinchTab 直接操作，秒级出 QR
+    // "session"   = Claude 子进程交互，适合需要对话的场景
+    const mode = 'keepalive';
 
     if (!company_id && !company_name) {
       return reply.status(400).send({ error: 'company_id or company_name is required' });
@@ -122,7 +127,7 @@ export default async function syncRoutes(app: FastifyInstance) {
         company_id: company.id,
         company_name: company.name,
         prompt: prompt,
-        mode: mode || 'keepalive',
+        mode: mode,
       }));
 
       // Log the action
@@ -135,7 +140,7 @@ export default async function syncRoutes(app: FastifyInstance) {
       return {
         ok: true,
         message: `已向 ${company.name} 发送登录指令`,
-        path: 'keepalive',
+        path: mode,
         node_name: binding.node_name,
       };
     } catch (err: any) {

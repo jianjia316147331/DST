@@ -202,14 +202,13 @@ export default function Companies() {
     if (!loginCompany) return;
     setLoginLoading(true);
     try {
-      // Determine mode: 'session' for interactive chat, 'keepalive' for passive monitoring
-      const mode = 'keepalive';
-      const { data: result } = await api.post('/api/sync/trigger-login', { company_name: loginCompany.name, company_id: loginCompany.id, mode });
+      const { data: result } = await api.post('/api/sync/trigger-login', { company_name: loginCompany.name, company_id: loginCompany.id });
+      const serverMode = result.path || 'keepalive';
       setLoginConfirmOpen(false);
-      setLoginPath(mode);
+      setLoginPath(serverMode);
       setSessionId(result.session_id || '');
       setChatMessages([]);
-      setKeepaliveSteps(mode === 'keepalive' ? [{ step: '已发送登录指令，等待响应...', status: 'process' }] : []);
+      setKeepaliveSteps(serverMode === 'keepalive' ? [{ step: '已发送登录指令，等待响应...', status: 'process' }] : []);
       // Always open the streaming modal to show progress and wait for QR
       setQrImage('');
       setQrModalOpen(true);
