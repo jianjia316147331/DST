@@ -17,14 +17,16 @@
 """
 
 import asyncio
+import base64
 import json
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # Ensure lib/ is importable
@@ -607,12 +609,20 @@ class NodeAgent:
 
     async def _handle_trigger_login(self, msg):
         """Handle trigger_login command from cloud server.
-        Spawn Claude Code to open 12123 login page and capture QR code.
+        Routes to keepalive (fast, PinchTab) or session (interactive, Claude) path.
         """
+        # TODO: 临时统一走保活路径验证，后续恢复 mode 判定
+        _USE_KEEPALIVE = True
+
+        if _USE_KEEPALIVE:
+            await self._trigger_keepalive_login(msg)
+            return
+
+        # ── session / Claude 路径（保留，暂不使用）──
         company_name = msg.get("company_name", "")
         company_id = str(msg.get("company_id", ""))
         prompt = msg.get("prompt", "")
-        mode = msg.get("mode", "keepalive")  # "keepalive" or "session"
+        mode = msg.get("mode", "keepalive")
 
         if not prompt:
             self._ws_send({
@@ -750,6 +760,188 @@ class NodeAgent:
         t = threading.Thread(target=_monitor_qr, daemon=True)
         t.start()
 
+    async def _trigger_keepalive_login(self, msg):
+        """保活登录路径：启动 keepalive daemon（auto-recover），监控 QR 截图和登录进度。
+
+        流程：
+        1. 确保 profile 存在且 is_logged_in=0
+        2. 启动 keepalive_daemon --auto-recover
+        3. 监控 health file → keepalive_login_progress
+        4. 监控 QR 文件 → qr_code (base64)
+        5. 登录成功 → login_ok
+        """
+        company_name = msg.get("company_name", "")
+        company_id = str(msg.get("company_id", ""))
+        province = msg.get("province", "")
+        contact_name = msg.get("contact_name", "")
+        contact_phone = msg.get("contact_phone", "")
+        notify_chat = msg.get("notify_chat_name", "")
+
+        print(f"[node_agent] 保活登录触发: {company_name}")
+
+        skill_dir = os.path.dirname(os.path.abspath(__file__))
+        daemon_path = os.path.join(skill_dir, "keepalive_daemon.py")
+        if not os.path.exists(daemon_path):
+            self._ws_send({"type": "login_failed", "company_name": company_name,
+                           "reason": "keepalive_daemon.py 未找到"})
+            return
+
+        # Step 1: 确保 profile 存在并已登出
+        try:
+            # profile-lookup
+            lookup = subprocess.run(
+                [sys.executable, os.path.join(skill_dir, "violation_helper.py"),
+                 "profile-lookup", "--company", company_name],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=15
+            )
+            profile_data = json.loads(lookup.stdout) if lookup.stdout.strip() else {}
+        except Exception as e:
+            print(f"[node_agent] profile-lookup 失败: {e}")
+            profile_data = {}
+
+        if not profile_data.get("found"):
+            # 创建 profile
+            print(f"[node_agent] 为 {company_name} 创建新 profile...")
+            try:
+                create = subprocess.run(
+                    [sys.executable, os.path.join(skill_dir, "session_manager.py"),
+                     "profile-create"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=15
+                )
+                create_data = json.loads(create.stdout) if create.stdout.strip() else {}
+                profile_name = create_data.get("profile_name", "")
+                instance_port = create_data.get("instance_port")
+            except Exception as e:
+                self._ws_send({"type": "login_failed", "company_name": company_name,
+                               "reason": f"profile-create 失败: {e}"})
+                return
+
+            # 注册 profile
+            platform_url = _province_to_url(province)
+            try:
+                subprocess.run(
+                    [sys.executable, os.path.join(skill_dir, "violation_helper.py"),
+                     "profile-register", "--company", company_name,
+                     "--profile-name", profile_name,
+                     "--platform-url", platform_url],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=15
+                )
+            except Exception as e:
+                print(f"[node_agent] profile-register 失败: {e}")
+        else:
+            profile_name = profile_data.get("profile_name", "")
+            instance_port = profile_data.get("instance_port")
+
+        # 确保 is_logged_in=0
+        try:
+            import sqlite3
+            db_path = os.path.join(
+                subprocess.run(
+                    [sys.executable, os.path.join(skill_dir, "violation_helper.py"),
+                     "get-data-dir"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=10
+                ).stdout.strip(),
+                "violations.db"
+            )
+            conn = sqlite3.connect(db_path)
+            conn.execute("UPDATE profiles SET is_logged_in=0 WHERE company_name=?", (company_name,))
+            conn.commit()
+            conn.close()
+            print(f"[node_agent] 已设置 {company_name} is_logged_in=0")
+        except Exception as e:
+            print(f"[node_agent] 设置 is_logged_in 失败: {e}")
+
+        # Step 2: 启动 keepalive daemon
+        cmd = [sys.executable, daemon_path,
+               "--company", company_name,
+               "--project-root", "/home/openclaw",
+               "--auto-recover"]
+        # 通知目标
+        if notify_chat:
+            cmd += ["--notify-chat", notify_chat]
+        elif contact_name:
+            cmd += ["--notify-user", contact_name]
+
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"[node_agent] keepalive daemon 已启动: {company_name}")
+        except Exception as e:
+            self._ws_send({"type": "login_failed", "company_name": company_name,
+                           "reason": f"启动 keepalive daemon 失败: {e}"})
+            return
+
+        self._ws_send({
+            "type": "keepalive_login_progress",
+            "company_name": company_name,
+            "progress": "保活登录程序已启动，正在打开 12123 登录页...",
+        })
+
+        # Step 3: 异步监控 QR 文件和登录进度
+        _company = company_name
+        _profile = profile_name
+        _iport = instance_port
+        _ws_send = self._ws_send
+
+        async def _monitor_keepalive():
+            from lib.core import _get_data_dir
+            data_dir = _get_data_dir()
+            health_file = os.path.join(data_dir, f"keepalive_health_{_company}.json")
+
+            qr_sent = False
+            last_progress = ""
+            deadline = time.time() + 900  # 15 分钟超时
+
+            while time.time() < deadline:
+                await asyncio.sleep(3)
+
+                # A. 检查 health file 获取进度
+                if os.path.exists(health_file):
+                    try:
+                        with open(health_file, "r") as f:
+                            h = json.load(f)
+                        progress = h.get("progress", h.get("state", ""))
+                        if progress and progress != last_progress:
+                            last_progress = progress
+                            _ws_send({
+                                "type": "keepalive_login_progress",
+                                "company_name": _company,
+                                "progress": progress,
+                            })
+                        if h.get("state") == "logged_in":
+                            _ws_send({"type": "login_ok", "company_name": _company})
+                            print(f"[node_agent] 保活登录成功: {_company}")
+                            return
+                    except Exception:
+                        pass
+
+                # B. 检查 QR 截图文件
+                if not qr_sent:
+                    import glob as _glob
+                    qr_pattern = os.path.join(data_dir, f"recovery_qr_{_company}_*.png")
+                    qr_files = sorted(_glob.glob(qr_pattern))
+                    if qr_files:
+                        qr_path = qr_files[-1]  # 取最新的
+                        try:
+                            with open(qr_path, "rb") as f:
+                                img_b64 = base64.b64encode(f.read()).decode("utf-8")
+                            _ws_send({
+                                "type": "qr_code",
+                                "company_name": _company,
+                                "image_base64": img_b64,
+                                "qr_expires_at": (datetime.now() + timedelta(minutes=5)).isoformat(),
+                            })
+                            qr_sent = True
+                            print(f"[node_agent] QR sent for {_company} ({len(img_b64)} bytes)")
+                        except Exception as e:
+                            print(f"[node_agent] QR read error: {e}")
+
+            # 超时
+            if not qr_sent:
+                _ws_send({"type": "login_failed", "company_name": _company,
+                          "reason": "保活登录超时（15分钟）"})
+
+        asyncio.ensure_future(_monitor_keepalive())
+
     def _handle_session_message(self, msg):
         """Forward a chat message from frontend to the active Claude session."""
         company_id = str(msg.get("company_id", ""))
@@ -790,7 +982,7 @@ class NodeAgent:
             try:
                 r = subprocess.run(
                     ["systemctl", "--user", "restart", svc_name],
-                    capture_output=True, text=True, timeout=15
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=15
                 )
                 if r.returncode == 0:
                     started = True
@@ -1219,7 +1411,7 @@ class NodeAgent:
             try:
                 r = subprocess.run(
                     ["systemctl", "is-active", service_name],
-                    capture_output=True, text=True, timeout=5
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5
                 )
                 status["keepalive_alive"] = r.stdout.strip() == "active"
             except Exception:
@@ -1248,6 +1440,21 @@ class NodeAgent:
             await asyncio.sleep(SYNC_INTERVAL)
             print("[node_agent] 定时全量同步...")
             await self._run_sync()
+
+
+def _province_to_url(province):
+    """省份名 → 12123 URL。"""
+    m = {
+        "四川": "https://sc.122.gov.cn", "广东": "https://gd.122.gov.cn",
+        "福建": "https://fj.122.gov.cn", "北京": "https://bj.122.gov.cn",
+        "上海": "https://sh.122.gov.cn", "重庆": "https://cq.122.gov.cn",
+        "浙江": "https://zj.122.gov.cn", "江苏": "https://js.122.gov.cn",
+        "湖北": "https://hb.122.gov.cn", "湖南": "https://hn.122.gov.cn",
+        "山东": "https://sd.122.gov.cn", "河南": "https://ha.122.gov.cn",
+        "河北": "https://he.122.gov.cn", "安徽": "https://ah.122.gov.cn",
+        "江西": "https://jx.122.gov.cn", "陕西": "https://sn.122.gov.cn",
+    }
+    return m.get(province, "https://sc.122.gov.cn")
 
 
 # ── Main ────────────────────────────────────────────────────────
