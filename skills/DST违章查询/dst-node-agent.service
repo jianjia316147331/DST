@@ -12,10 +12,20 @@ Restart=on-failure
 RestartSec=10
 RestartPreventExitStatus=1
 
-# Environment
 Environment=PYTHONUNBUFFERED=1
+Environment=ANTHROPIC_AUTH_TOKEN=sk-eaabc17db30541f9bd057dca714ca318
+Environment=ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+Environment=ANTHROPIC_MODEL=deepseek-v4-pro[1m]
+Environment=ANTHROPIC_DEFAULT_OPUS_MODEL=deepseek-v4-pro[1m]
+Environment=ANTHROPIC_DEFAULT_SONNET_MODEL=deepseek-v4-pro[1m]
+Environment=ANTHROPIC_DEFAULT_HAIKU_MODEL=deepseek-v4-flash
+Environment=OPENCLAW_PROVIDER_PROTOCOL=openai-completions
+Environment=OPENCLAW_API_KEY=SvWNJQkIVAmlBFT2
+Environment=OPENCLAW_BASE_URL=http://token.dstcar.com/v1/
+Environment=OPENCLAW_GATEWAY_TOKEN=opsnexus_gw_2f484df1f5a6ed8260251c849ea8d0b4
+Environment=HOME=/home/openclaw
+Environment=USER=openclaw
 
-# Logging
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=dst-node-agent
