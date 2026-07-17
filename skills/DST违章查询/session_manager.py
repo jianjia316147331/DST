@@ -71,7 +71,7 @@ def _create_tab(instance_port=None):
     Returns tab_id (hex string) or exits with error."""
     cfg = _read_config()
     port = instance_port if instance_port else cfg["server"]["port"]
-    data = json.dumps({"action": "new"}).encode("utf-8")
+    data = json.dumps({"action": "new", "focus": False}).encode("utf-8")
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/tab",
         data=data,
