@@ -114,8 +114,29 @@ export default function Companies() {
             message.warning(`${msg.company_name} 保活登录失败: ${msg.reason}，请尝试手动登录`);
           }
         } else if (msg.type === 'session_chunk') {
-          setChatMessages(prev => [...prev, { text: msg.text }]);
-          // Auto-show dialog if not already open
+          const event = msg.event || {};
+          const etype = event.type || '';
+          // Extract readable text from stream-json event
+          let text = '';
+          if (etype === 'assistant') {
+            const blocks = event.message?.content || [];
+            for (const b of blocks) {
+              if (b.type === 'text' && b.text) text += b.text;
+              else if (b.type === 'tool_use') text += `[调用工具: ${b.name}]`;
+            }
+          } else if (etype === 'user') {
+            const blocks = event.message?.content || [];
+            for (const b of blocks) {
+              if (b.type === 'tool_result') {
+                const content = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
+                text = `[结果] ${content.substring(0, 100)}`;
+              }
+            }
+          }
+          if (text) {
+            setChatMessages(prev => [...prev, { text }]);
+          }
+          // Auto-show dialog
           if (!qrModalOpen && loginCompany) {
             setQrModalOpen(true);
             setLoginPath('session');
@@ -184,12 +205,14 @@ export default function Companies() {
     if (!loginCompany) return;
     setLoginLoading(true);
     try {
-      const { data: result } = await api.post('/api/sync/trigger-login', { company_name: loginCompany.name, company_id: loginCompany.id });
+      // Determine mode: 'session' for interactive chat, 'keepalive' for passive monitoring
+      const mode: string = keepaliveSteps.length > 0 ? 'keepalive' : 'session';
+      const { data: result } = await api.post('/api/sync/trigger-login', { company_name: loginCompany.name, company_id: loginCompany.id, mode });
       setLoginConfirmOpen(false);
-      setLoginPath(result.path || 'keepalive');
+      setLoginPath(mode);
       setSessionId(result.session_id || '');
       setChatMessages([]);
-      setKeepaliveSteps([{ step: '已发送登录指令，等待响应...', status: 'process' }]);
+      setKeepaliveSteps(mode === 'keepalive' ? [{ step: '已发送登录指令，等待响应...', status: 'process' }] : []);
       // Always open the streaming modal to show progress and wait for QR
       setQrImage('');
       setQrModalOpen(true);
@@ -200,13 +223,17 @@ export default function Companies() {
     }
   };
 
-  // Send chat message via WS (TODO: implement WS send from frontend)
-  const sendChatMessage = () => {
-    if (!chatInput.trim()) return;
-    setChatMessages(prev => [...prev, { text: chatInput, isUser: true }]);
-    // The session_message is sent via cloud-server, not directly from frontend WS
-    // For now, messages are just displayed locally
+  // Send chat message to active Claude session via API
+  const sendChatMessage = async () => {
+    if (!chatInput.trim() || !loginCompany) return;
+    const text = chatInput.trim();
+    setChatMessages(prev => [...prev, { text, isUser: true }]);
     setChatInput('');
+    try {
+      await api.post('/api/sync/session-message', { company_id: loginCompany.id, text });
+    } catch {
+      setChatMessages(prev => [...prev, { text: '[发送失败]' }]);
+    }
   };
 
   const openCreate = () => {

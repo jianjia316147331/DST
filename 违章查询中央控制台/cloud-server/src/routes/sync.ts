@@ -54,7 +54,7 @@ export default async function syncRoutes(app: FastifyInstance) {
 
   // POST /api/sync/trigger-login — trigger 12123 login on the node bound to a company
   app.post('/api/sync/trigger-login', { preHandler: [app.authenticate] }, async (request, reply) => {
-    const { company_id, company_name } = request.body as { company_id: number; company_name: string };
+    const { company_id, company_name, mode } = request.body as { company_id: number; company_name: string; mode?: string };
 
     if (!company_id && !company_name) {
       return reply.status(400).send({ error: 'company_id or company_name is required' });
@@ -122,6 +122,7 @@ export default async function syncRoutes(app: FastifyInstance) {
         company_id: company.id,
         company_name: company.name,
         prompt: prompt,
+        mode: mode || 'keepalive',
       }));
 
       // Log the action
@@ -140,6 +141,41 @@ export default async function syncRoutes(app: FastifyInstance) {
     } catch (err: any) {
       return reply.status(500).send({ error: err.message || '发送登录指令失败' });
     }
+  });
+
+  // POST /api/sync/session-message — forward chat message to active Claude session via node
+  app.post('/api/sync/session-message', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id, text } = request.body as { company_id: number; text: string };
+
+    if (!company_id || !text) {
+      return reply.status(400).send({ error: 'company_id and text are required' });
+    }
+
+    const [bindings] = await pool.query(
+      `SELECT b.*, n.node_name, n.status as node_status
+       FROM company_node_bindings b
+       JOIN nodes n ON b.node_id = n.id
+       WHERE b.company_id = ? AND b.is_active = 1`,
+      [company_id]
+    );
+
+    const binding = (bindings as any[])[0];
+    if (!binding) {
+      return reply.status(400).send({ error: '该公司未绑定设备' });
+    }
+
+    const nodeWs = getNodeWs(binding.node_name);
+    if (!nodeWs || nodeWs.readyState !== WebSocket.OPEN) {
+      return reply.status(400).send({ error: '设备 WebSocket 未连接' });
+    }
+
+    nodeWs.send(JSON.stringify({
+      type: 'session_message',
+      company_id: String(company_id),
+      text: text,
+    }));
+
+    return { ok: true };
   });
 
   // GET /api/sync/status/:nodeId — check node sync status
