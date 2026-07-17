@@ -460,7 +460,7 @@ export default function Companies() {
             )}
             {qrImage ? (
               <div style={{ textAlign: 'center' }}>
-                <Image src={qrImage} alt="二维码" style={{ maxWidth: 300 }} preview={false} />
+                <Image src={qrImage} alt="二维码" style={{ maxWidth: 300, cursor: 'zoom-in' }} />
                 <p style={{ marginTop: 12, color: '#666' }}>请用 12123 App 扫描二维码登录</p>
               </div>
             ) : (
