@@ -584,7 +584,7 @@ class NodeAgent:
         Routes to keepalive (fast, PinchTab) or session (interactive, Claude) path.
         """
         # 按 mode 判定路由：keepalive(保活) 或 session(Claude交互)
-        _USE_KEEPALIVE = False
+        _USE_KEEPALIVE = True
 
         if _USE_KEEPALIVE:
             await self._trigger_keepalive_login(msg)
@@ -704,19 +704,19 @@ class NodeAgent:
                             if "__LOGIN_FAILED__" in text:
                                 reason = text.split("__LOGIN_FAILED__:")[-1].strip().split("\n")[0].strip() if ":" in text else "unknown"
                                 self._ws_send({"type": "login_failed", "company_name": company_name, "reason": reason})
-                    # Progress from tool results
+                    # Progress from tool results — keepalive mode only
                     elif etype == "user" and event.get("message", {}).get("content", []):
                         for block in event["message"]["content"]:
                             if block.get("type") == "tool_result":
                                 tool_id = block.get("tool_use_id", "")
                                 tool_content = str(block.get("content", ""))[:200]
                                 print(f"[node_agent] claude tool_result {tool_id[:20]}: {tool_content[:100]}")
-                                progress_text = tool_content[:120]
-                                self._ws_send({
-                                    "type": "keepalive_login_progress",
-                                    "company_name": company_name,
-                                    "progress": progress_text,
-                                })
+                                if mode != "session":
+                                    self._ws_send({
+                                        "type": "keepalive_login_progress",
+                                        "company_name": company_name,
+                                        "progress": tool_content[:120],
+                                    })
                 # stdout exhausted
                 exit_code = proc.wait()
                 stderr_out = proc.stderr.read()
@@ -846,11 +846,13 @@ class NodeAgent:
             # 注册 profile
             platform_url = _province_to_url(province)
             try:
-                subprocess.run(
-                    [sys.executable, os.path.join(skill_dir, "violation_helper.py"),
+                reg_cmd = [sys.executable, os.path.join(skill_dir, "violation_helper.py"),
                      "profile-register", "--company", company_name,
                      "--profile-name", profile_name,
-                     "--platform-url", platform_url],
+                     "--platform-url", platform_url]
+                if instance_port:
+                    reg_cmd += ["--instance-port", str(instance_port)]
+                subprocess.run(reg_cmd,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=15
                 )
             except Exception as e:
