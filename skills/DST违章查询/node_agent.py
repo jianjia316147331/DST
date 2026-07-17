@@ -40,7 +40,7 @@ WEBSOCKET_RECONNECT_DELAY = 5   # seconds
 HEARTBEAT_INTERVAL = 10          # seconds
 KEEPALIVE_REPORT_INTERVAL = 300  # 5 minutes
 SYNC_INTERVAL = 1800             # 30 minutes periodic sync fallback
-CLAUDE_PATH = "claude"
+CLAUDE_PATH = "/home/openclaw/.npm-global/bin/claude"
 
 
 # ── Setup ───────────────────────────────────────────────────────
@@ -579,71 +579,95 @@ class NodeAgent:
         Spawn Claude Code to open 12123 login page and capture QR code.
         """
         company_name = msg.get("company_name", "")
-        province_url = msg.get("province_url", "")
+        prompt = msg.get("prompt", "")
+        if not prompt:
+            self._ws_send({
+                "type": "login_failed", "company_name": company_name,
+                "reason": "未收到登录提示词"
+            })
+            return
 
         print(f"[node_agent] 触发扫码登录: {company_name}")
 
-        # Start a Claude session to get QR code
-        session_id = f"login-{company_name}-{int(time.time())}"
-        prompt = (
-            f"登录{company_name}的12123账号。"
-            f"请导航到 provincial 12123 登录页面，截图二维码保存到 "
-            f"violation_query/screenshots/qr_{company_name}.png，"
-            f"然后输出 __QR_READY__:qr_{company_name}.png"
-        )
-
         try:
             proc = subprocess.Popen(
-                [CLAUDE_PATH, "-p", prompt],
+                [CLAUDE_PATH, "-p", prompt,
+                 "--permission-mode", "auto",
+                 "--output-format", "stream-json",
+                 "--verbose",
+                 "--include-partial-messages"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 universal_newlines=True,
                 bufsize=1,
             )
+            print(f"[node_agent] Claude 子进程已启动: PID={proc.pid}")
         except FileNotFoundError:
             self._ws_send({
                 "type": "login_failed", "company_name": company_name,
                 "reason": "Claude CLI 未找到"
             })
             return
+        except Exception as e:
+            print(f"[node_agent] Popen 异常: {e}")
+            self._ws_send({
+                "type": "login_failed", "company_name": company_name,
+                "reason": f"启动 Claude 失败: {e}"
+            })
+            return
 
-        # Monitor output for QR ready marker
-        import threading
+        # Monitor stream-json output for QR ready marker and progress
+        import threading, json as _json
         def _monitor_qr():
             try:
                 for line in proc.stdout:
                     line = line.strip()
-                    if "__QR_READY__" in line:
-                        # Extract filename
-                        qr_file = line.split("__QR_READY__:")[-1].strip()
-                        # Read and base64
-                        import base64
-                        from lib.core import _find_project_root
-                        root = _find_project_root()
-                        qr_path = os.path.join(root, qr_file) if not os.path.isabs(qr_file) else qr_file
-                        if os.path.exists(qr_path):
-                            with open(qr_path, "rb") as f:
-                                img_b64 = base64.b64encode(f.read()).decode("utf-8")
-                            self._ws_send({
-                                "type": "qr_code",
-                                "company_name": company_name,
-                                "image_base64": img_b64,
-                                "qr_expires_at": datetime.now().isoformat(),
-                            })
-                    elif "__LOGIN_OK__" in line:
-                        self._ws_send({
-                            "type": "login_ok",
-                            "company_name": company_name,
-                        })
-                    elif "__LOGIN_FAILED__" in line:
-                        reason = line.split("__LOGIN_FAILED__:")[-1].strip() if ":" in line else "unknown"
-                        self._ws_send({
-                            "type": "login_failed",
-                            "company_name": company_name,
-                            "reason": reason,
-                        })
-            except Exception:
-                pass
+                    if not line:
+                        continue
+                    try:
+                        event = _json.loads(line)
+                    except Exception:
+                        continue
+                    etype = event.get("type", "")
+                    # Track assistant text for markers
+                    if etype == "assistant":
+                        content = event.get("message", {}).get("content", [])
+                        for block in content:
+                            text = block.get("text", "") if isinstance(block, dict) else ""
+                            if "__QR_READY__" in text:
+                                qr_file = text.split("__QR_READY__:")[-1].strip().split("\n")[0].strip()
+                                import base64
+                                from lib.core import _find_project_root
+                                root = _find_project_root()
+                                qr_path = os.path.join(root, qr_file) if not os.path.isabs(qr_file) else qr_file
+                                if os.path.exists(qr_path):
+                                    with open(qr_path, "rb") as f:
+                                        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+                                    self._ws_send({
+                                        "type": "qr_code",
+                                        "company_name": company_name,
+                                        "image_base64": img_b64,
+                                        "qr_expires_at": datetime.now().isoformat(),
+                                    })
+                                    print(f"[node_agent] QR sent for {company_name}")
+                            if "__LOGIN_OK__" in text:
+                                self._ws_send({"type": "login_ok", "company_name": company_name})
+                            if "__LOGIN_FAILED__" in text:
+                                reason = text.split("__LOGIN_FAILED__:")[-1].strip().split("\n")[0].strip() if ":" in text else "unknown"
+                                self._ws_send({"type": "login_failed", "company_name": company_name, "reason": reason})
+                    # Track progress from tool use
+                    elif etype == "user" and event.get("message", {}).get("content", []):
+                        for block in event["message"]["content"]:
+                            if block.get("type") == "tool_result":
+                                tool_id = block.get("tool_use_id", "")
+                                tool_content = str(block.get("content", ""))[:200]
+                                print(f"[node_agent] claude tool_result {tool_id[:20]}: {tool_content[:100]}")
+                # stdout exhausted
+                exit_code = proc.wait()
+                stderr_out = proc.stderr.read()
+                print(f"[node_agent] Claude 子进程退出: exit={exit_code} stderr={stderr_out[:500] if stderr_out else '(empty)'}")
+            except Exception as e:
+                print(f"[node_agent] _monitor_qr 异常: {e}")
 
         t = threading.Thread(target=_monitor_qr, daemon=True)
         t.start()
