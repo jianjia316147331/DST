@@ -583,8 +583,8 @@ class NodeAgent:
         """Handle trigger_login command from cloud server.
         Routes to keepalive (fast, PinchTab) or session (interactive, Claude) path.
         """
-        # TODO: 临时统一走保活路径验证，后续恢复 mode 判定
-        _USE_KEEPALIVE = True
+        # 按 mode 判定路由：keepalive(保活) 或 session(Claude交互)
+        _USE_KEEPALIVE = False
 
         if _USE_KEEPALIVE:
             await self._trigger_keepalive_login(msg)
