@@ -83,7 +83,6 @@ export default function Companies() {
           setQrCompanyName(msg.company_name);
           setQrImage(`data:image/png;base64,${msg.image_base64}`);
           setQrModalOpen(true);
-          setLoginPath('keepalive');
         } else if (msg.type === 'login_ok') {
           message.success(`${msg.company_name} 登录成功`);
           setQrModalOpen(false);
@@ -101,8 +100,6 @@ export default function Companies() {
             const filtered = prev.filter(s => s.step !== msg.progress);
             return [...filtered, { step: msg.progress, status: 'done' }];
           });
-          // Auto-show keepalive progress dialog
-          setLoginPath('keepalive');
           if (!qrModalOpen) {
             setQrCompanyName(msg.company_name);
             setQrModalOpen(true);
