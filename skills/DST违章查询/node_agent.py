@@ -145,9 +145,7 @@ class NodeAgent:
                 await self._connect_ws()
             except Exception as e:
                 print(f"[node_agent] WebSocket 错误: {e}, {WEBSOCKET_RECONNECT_DELAY}s 后重连...")
-            # Whether normal disconnect or exception, clean up and delay before retry
-            self._cleanup_connection()
-            if self._running:
+                self._register_event.clear()  # reset for reconnection
                 await asyncio.sleep(WEBSOCKET_RECONNECT_DELAY)
 
     async def stop(self):
@@ -168,23 +166,6 @@ class NodeAgent:
             except Exception:
                 pass
         print("[node_agent] 已停止")
-
-    async def _cleanup_connection(self):
-        """Cancel periodic tasks and clear stale state on disconnect."""
-        # Cancel periodic tasks
-        for task in [self._heartbeat_task, self._keepalive_task, self._sync_task]:
-            if task and not task.done():
-                task.cancel()
-        self._heartbeat_task = None
-        self._keepalive_task = None
-        self._sync_task = None
-        # Clear stale writer
-        self._writer = None
-        # Reset register event for next connection
-        self._register_event.clear()
-        # Clear bridge reference
-        self.bridge = None
-        print("[node_agent] 连接已断开，清理完成")
 
     async def _connect_ws(self):
         """Establish WebSocket connection using native TCP sockets (zero deps)."""
@@ -371,20 +352,18 @@ class NodeAgent:
     def _ws_send(self, msg):
         """Send a message via WebSocket (thread-safe)."""
         try:
-            writer = self._writer  # snapshot to avoid race with cleanup
-            if writer is not None:
+            if self._writer is not None:
                 loop = asyncio.get_event_loop()
                 # call_soon_threadsafe works from any thread
                 loop.call_soon_threadsafe(
-                    lambda w=writer, m=msg: asyncio.ensure_future(
-                        self._safe_ws_send(w, m)
+                    lambda m=msg: asyncio.ensure_future(
+                        self._ws_send_native(self._writer, m)
                     )
                 )
         except RuntimeError:
             # No event loop in this thread — fall back to direct send
             try:
-                writer = self._writer
-                if self._running and writer is not None:
+                if self._running and self._writer is not None:
                     payload = json.dumps(msg, ensure_ascii=False).encode("utf-8")
                     frame = bytearray()
                     frame.append(0x81)
@@ -400,18 +379,11 @@ class NodeAgent:
                     mask_key = os.urandom(4)
                     frame.extend(mask_key)
                     frame.extend(bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload)))
-                    writer.write(bytes(frame))
+                    self._writer.write(bytes(frame))
             except Exception as e:
                 print(f"[node_agent] 发送失败: {e}")
         except Exception as e:
             print(f"[node_agent] 发送失败: {e}")
-
-    async def _safe_ws_send(self, writer, msg):
-        """Send a WebSocket message with error suppression for stale connections."""
-        try:
-            await self._ws_send_native(writer, msg)
-        except Exception:
-            pass  # Connection likely closed, cleanup will handle it
 
     def _detect_keepalive_services(self):
         """Detect which keepalive services are installed on this device."""
@@ -779,6 +751,61 @@ class NodeAgent:
 
         print(f"[node_agent] 保活登录触发: {company_name}")
 
+        # ── 检查是否已有保活程序在运行 ──
+        from lib.core import _get_data_dir
+        data_dir = _get_data_dir()
+        safe_name = company_name  # keepalive uses raw company name
+        pid_file = os.path.join(data_dir, f"keepalive_{safe_name}.pid")
+        health_file = os.path.join(data_dir, f"keepalive_health_{safe_name}.json")
+
+        keepalive_alive = False
+        if os.path.exists(pid_file):
+            try:
+                with open(pid_file, "r") as f:
+                    old_pid = int(f.read().strip())
+                os.kill(old_pid, 0)  # 检查进程是否存在
+                keepalive_alive = True
+                print(f"[node_agent] 保活程序已在运行 PID={old_pid}，复用")
+            except (OSError, ValueError):
+                pass
+
+        if keepalive_alive:
+            # 发送已有 QR（如有）
+            import glob as _glob
+            qr_pattern = os.path.join(data_dir, f"recovery_qr_{safe_name}_*.png")
+            qr_files = sorted(_glob.glob(qr_pattern))
+            if qr_files:
+                try:
+                    with open(qr_files[-1], "rb") as f:
+                        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+                    self._ws_send({
+                        "type": "qr_code", "company_name": company_name,
+                        "image_base64": img_b64,
+                        "qr_expires_at": (datetime.now() + timedelta(minutes=5)).isoformat(),
+                    })
+                    print(f"[node_agent] 复用已有 QR for {company_name}")
+                except Exception as e:
+                    print(f"[node_agent] 复用 QR 失败: {e}")
+
+            # 发送当前进度
+            if os.path.exists(health_file):
+                try:
+                    with open(health_file, "r") as f:
+                        h = json.load(f)
+                    progress = h.get("progress", h.get("state", "保活程序运行中"))
+                    self._ws_send({
+                        "type": "keepalive_login_progress",
+                        "company_name": company_name,
+                        "progress": progress,
+                    })
+                except Exception:
+                    pass
+
+            # 启动监控（如果还没在监控）
+            asyncio.ensure_future(self._monitor_existing_keepalive(
+                company_name, health_file, data_dir, safe_name))
+            return
+
         skill_dir = os.path.dirname(os.path.abspath(__file__))
         daemon_path = os.path.join(skill_dir, "keepalive_daemon.py")
         if not os.path.exists(daemon_path):
@@ -941,6 +968,63 @@ class NodeAgent:
                           "reason": "保活登录超时（15分钟）"})
 
         asyncio.ensure_future(_monitor_keepalive())
+
+    async def _monitor_existing_keepalive(self, company_name, health_file, data_dir, safe_name):
+        """监控已在运行的保活程序，跟踪 QR 更新和登录结果。"""
+        import glob as _glob
+        last_qr = ""
+        last_progress = ""
+        deadline = time.time() + 900
+
+        while time.time() < deadline:
+            await asyncio.sleep(5)
+
+            # 检查 QR 更新
+            qr_pattern = os.path.join(data_dir, f"recovery_qr_{safe_name}_*.png")
+            qr_files = sorted(_glob.glob(qr_pattern))
+            if qr_files:
+                latest = qr_files[-1]
+                if latest != last_qr:
+                    last_qr = latest
+                    try:
+                        with open(latest, "rb") as f:
+                            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+                        self._ws_send({
+                            "type": "qr_code", "company_name": company_name,
+                            "image_base64": img_b64,
+                            "qr_expires_at": (datetime.now() + timedelta(minutes=5)).isoformat(),
+                        })
+                    except Exception:
+                        pass
+
+            # 检查进度
+            if os.path.exists(health_file):
+                try:
+                    with open(health_file, "r") as f:
+                        h = json.load(f)
+                    progress = h.get("progress", h.get("state", ""))
+                    if progress and progress != last_progress:
+                        last_progress = progress
+                        self._ws_send({
+                            "type": "keepalive_login_progress",
+                            "company_name": company_name,
+                            "progress": progress,
+                        })
+                    if h.get("state") == "logged_in":
+                        self._ws_send({"type": "login_ok", "company_name": company_name})
+                        return
+                except Exception:
+                    pass
+
+            # 检查保活是否还活着
+            pid_file = os.path.join(data_dir, f"keepalive_{safe_name}.pid")
+            if os.path.exists(pid_file):
+                try:
+                    with open(pid_file, "r") as f:
+                        pid = int(f.read().strip())
+                    os.kill(pid, 0)
+                except (OSError, ValueError):
+                    break  # 进程已死
 
     def _handle_session_message(self, msg):
         """Forward a chat message from frontend to the active Claude session."""
