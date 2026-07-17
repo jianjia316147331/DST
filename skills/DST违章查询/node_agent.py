@@ -438,6 +438,9 @@ class NodeAgent:
         elif msg_type == "trigger_login":
             await self._handle_trigger_login(msg)
 
+        elif msg_type == "session_message":
+            self._handle_session_message(msg)
+
         elif msg_type == "start_keepalive_login":
             await self._handle_start_keepalive_login(msg)
 
@@ -579,7 +582,10 @@ class NodeAgent:
         Spawn Claude Code to open 12123 login page and capture QR code.
         """
         company_name = msg.get("company_name", "")
+        company_id = str(msg.get("company_id", ""))
         prompt = msg.get("prompt", "")
+        mode = msg.get("mode", "keepalive")  # "keepalive" or "session"
+
         if not prompt:
             self._ws_send({
                 "type": "login_failed", "company_name": company_name,
@@ -587,36 +593,60 @@ class NodeAgent:
             })
             return
 
-        print(f"[node_agent] 触发扫码登录: {company_name}")
+        print(f"[node_agent] 触发扫码登录: {company_name} (mode={mode})")
+
+        # Build Claude command based on mode
+        if mode == "session":
+            # Interactive session: no -p, stream-json I/O
+            cmd = [CLAUDE_PATH,
+                   "--input-format", "stream-json",
+                   "--output-format", "stream-json",
+                   "--verbose",
+                   "--include-partial-messages",
+                   "--permission-mode", "auto"]
+            stdin_pipe = subprocess.PIPE
+        else:
+            # keepalive: one-shot print mode
+            cmd = [CLAUDE_PATH, "-p", prompt,
+                   "--output-format", "stream-json",
+                   "--verbose",
+                   "--include-partial-messages",
+                   "--permission-mode", "auto"]
+            stdin_pipe = None
 
         try:
             proc = subprocess.Popen(
-                [CLAUDE_PATH, "-p", prompt,
-                 "--permission-mode", "auto",
-                 "--output-format", "stream-json",
-                 "--verbose",
-                 "--include-partial-messages"],
+                cmd,
+                stdin=stdin_pipe,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 universal_newlines=True,
                 bufsize=1,
             )
-            print(f"[node_agent] Claude 子进程已启动: PID={proc.pid}")
+            print(f"[node_agent] Claude 子进程已启动: PID={proc.pid} mode={mode}")
         except FileNotFoundError:
-            self._ws_send({
-                "type": "login_failed", "company_name": company_name,
-                "reason": "Claude CLI 未找到"
-            })
+            self._ws_send({"type": "login_failed", "company_name": company_name, "reason": "Claude CLI 未找到"})
             return
         except Exception as e:
             print(f"[node_agent] Popen 异常: {e}")
-            self._ws_send({
-                "type": "login_failed", "company_name": company_name,
-                "reason": f"启动 Claude 失败: {e}"
-            })
+            self._ws_send({"type": "login_failed", "company_name": company_name, "reason": f"启动 Claude 失败: {e}"})
             return
 
-        # Monitor stream-json output for QR ready marker and progress
+        # For session mode, send the prompt as first user message
+        if mode == "session" and proc.stdin:
+            import json as _json
+            first_msg = _json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": [{"type": "text", "text": prompt}]}
+            }) + "\n"
+            proc.stdin.write(first_msg)
+            proc.stdin.flush()
+            # Track session for message forwarding
+            self._claude_sessions = getattr(self, '_claude_sessions', {})
+            self._claude_sessions[company_id] = proc
+            print(f"[node_agent] Session started for {company_name} ({company_id})")
+
+        # Monitor stream-json output
         import threading, json as _json
         def _monitor_qr():
             try:
@@ -629,6 +659,15 @@ class NodeAgent:
                     except Exception:
                         continue
                     etype = event.get("type", "")
+
+                    # For session mode: forward all events as session_chunk
+                    if mode == "session":
+                        self._ws_send({
+                            "type": "session_chunk",
+                            "company_name": company_name,
+                            "event": event,
+                        })
+
                     # Track assistant text for markers
                     if etype == "assistant":
                         content = event.get("message", {}).get("content", [])
@@ -655,14 +694,13 @@ class NodeAgent:
                             if "__LOGIN_FAILED__" in text:
                                 reason = text.split("__LOGIN_FAILED__:")[-1].strip().split("\n")[0].strip() if ":" in text else "unknown"
                                 self._ws_send({"type": "login_failed", "company_name": company_name, "reason": reason})
-                    # Track progress from tool use — send to frontend
+                    # Progress from tool results
                     elif etype == "user" and event.get("message", {}).get("content", []):
                         for block in event["message"]["content"]:
                             if block.get("type") == "tool_result":
                                 tool_id = block.get("tool_use_id", "")
                                 tool_content = str(block.get("content", ""))[:200]
                                 print(f"[node_agent] claude tool_result {tool_id[:20]}: {tool_content[:100]}")
-                                # Extract readable progress from tool result
                                 progress_text = tool_content[:120]
                                 self._ws_send({
                                     "type": "keepalive_login_progress",
@@ -673,11 +711,37 @@ class NodeAgent:
                 exit_code = proc.wait()
                 stderr_out = proc.stderr.read()
                 print(f"[node_agent] Claude 子进程退出: exit={exit_code} stderr={stderr_out[:500] if stderr_out else '(empty)'}")
+                # Clean up session tracking
+                if mode == "session":
+                    self._ws_send({"type": "session_done", "company_name": company_name, "reason": f"exit={exit_code}"})
+                    self._claude_sessions = getattr(self, '_claude_sessions', {})
+                    self._claude_sessions.pop(company_id, None)
             except Exception as e:
                 print(f"[node_agent] _monitor_qr 异常: {e}")
 
         t = threading.Thread(target=_monitor_qr, daemon=True)
         t.start()
+
+    def _handle_session_message(self, msg):
+        """Forward a chat message from frontend to the active Claude session."""
+        company_id = str(msg.get("company_id", ""))
+        text = msg.get("text", "")
+        self._claude_sessions = getattr(self, '_claude_sessions', {})
+        proc = self._claude_sessions.get(company_id)
+        if not proc or not proc.stdin:
+            print(f"[node_agent] session_message: no active session for {company_id}")
+            return
+        try:
+            import json as _json
+            user_msg = _json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": [{"type": "text", "text": text}]}
+            }) + "\n"
+            proc.stdin.write(user_msg)
+            proc.stdin.flush()
+            print(f"[node_agent] session_message sent to {company_id}: {text[:60]}")
+        except Exception as e:
+            print(f"[node_agent] session_message write error: {e}")
 
     async def _handle_start_keepalive_login(self, msg):
         """Handle start_keepalive_login — 激活保活服务登录（路径A）。"""
