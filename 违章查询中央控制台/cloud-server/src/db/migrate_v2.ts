@@ -133,6 +133,9 @@ const schema = [
     INDEX idx_rs_node (node_id)
   )`,
   `ALTER TABLE reporting_schedules ADD COLUMN frequency VARCHAR(20) DEFAULT 'custom' AFTER enabled`,
+
+  // ── companies: notify_chat_name ──
+  `ALTER TABLE companies ADD COLUMN notify_chat_name VARCHAR(200)`,
 ];
 
 async function migrate() {

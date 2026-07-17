@@ -1,5 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import pool from '../db/index.js';
+import { getNodeWs, broadcastToFrontend } from '../ws/handler.js';
+import { WebSocket } from 'ws';
 
 export default async function syncRoutes(app: FastifyInstance) {
   // GET /api/sync/logs — list sync logs
@@ -48,6 +50,96 @@ export default async function syncRoutes(app: FastifyInstance) {
     );
 
     return { ok: true, message: 'Sync triggered' };
+  });
+
+  // POST /api/sync/trigger-login — trigger 12123 login on the node bound to a company
+  app.post('/api/sync/trigger-login', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { company_id, company_name } = request.body as { company_id: number; company_name: string };
+
+    if (!company_id && !company_name) {
+      return reply.status(400).send({ error: 'company_id or company_name is required' });
+    }
+
+    // Find the company
+    let company: any;
+    if (company_id) {
+      const [rows] = await pool.query('SELECT * FROM companies WHERE id = ?', [company_id]);
+      company = (rows as any[])[0];
+    } else {
+      const [rows] = await pool.query('SELECT * FROM companies WHERE name = ?', [company_name]);
+      company = (rows as any[])[0];
+    }
+
+    if (!company) {
+      return reply.status(404).send({ error: 'Company not found' });
+    }
+
+    // Find the active node binding
+    const [bindings] = await pool.query(
+      `SELECT b.*, n.node_name, n.status as node_status
+       FROM company_node_bindings b
+       JOIN nodes n ON b.node_id = n.id
+       WHERE b.company_id = ? AND b.is_active = 1`,
+      [company.id]
+    );
+
+    const binding = (bindings as any[])[0];
+    if (!binding) {
+      return reply.status(400).send({ error: '该公司未绑定设备，请先在控制台中绑定设备' });
+    }
+
+    if (binding.node_status !== 'online') {
+      return reply.status(400).send({ error: `设备 "${binding.node_name}" 当前离线，请确认设备已启动` });
+    }
+
+    // Send trigger_login message to the node via WebSocket
+    const nodeWs = getNodeWs(binding.node_name);
+    if (!nodeWs || nodeWs.readyState !== WebSocket.OPEN) {
+      return reply.status(400).send({ error: `设备 "${binding.node_name}" WebSocket 未连接，请重启设备` });
+    }
+
+    try {
+      // Build the login prompt centrally
+      const LQ = '“'; // "
+      const RQ = '”'; // "
+      let prompt = `启动违章查询${LQ}${company.name}${RQ}登录任务，本次只登录不执行（严禁）查询`;
+
+      const contactName = company.contact_name || '';
+      const contactPhone = company.contact_phone || '';
+      const notifyChat = company.notify_chat_name || '';
+
+      if (notifyChat) {
+        const atInfo = contactName ? `@${contactName}（${contactPhone}）` : '';
+        prompt += `。发送到${LQ}${notifyChat}${RQ}群，并${LQ}${atInfo}${RQ}`;
+      } else if (contactName && contactPhone) {
+        prompt += `。发送给${LQ}${contactName}（${contactPhone}）${RQ}扫码`;
+      }
+
+      prompt += `。获取截图后保存到 violation_query/screenshots/qr_${company.name}.png，然后输出 __QR_READY__:qr_${company.name}.png`;
+
+      nodeWs.send(JSON.stringify({
+        type: 'trigger_login',
+        company_id: company.id,
+        company_name: company.name,
+        prompt: prompt,
+      }));
+
+      // Log the action
+      await pool.query(
+        `INSERT INTO logs (level, category, message)
+         VALUES ('INFO', 'system', ?)`,
+        [`触发登录: ${company.name} (设备 ${binding.node_name})`]
+      );
+
+      return {
+        ok: true,
+        message: `已向 ${company.name} 发送登录指令`,
+        path: 'keepalive',
+        node_name: binding.node_name,
+      };
+    } catch (err: any) {
+      return reply.status(500).send({ error: err.message || '发送登录指令失败' });
+    }
   });
 
   // GET /api/sync/status/:nodeId — check node sync status

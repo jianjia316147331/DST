@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { WebSocket } from 'ws';
 import pool from '../db/index.js';
-import { upsertCompaniesList, upsertVehicle, upsertViolations, validateCompanies } from '../db/sync.js';
+import { upsertCompaniesList, upsertVehicle, upsertViolations, validateCompanies, getKnownCompanyNames } from '../db/sync.js';
 
 // Connected tray nodes: Map<node_id, WebSocket>
 const nodes = new Map<string, WebSocket>();
@@ -188,7 +188,7 @@ async function handleMessage(ws: WebSocket, raw: string) {
         if (Array.isArray(vehicles)) vehicles.forEach((v: any) => allCompanyNames.add(v.company_name));
         if (Array.isArray(violations)) violations.forEach((v: any) => allCompanyNames.add(v.company_name));
 
-        const knownCompanies = await validateCompanies([...allCompanyNames]);
+        const knownCompanies = await getKnownCompanyNames([...allCompanyNames]);
         const unknownCompanies = [...allCompanyNames].filter(n => !knownCompanies.has(n));
 
         if (unknownCompanies.length > 0) {
@@ -280,7 +280,7 @@ async function handleMessage(ws: WebSocket, raw: string) {
       if (Array.isArray(keepaliveCompanies)) {
         // Validate companies
         const names = keepaliveCompanies.map((c: any) => c.name);
-        const known = await validateCompanies(names);
+        const known = await getKnownCompanyNames(names);
         const unknownNames = names.filter((n: string) => !known.has(n));
         if (unknownNames.length > 0) {
           console.warn(`[Keepalive] 未知企业: ${unknownNames.join(', ')}`);
@@ -402,6 +402,11 @@ async function handleMessage(ws: WebSocket, raw: string) {
 }
 
 export default async function wsHandler(app: FastifyInstance) {
+  // 启动时将所有节点标记为离线（进程崩溃时 close 事件不保证触发）
+  // 节点重新 register 后会自动切回 online
+  pool.query("UPDATE nodes SET status='offline' WHERE status='online'").catch(() => {});
+  console.log('[ws] 启动：将所有在线节点重置为 offline，等待 re-register');
+
   app.get('/ws', { websocket: true }, (socket, req) => {
     // Determine if this is a tray node or frontend client
     const url = new URL(req.url || '', `http://${req.headers.host}`);

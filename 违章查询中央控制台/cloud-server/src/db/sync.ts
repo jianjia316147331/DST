@@ -82,6 +82,24 @@ export async function upsertViolations(violations: any[]): Promise<{ inserted: n
   return { inserted, updated };
 }
 
+/**
+ * Query the database for known company names, return as a Set for O(1) lookup.
+ */
+export async function getKnownCompanyNames(names: string[]): Promise<Set<string>> {
+  if (!Array.isArray(names) || names.length === 0) return new Set();
+  const conn = await pool.getConnection();
+  try {
+    const placeholders = names.map(() => '?').join(',');
+    const [rows] = await conn.query(
+      `SELECT name FROM companies WHERE name IN (${placeholders})`,
+      names
+    ) as any[];
+    return new Set((rows as any[]).map((r: any) => r.name));
+  } finally {
+    conn.release();
+  }
+}
+
 export function validateCompanies(companies: any[]): { valid: any[]; errors: string[] } {
   const valid: any[] = [];
   const errors: string[] = [];

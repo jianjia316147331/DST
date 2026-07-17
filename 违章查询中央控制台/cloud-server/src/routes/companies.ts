@@ -52,7 +52,7 @@ export default async function companyRoutes(app: FastifyInstance) {
 
   // Create company
   app.post('/api/companies', { preHandler: [app.authenticate] }, async (request, reply) => {
-    const { name, short_name, province, feishu_contact_id, contact_name, contact_phone } =
+    const { name, short_name, province, feishu_contact_id, contact_name, contact_phone, notify_chat_name } =
       request.body as Record<string, string>;
 
     if (!name || !province || !contact_name || !contact_phone) {
@@ -60,9 +60,9 @@ export default async function companyRoutes(app: FastifyInstance) {
     }
 
     const [result] = await pool.query(
-      `INSERT INTO companies (name, short_name, province, feishu_contact_id, contact_name, contact_phone)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [name, short_name || null, province, feishu_contact_id || null, contact_name, contact_phone]
+      `INSERT INTO companies (name, short_name, province, feishu_contact_id, contact_name, contact_phone, notify_chat_name)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [name, short_name || null, province, feishu_contact_id || null, contact_name, contact_phone, notify_chat_name || null]
     );
 
     // Fetch back the inserted row
@@ -75,14 +75,14 @@ export default async function companyRoutes(app: FastifyInstance) {
   // Update company
   app.put('/api/companies/:id', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string };
-    const { name, short_name, province, feishu_contact_id, contact_name, contact_phone } =
+    const { name, short_name, province, feishu_contact_id, contact_name, contact_phone, notify_chat_name } =
       request.body as Record<string, string>;
 
     const [result] = await pool.query(
       `UPDATE companies SET name=?, short_name=?, province=?,
-       feishu_contact_id=?, contact_name=?, contact_phone=?, updated_at=NOW()
+       feishu_contact_id=?, contact_name=?, contact_phone=?, notify_chat_name=?, updated_at=NOW()
        WHERE id=?`,
-      [name, short_name || null, province, feishu_contact_id || null, contact_name, contact_phone, id]
+      [name, short_name || null, province, feishu_contact_id || null, contact_name, contact_phone, notify_chat_name || null, id]
     );
 
     if (result.affectedRows === 0) return reply.status(404).send({ error: 'Company not found' });
