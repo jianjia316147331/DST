@@ -417,9 +417,9 @@ class PinchTabClient:
         Args:
             tab_id: Tab ID.
             action: Action dict, e.g.
-                ``{"kind": "click", "ref": "e2"}``
-                ``{"kind": "type", "ref": "e5", "text": "hello"}``
-                ``{"kind": "press", "key": "Enter"}``
+                ``{"action": "click", "ref": "e2"}``
+                ``{"action": "type", "ref": "e5", "text": "hello"}``
+                ``{"action": "press", "key": "Enter"}``
         """
         return self._bridge(tab_id, "POST", "/action", action)
 
@@ -431,15 +431,15 @@ class PinchTabClient:
 
     def click(self, tab_id, ref):
         """Click an element by its accessibility ref (e.g. ``"e2"``)."""
-        return self.action(tab_id, {"kind": "click", "ref": ref})
+        return self.action(tab_id, {"action": "click", "ref": ref})
 
     def type_text(self, tab_id, ref, text):
         """Type *text* into an element by its ref."""
-        return self.action(tab_id, {"kind": "type", "ref": ref, "text": text})
+        return self.action(tab_id, {"action": "type", "ref": ref, "text": text})
 
     def press_key(self, tab_id, key):
         """Press a keyboard key (``"Enter"``, ``"Escape"``, ``"Tab"``, etc.)."""
-        return self.action(tab_id, {"kind": "press", "key": key})
+        return self.action(tab_id, {"action": "press", "key": key})
 
     # ── find & wait ───────────────────────────────────────────────────
 
