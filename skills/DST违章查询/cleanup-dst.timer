@@ -2,6 +2,7 @@
 Description=Hourly DST violation query cleanup
 
 [Timer]
+OnBootSec=2min
 OnCalendar=hourly
 RandomizedDelaySec=300
 Persistent=true

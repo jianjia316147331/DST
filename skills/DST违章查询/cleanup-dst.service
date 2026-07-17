@@ -3,6 +3,8 @@ Description=DST Violation Query Cleanup (zombie tabs + stale files)
 
 [Service]
 Type=oneshot
+User=openclaw
+Environment="HOME=/home/openclaw"
 Environment="PATH=/home/openclaw/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=/opt/aiext/bin/python3 /home/openclaw/.claude/skills/DST违章查询/cleanup_daemon.py \
     --project-root /home/openclaw
