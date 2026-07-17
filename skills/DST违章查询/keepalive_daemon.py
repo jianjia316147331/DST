@@ -1212,9 +1212,33 @@ def _auto_recover_login(company, instance_port, platform_url, project_root, log,
                 instance_port=instance_port, timeout=30
             )
             if nav_result.returncode != 0:
-                log.error(f"Navigation failed: {nav_result.stderr[:200]}")
-                time.sleep(10)
-                continue
+                stderr_text = (nav_result.stderr or "").lower()
+                if "tab" in stderr_text and ("not found" in stderr_text or "404" in stderr_text):
+                    log.warning("Tab not found during auto-recovery — creating fresh tab")
+                    new_tab_id = _create_keepalive_tab(instance_port, UNIT_LOGIN_URL,
+                                                       project_root, company, log)
+                    if new_tab_id:
+                        os.environ["VIOLATION_TAB_ID"] = new_tab_id
+                        tab_file = os.path.join(_get_data_dir(project_root),
+                                                f"keepalive_tab_{_safe_name(company)}.txt")
+                        _save_tab_id(tab_file, new_tab_id)
+                        log.info("Retrying navigation with fresh tab...")
+                        nav_result = _run_pinchtab(
+                            ["nav", UNIT_LOGIN_URL],
+                            instance_port=instance_port, timeout=30
+                        )
+                        if nav_result.returncode != 0:
+                            log.error(f"Navigation still failed after fresh tab: {nav_result.stderr[:200]}")
+                            time.sleep(10)
+                            continue
+                    else:
+                        log.error("Failed to create fresh tab")
+                        time.sleep(10)
+                        continue
+                else:
+                    log.error(f"Navigation failed: {nav_result.stderr[:200]}")
+                    time.sleep(10)
+                    continue
             time.sleep(PAGE_LOAD_WAIT)
 
             # Step 2: Confirm unit login tab is selected (personal/unit share same QR page)
