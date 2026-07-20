@@ -450,19 +450,38 @@ def cmd_profile_register():
         else:
             i += 1
 
+    if not p["platform_url"]:
+        print(json.dumps({"ok": False, "error": "--platform-url is required (e.g. https://gd.122.gov.cn)"}))
+        sys.exit(1)
+
     _init_db()
     db_path = _get_db_path()
     conn = sqlite3.connect(db_path)
     now = time.strftime('%Y-%m-%d %H:%M:%S')
-    conn.execute(
-        """INSERT INTO profiles (company_name, profile_name, profile_id, platform_url, instance_port, last_login, is_logged_in)
-           VALUES (?, ?, ?, ?, ?, ?, 1)
-           ON CONFLICT(company_name) DO UPDATE SET
-           profile_name=excluded.profile_name, profile_id=excluded.profile_id,
-           platform_url=excluded.platform_url, instance_port=excluded.instance_port,
-           last_login=excluded.last_login, is_logged_in=1""",
-        (p["company"], p["profile_name"], p["profile_id"],
-         p["platform_url"], p["instance_port"], now))
+
+    # Match by profile_id first — profile-create inserts a placeholder row
+    # with company_name=NULL before the company name is known.  Matching by
+    # company_name (ON CONFLICT) would miss that row (NULL never conflicts)
+    # and create a duplicate.  profile_id is the stable PinchTab identifier.
+    cur = conn.execute(
+        "SELECT rowid FROM profiles WHERE profile_id = ? AND profile_id != ''",
+        (p["profile_id"],))
+    existing = cur.fetchone()
+
+    if existing:
+        conn.execute(
+            """UPDATE profiles SET company_name=?, profile_name=?,
+               platform_url=?, instance_port=?, last_login=?, is_logged_in=1
+               WHERE rowid=?""",
+            (p["company"], p["profile_name"],
+             p["platform_url"], p["instance_port"], now, existing[0]))
+    else:
+        conn.execute(
+            """INSERT INTO profiles (company_name, profile_name, profile_id,
+               platform_url, instance_port, last_login, is_logged_in)
+               VALUES (?, ?, ?, ?, ?, ?, 1)""",
+            (p["company"], p["profile_name"], p["profile_id"],
+             p["platform_url"], p["instance_port"], now))
     conn.commit()
     conn.close()
 
@@ -483,7 +502,9 @@ def cmd_profile_register():
     conn2.commit()
     conn2.close()
 
-    # Auto-discover instance port (unless already explicitly provided)
+    # Validate instance port if explicitly provided — the port must
+    # belong to this profile to prevent port-sharing bugs where two
+    # companies end up sharing the same Chrome instance.
     session_mgr = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "session_manager.py")
     # Also check in skill directory
@@ -494,7 +515,7 @@ def cmd_profile_register():
             session_mgr = skill_dir
 
     discover_result = {"ran": False}
-    if os.path.exists(session_mgr) and not p.get("instance_port"):
+    if os.path.exists(session_mgr):
         try:
             r = subprocess.run(
                 [sys.executable, session_mgr, "instance-discover"],
@@ -504,6 +525,37 @@ def cmd_profile_register():
             if r.returncode == 0:
                 discover_result = json.loads(r.stdout)
                 discover_result["ran"] = True
+
+                # If an explicit --instance-port was provided, verify it
+                # against the discover results for this profile.
+                explicit_port = p.get("instance_port")
+                if explicit_port:
+                    port_valid = False
+                    for entry in discover_result.get("bound", []):
+                        if entry.get("profile_name") == p["profile_name"]:
+                            discovered = entry.get("instance_port")
+                            if str(discovered) == str(explicit_port):
+                                port_valid = True
+                            break
+                    if not port_valid:
+                        # The explicit port doesn't match the running instance.
+                        # Use the discovered port instead (if found).
+                        for entry in discover_result.get("bound", []):
+                            if entry.get("profile_name") == p["profile_name"]:
+                                corrected = entry.get("instance_port")
+                                if corrected:
+                                    print(f"warning: --instance-port {explicit_port} "
+                                          f"does not match running instance on port {corrected}; "
+                                          f"using discovered port", file=sys.stderr)
+                                    # Update the DB with the correct port
+                                    conn3 = sqlite3.connect(db_path)
+                                    conn3.execute(
+                                        "UPDATE profiles SET instance_port = ? "
+                                        "WHERE profile_name = ?",
+                                        (str(corrected), p["profile_name"]))
+                                    conn3.commit()
+                                    conn3.close()
+                                break
         except Exception:
             pass
 

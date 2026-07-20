@@ -192,7 +192,7 @@ def _touch_health(health_file, state, tab_id, cycle_count, instance_port, log):
     """Write health status for external consumers (query processes)."""
     try:
         data = {
-            "state": state,               # "ok" | "login_expired" | "rate_limited"
+            "state": state,               # "logged_in" | "login_expired" | "rate_limited"
             "tab_id": tab_id,             # current keepalive tab (hex)
             "cycle_count": cycle_count,
             "instance_port": instance_port,
@@ -349,6 +349,8 @@ def _set_logged_out(db_path, company):
     conn.commit()
     conn.close()
     return updated > 0
+
+
 
 
 def _set_logged_in(db_path, company, instance_port=None):
@@ -664,7 +666,7 @@ def _check_page_state(instance_port, platform_url, log):
     Rate-limit detection: snap check for anti-crawl keywords, since rate-limit
     popups don't cause a URL redirect.
 
-    Returns: ("ok"|"login_expired"|"rate_limited"|"unknown", detail_text)
+    Returns: ("logged_in"|"login_expired"|"rate_limited"|"unknown", detail_text)
     """
     # ── rate-limit check (best-effort, non-fatal on failure) ──
     try:
@@ -686,7 +688,7 @@ def _check_page_state(instance_port, platform_url, log):
         url = (url_result.stdout or "").strip()
         if url.startswith(platform_url) and "vehlist" in url and "/m/login" not in url:
             log.info(f"Session OK (URL={url[:80]})")
-            return ("ok", url[:80])
+            return ("logged_in", url[:80])
         log.warning(f"Session expired: not on 我的主页 (URL={url[:80]})")
         return ("login_expired", f"not on 我的主页: {url[:80]}")
     except Exception as e:
@@ -1522,7 +1524,10 @@ def _run_daemon(company, project_root, auto_recover=False,
                     log.info("Startup recovery successful! Proceeding with normal keepalive.")
                     profile = _read_profile(db_path, company)  # re-read updated profile
                     if not profile or not profile.get("platform_url"):
-                        log.error("Profile missing platform_url after recovery.")
+                        log.error("Profile missing platform_url after recovery. "
+                                  "Run: profile-register --company '...' --platform-url 'https://xx.122.gov.cn'")
+                        _remove_pid(pid_file)
+                        sys.exit(EXIT_LOGGED_OUT)
                         _remove_pid(pid_file)
                         sys.exit(EXIT_LOGGED_OUT)
                     # Fall through to normal keepalive loop below
@@ -1597,7 +1602,7 @@ def _run_daemon(company, project_root, auto_recover=False,
         # nav + dismiss + check (20-30s of pinchtab calls)
         # can't push us past WatchdogSec if the last heartbeat was >90s ago.
         _sd_notify("WATCHDOG=1", log)
-        _touch_health(health_file, "ok", tab_id, cycle_count, instance_port, log)
+        _touch_health(health_file, "logged_in", tab_id, cycle_count, instance_port, log)
         log.info(f"=== Keepalive cycle #{cycle_count} (tab={tab_id}) ===")
 
         # ── pre-flight: check is_logged_in ──
@@ -1627,7 +1632,7 @@ def _run_daemon(company, project_root, auto_recover=False,
                         break
                     time.sleep(5)
                     _sd_notify("WATCHDOG=1", log)
-                    _touch_health(health_file, "ok", tab_id, cycle_count, instance_port, log)
+                    _touch_health(health_file, "logged_in", tab_id, cycle_count, instance_port, log)
                 continue
             _save_tab_id(tab_file, tab_id)
 
@@ -1652,7 +1657,7 @@ def _run_daemon(company, project_root, auto_recover=False,
                         break
                     time.sleep(5)
                     _sd_notify("WATCHDOG=1", log)
-                    _touch_health(health_file, "ok", tab_id, cycle_count, instance_port, log)
+                    _touch_health(health_file, "logged_in", tab_id, cycle_count, instance_port, log)
                 continue
             consecutive_failures = 0
             time.sleep(PAGE_LOAD_WAIT)
@@ -1670,7 +1675,7 @@ def _run_daemon(company, project_root, auto_recover=False,
                     break
                 time.sleep(5)
                 _sd_notify("WATCHDOG=1", log)
-                _touch_health(health_file, "ok", tab_id, cycle_count, instance_port, log)
+                _touch_health(health_file, "logged_in", tab_id, cycle_count, instance_port, log)
             continue
 
         # ── step 2: dismiss popups ──
@@ -1712,7 +1717,7 @@ def _run_daemon(company, project_root, auto_recover=False,
             exit_code = EXIT_LOGGED_OUT
             break
 
-        elif state == "ok":
+        elif state == "logged_in":
             log.info(f"Page state OK: {detail}")
             consecutive_unknown = 0
             # Persist cookies every cycle so session cookies survive Chrome restart
@@ -1739,7 +1744,7 @@ def _run_daemon(company, project_root, auto_recover=False,
         _touch_health(health_file, state, tab_id, cycle_count, instance_port, log)
         # N2: write session state for query/keepalive coordination (informational only)
         _write_session_state(project_root, company, instance_port, tab_id, cycle_count,
-                             state == "ok", log)
+                             state == "logged_in", log)
         _sd_notify("WATCHDOG=1", log)
 
         log.info(f"Cycle {cycle_count} done ({elapsed:.0f}s). "
@@ -1762,6 +1767,11 @@ def _run_daemon(company, project_root, auto_recover=False,
             # freeze the daemon indefinitely.  At worst we lose 30s.
             # Include watchdog timer in the min() so we always wake in time.
             chunk = min(30, next_heartbeat, next_watchdog, sleep_time)
+            # Safety floor: chunk must be >= 1s to prevent zero-sleep tight loop
+            # that would burn 100% CPU.  Worst case this adds 1s latency to
+            # heartbeat / watchdog timers, which is negligible.
+            if chunk < 1:
+                chunk = 1
             time.sleep(chunk)
             sleep_time -= chunk
             next_heartbeat -= chunk
@@ -1773,35 +1783,41 @@ def _run_daemon(company, project_root, auto_recover=False,
                 _touch_health(health_file, state, tab_id, cycle_count, instance_port, log)
                 next_watchdog = WATCHDOG_INTERVAL
 
-            if next_heartbeat <= 0 and sleep_time > 10 and state == "ok":
-                # Perform a light heartbeat: random scroll + ping
-                heartbeat_count += 1
-                hb_start = time.time()
-                ok = _heartbeat(instance_port, log)
-                hb_elapsed = time.time() - hb_start
+            if next_heartbeat <= 0:
+                if sleep_time > 10 and state == "logged_in":
+                    # Perform a light heartbeat: random scroll + ping
+                    heartbeat_count += 1
+                    hb_start = time.time()
+                    ok = _heartbeat(instance_port, log)
+                    hb_elapsed = time.time() - hb_start
 
-                if ok:
-                    heartbeat_fail_streak = 0
-                    # Notify systemd watchdog on successful heartbeats too
-                    _sd_notify("WATCHDOG=1", log)
-                    # Update health file on heartbeats so stall detection is
-                    # granular (60-120s) instead of only at cycle boundaries (18min).
-                    _touch_health(health_file, state, tab_id, cycle_count, instance_port, log)
-                    # Log first heartbeat + every ~5th to avoid noise
-                    if heartbeat_count == 1 or heartbeat_count % 5 == 0:
-                        log.info(f"Heartbeat #{heartbeat_count} OK "
-                                 f"(scroll in {hb_elapsed:.1f}s)")
+                    if ok:
+                        heartbeat_fail_streak = 0
+                        # Notify systemd watchdog on successful heartbeats too
+                        _sd_notify("WATCHDOG=1", log)
+                        # Update health file on heartbeats so stall detection is
+                        # granular (60-120s) instead of only at cycle boundaries (18min).
+                        _touch_health(health_file, state, tab_id, cycle_count, instance_port, log)
+                        # Log first heartbeat + every ~5th to avoid noise
+                        if heartbeat_count == 1 or heartbeat_count % 5 == 0:
+                            log.info(f"Heartbeat #{heartbeat_count} OK "
+                                     f"(scroll in {hb_elapsed:.1f}s)")
+                    else:
+                        heartbeat_fail_streak += 1
+                        log.warning(f"Heartbeat #{heartbeat_count} FAILED "
+                                    f"({heartbeat_fail_streak}/"
+                                    f"{MAX_CONSECUTIVE_HEARTBEAT_FAILS})")
+                        if heartbeat_fail_streak >= MAX_CONSECUTIVE_HEARTBEAT_FAILS:
+                            log.error("Too many consecutive heartbeat failures "
+                                      "— page may be stalled. Triggering early reload.")
+                            break  # break inner sleep loop → trigger next full reload cycle
                 else:
-                    heartbeat_fail_streak += 1
-                    log.warning(f"Heartbeat #{heartbeat_count} FAILED "
-                                f"({heartbeat_fail_streak}/"
-                                f"{MAX_CONSECUTIVE_HEARTBEAT_FAILS})")
-                    if heartbeat_fail_streak >= MAX_CONSECUTIVE_HEARTBEAT_FAILS:
-                        log.error("Too many consecutive heartbeat failures "
-                                  "— page may be stalled. Triggering early reload.")
-                        break  # break inner sleep loop → trigger next full reload cycle
-
-                # Schedule next heartbeat with random interval
+                    # State is not "logged_in" (e.g. transient CDP failure).
+                    # Reset heartbeat timer to avoid a tight loop:
+                    # when next_heartbeat stays at 0, chunk=min(30,0,...)=0
+                    # → time.sleep(0) spins forever at 100% CPU.
+                    pass
+                # Always reschedule next heartbeat to prevent zero-chunk tight loop.
                 next_heartbeat = random.randint(HEARTBEAT_MIN_SEC, HEARTBEAT_MAX_SEC)
 
     # ── cleanup ──

@@ -26,6 +26,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.request
 from datetime import datetime
 
@@ -212,17 +213,49 @@ def _read_profiles_table():
         return []
 
 
-def _update_instance_port(company_name, instance_port):
-    """Update instance_port for a company in the profiles table."""
+def _validate_instance_port(profile_name, instance_port):
+    """Verify via PinchTab API that an instance on instance_port belongs to profile_name.
+
+    Queries running instances and checks that:
+    1. An instance with the given port exists and is running
+    2. That instance's profileName matches profile_name
+
+    Returns (valid: bool, actual_profile_name: str|None).
+    """
+    instances = _get_running_instances()
+    for inst in instances:
+        port = inst.get("port", "")
+        status = inst.get("status", "")
+        if port and int(port) == int(instance_port) and status == "running":
+            actual_pname = inst.get("profileName", "")
+            if actual_pname == profile_name:
+                return True, actual_pname
+            else:
+                return False, actual_pname
+    return False, None
+
+
+def _update_instance_port(profile_name, instance_port):
+    """Update instance_port for a profile in the profiles table.
+
+    Uses profile_name as the key (not company_name) because company_name
+    may be NULL for profiles created by profile-create before registration.
+    NULL = NULL is always false in SQLite, so WHERE company_name = NULL
+    would silently update 0 rows.
+    """
     db_path = _get_db_path()
     try:
         conn = sqlite3.connect(db_path)
         conn.execute(
-            "UPDATE profiles SET instance_port = ? WHERE company_name = ?",
-            (str(instance_port), company_name)
+            "UPDATE profiles SET instance_port = ? WHERE profile_name = ?",
+            (str(instance_port), profile_name)
         )
         conn.commit()
+        affected = conn.total_changes
         conn.close()
+        if affected == 0:
+            print(f"warning: _update_instance_port: no row found for profile_name='{profile_name}'", file=sys.stderr)
+            return False
         return True
     except Exception as e:
         print(f"error: failed to update instance_port: {e}", file=sys.stderr)
@@ -707,9 +740,61 @@ def cmd_instance_discover():
         pname = prof["profile_name"]
         company = prof["company_name"]
 
+        # Skip orphaned placeholder rows (profile-create before profile-register).
+        # These have NULL company_name and no real instance to manage.
+        if not company:
+            continue
+
         if pname in running_map:
             port = running_map[pname]
-            if _update_instance_port(company, port):
+            # Validate that the instance on this port actually belongs to
+            # this profile before updating the DB.  Protects against stale
+            # or incorrect running_map entries.
+            valid, actual_pname = _validate_instance_port(pname, port)
+            if not valid:
+                # Instance may have stopped between the initial query and
+                # validation — fall through to auto-start instead of giving up.
+                print(f"warning: instance for '{pname}' on port {port} "
+                      f"not found or mismatched (actual={actual_pname}), "
+                      f"attempting restart...", file=sys.stderr)
+                new_port = _start_instance_for_profile(pname, prof["profile_id"])
+                if new_port:
+                    # Wait for new instance to become running
+                    for attempt in range(10):
+                        time.sleep(1)
+                        valid2, actual2 = _validate_instance_port(pname, new_port)
+                        if valid2:
+                            if _update_instance_port(pname, new_port):
+                                bound.append({
+                                    "company": company,
+                                    "instance_port": new_port,
+                                    "profile_name": pname,
+                                    "started": True,
+                                    "previous_port": port,
+                                })
+                            else:
+                                errors.append({
+                                    "company": company,
+                                    "error": f"restarted on {new_port} but DB update failed",
+                                })
+                            break
+                    else:
+                        errors.append({
+                            "company": company,
+                            "profile_name": pname,
+                            "previous_port": port,
+                            "new_port": new_port,
+                            "error": f"validation failed (was {port}, restarted on {new_port} but validation timed out)",
+                        })
+                else:
+                    errors.append({
+                        "company": company,
+                        "profile_name": pname,
+                        "expected_port": port,
+                        "actual_profile": actual_pname,
+                        "error": f"port {port} belongs to '{actual_pname}', not '{pname}', and restart failed",
+                    })
+            elif _update_instance_port(pname, port):
                 bound.append({
                     "company": company,
                     "instance_port": port,
@@ -724,7 +809,24 @@ def cmd_instance_discover():
             # No running instance — try to start one
             new_port = _start_instance_for_profile(pname, prof["profile_id"])
             if new_port:
-                if _update_instance_port(company, new_port):
+                # PinchTab returns status "starting" — the instance needs a few
+                # seconds to transition to "running".  Poll with retries.
+                valid = False
+                actual_pname = None
+                for attempt in range(10):  # up to 10 s
+                    time.sleep(1)
+                    valid, actual_pname = _validate_instance_port(pname, new_port)
+                    if valid:
+                        break
+                if not valid:
+                    errors.append({
+                        "company": company,
+                        "profile_name": pname,
+                        "expected_port": new_port,
+                        "actual_profile": actual_pname,
+                        "error": f"started instance on port {new_port} but it belongs to '{actual_pname}', not '{pname}'",
+                    })
+                elif _update_instance_port(pname, new_port):
                     bound.append({
                         "company": company,
                         "instance_port": new_port,

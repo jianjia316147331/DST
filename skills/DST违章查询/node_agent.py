@@ -879,6 +879,53 @@ class NodeAgent:
         except Exception as e:
             print(f"[node_agent] 设置 is_logged_in 失败: {e}")
 
+        # Step 1.5: 同步实例端口 — 运行 instance-discover 确保 DB 中
+        # instance_port 与 PinchTab 服务器一致。修复之前 port sharing bug
+        # 导致的 DB 记录与实际运行实例不匹配的问题。
+        try:
+            discover = subprocess.run(
+                [sys.executable, os.path.join(skill_dir, "session_manager.py"),
+                 "instance-discover"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=15
+            )
+            if discover.returncode == 0:
+                dresult = json.loads(discover.stdout)
+                # 提取当前公司的实例端口（从 bound 列表中查找）
+                for entry in dresult.get("bound", []):
+                    if entry.get("company") == company_name or entry.get("profile_name") == profile_name:
+                        corrected_port = entry.get("instance_port")
+                        if corrected_port and str(corrected_port) != str(instance_port):
+                            print(f"[node_agent] instance-discover 纠正端口: {instance_port} -> {corrected_port}")
+                            instance_port = int(corrected_port)
+                        break
+                # 记录错误和未绑定的情况
+                unbound_errors = dresult.get("unbound", [])
+                for ub in unbound_errors:
+                    if ub.get("company") == company_name or ub.get("profile_name") == profile_name:
+                        print(f"[node_agent] 警告: {company_name} 实例未绑定: {ub.get('error')}")
+                d_errors = dresult.get("errors", [])
+                for err in d_errors:
+                    if err.get("company") == company_name or err.get("profile_name") == profile_name:
+                        print(f"[node_agent] 警告: {company_name} 实例验证错误: {err.get('error')}")
+        except Exception as e:
+            print(f"[node_agent] instance-discover 失败: {e}")
+
+        # Step 1.6: 清理旧 QR 文件
+        # 旧 QR 来自之前失败的 keepalive 尝试，发送给控制台会导致用户
+        # 扫描一个无人监听的二维码——扫码成功但 login_ok 永远不会来。
+        from lib.core import _get_data_dir
+        data_dir = _get_data_dir()
+        safe_name = company_name.replace("/", "_").replace(" ", "_")
+        import glob as _glob
+        old_qr_pattern = os.path.join(data_dir, f"recovery_qr_{safe_name}_*.png")
+        old_qr_files = _glob.glob(old_qr_pattern)
+        for old_qr in old_qr_files:
+            try:
+                os.remove(old_qr)
+                print(f"[node_agent] 清理旧 QR: {old_qr}")
+            except Exception:
+                pass
+
         # Step 2: 启动 keepalive daemon
         cmd = [sys.executable, daemon_path,
                "--company", company_name,
@@ -943,25 +990,33 @@ class NodeAgent:
                         pass
 
                 # B. 检查 QR 截图文件
+                # ⚠️ 只发送 60 秒内生成的新 QR。旧 QR 来自之前失败的
+                # keepalive 尝试，发送它会导致用户扫描一个无人监听的码。
                 if not qr_sent:
                     import glob as _glob
                     qr_pattern = os.path.join(data_dir, f"recovery_qr_{_company}_*.png")
                     qr_files = sorted(_glob.glob(qr_pattern))
                     if qr_files:
                         qr_path = qr_files[-1]  # 取最新的
-                        try:
-                            with open(qr_path, "rb") as f:
-                                img_b64 = base64.b64encode(f.read()).decode("utf-8")
-                            _ws_send({
-                                "type": "qr_code",
-                                "company_name": _company,
-                                "image_base64": img_b64,
-                                "qr_expires_at": (datetime.now() + timedelta(minutes=5)).isoformat(),
-                            })
-                            qr_sent = True
-                            print(f"[node_agent] QR sent for {_company} ({len(img_b64)} bytes)")
-                        except Exception as e:
-                            print(f"[node_agent] QR read error: {e}")
+                        # 检查文件年龄
+                        qr_mtime = os.path.getmtime(qr_path)
+                        qr_age = time.time() - qr_mtime
+                        if qr_age > 60:
+                            print(f"[node_agent] 跳过旧 QR ({qr_age:.0f}s): {qr_path}")
+                        else:
+                            try:
+                                with open(qr_path, "rb") as f:
+                                    img_b64 = base64.b64encode(f.read()).decode("utf-8")
+                                _ws_send({
+                                    "type": "qr_code",
+                                    "company_name": _company,
+                                    "image_base64": img_b64,
+                                    "qr_expires_at": (datetime.now() + timedelta(minutes=5)).isoformat(),
+                                })
+                                qr_sent = True
+                                print(f"[node_agent] QR sent for {_company} ({len(img_b64)} bytes)")
+                            except Exception as e:
+                                print(f"[node_agent] QR read error: {e}")
 
             # 超时
             if not qr_sent:
@@ -1138,7 +1193,7 @@ class NodeAgent:
                 })
 
             # Check terminal states
-            if state == "ok" and progress == "logged_in":
+            if state == "logged_in":
                 self._ws_send({
                     "type": "keepalive_login_result",
                     "company_name": company_name,
@@ -1465,6 +1520,11 @@ class NodeAgent:
             await asyncio.sleep(KEEPALIVE_REPORT_INTERVAL)
             companies_status = self._gather_keepalive_status()
             if companies_status:
+                summary = ", ".join(
+                    f"{c['name'][:12]}...={c['is_logged_in']}/{c['keepalive_alive']}"
+                    for c in companies_status
+                )
+                print(f"[node_agent] keepalive_status -> {summary}")
                 self._ws_send({
                     "type": "keepalive_status",
                     "node_id": self.node_id,
@@ -1488,32 +1548,98 @@ class NodeAgent:
 
         result = []
         for p in profiles:
-            status = {"name": p["company_name"], "is_logged_in": bool(p.get("is_logged_in", 0))}
+            # Skip rows without a company name (orphan profiles that were never
+            # bound to a company — they have no keepalive to report).
+            if not p.get("company_name"):
+                continue
 
-            # Check keepalive systemd service
-            profile_name = p.get("profile_name", "").replace("profile_", "")
-            service_name = f"keepalive-watchdog-profile_{profile_name}"
-            try:
-                r = subprocess.run(
-                    ["systemctl", "is-active", service_name],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=5
-                )
-                status["keepalive_alive"] = r.stdout.strip() == "active"
-            except Exception:
-                status["keepalive_alive"] = False
-
-            # Read health file
+            # ── Keepalive liveness + login state ──
+            # We CANNOT use `systemctl --user is-active` here because
+            # node_agent often runs as a SYSTEM service (root), and
+            # root has no access to the per-user D-Bus session bus.
+            #
+            # Instead we read the JSON health file that the keepalive
+            # daemon rewrites on every heartbeat cycle.  The health file
+            # is the GROUND TRUTH for login state because:
+            # 1. It's written by the process that actually talks to Chrome
+            # 2. It includes instance_port so we can cross-validate
+            # 3. It has a timestamp so we know if it's fresh
+            #
+            # ⚠️  We do NOT trust profiles.is_logged_in from the DB.  That
+            # field is a write-only cache that the keepalive daemon sets
+            # after detecting a login.  If the daemon was connected to the
+            # WRONG Chrome instance (port-sharing bug), is_logged_in=1 is
+            # a lie — it reflects ANOTHER company's login session.
             from lib.core import _get_data_dir
             health_file = os.path.join(_get_data_dir(), f"keepalive_health_{p['company_name']}.json")
+            last_cycle = None
+            keepalive_alive = False
+            is_logged_in = False
+            health_state = None
+
             if os.path.exists(health_file):
                 try:
                     with open(health_file, "r") as f:
                         health = json.load(f)
-                    status["last_cycle"] = health.get("last_check", "")
+                    last_cycle = health.get("last_check", "")
+                    health_state = health.get("state", "")
+                    health_port = health.get("instance_port")
+                    db_port = p.get("instance_port")
+
+                    if last_cycle:
+                        last_dt = datetime.strptime(last_cycle, "%Y-%m-%d %H:%M:%S")
+                        age_sec = (datetime.now() - last_dt).total_seconds()
+                        # Keepalive daemon heartbeats every HEARTBEAT_MIN_SEC
+                        # to HEARTBEAT_MAX_SEC (currently 180-600 s).  Allow
+                        # a generous 900 s (15 min) window to avoid flapping.
+                        keepalive_alive = age_sec < 900
+
+                    # Cross-validate: the health file's instance_port MUST
+                    # match the DB instance_port.  If they differ, the
+                    # health file was written by a daemon connected to a
+                    # DIFFERENT Chrome instance — its login state is not
+                    # about THIS company (port-sharing bug defense).
+                    port_ok = True
+                    if health_port is not None and db_port is not None:
+                        port_ok = (str(health_port) == str(db_port))
+
+                    if keepalive_alive and port_ok:
+                        # The daemon is alive AND connected to the correct
+                        # Chrome instance.  Trust its reported state.
+                        # Only "logged_in" means actually logged in.
+                        is_logged_in = (health_state == "logged_in")
+                    # else: daemon dead OR port mismatch → is_logged_in = False
+                    # (we have no reliable source to confirm login state)
+
                 except Exception:
-                    status["last_cycle"] = None
-            else:
-                status["last_cycle"] = None
+                    last_cycle = None
+                    keepalive_alive = False
+                    is_logged_in = False
+
+            status = {"name": p["company_name"], "is_logged_in": is_logged_in}
+            status["keepalive_alive"] = keepalive_alive
+            status["last_cycle"] = last_cycle
+
+            # ── Sync corrected is_logged_in back to DB ──
+            # If our ground-truth check disagrees with the cached DB value,
+            # correct the DB.  This is how we fix the "fake login" state
+            # left behind by the port-sharing bug: the next keepalive report
+            # cycle will detect the mismatch and set is_logged_in=0.
+            db_is_logged_in = bool(p.get("is_logged_in", 0))
+            if is_logged_in != db_is_logged_in:
+                try:
+                    conn2 = sqlite3.connect(db_path)
+                    conn2.execute(
+                        "UPDATE profiles SET is_logged_in = ? WHERE company_name = ?",
+                        (1 if is_logged_in else 0, p["company_name"])
+                    )
+                    conn2.commit()
+                    conn2.close()
+                    print(f"[node_agent] 纠正 is_logged_in: {p['company_name']} "
+                          f"{db_is_logged_in} -> {is_logged_in} "
+                          f"(health_state={health_state}, alive={keepalive_alive})")
+                except Exception as e:
+                    print(f"[node_agent] 纠正 is_logged_in 失败: {e}")
 
             result.append(status)
 
