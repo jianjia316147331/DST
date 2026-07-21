@@ -192,10 +192,10 @@ def _query_one_vehicle(plate, unprocessed_count, search_start):
 
     if not found:
         print(f"    SKIP: search failed after retry for {plate}")
-        # Mark query failure in DB
+        # Mark query failure + record attempt time
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
-            "UPDATE vehicles SET status_code = 'query_failed' WHERE plate_number = ? AND company_id = ?",
+            "UPDATE vehicles SET status_code = 'query_failed', last_queried_at = datetime('now','localtime') WHERE plate_number = ? AND company_id = ?",
             (plate, company_id))
         conn.commit()
         conn.close()
@@ -224,10 +224,10 @@ def _query_one_vehicle(plate, unprocessed_count, search_start):
             for v in new_ones:
                 new_pts += v.get('points', 0) or 0
                 new_fine += v.get('fine', 0) or 0
-        # Clear failure status on successful query
+        # Record query completion time + clear failure status on recovery
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
-            "UPDATE vehicles SET status_code = '' WHERE plate_number = ? AND company_id = ? AND status_code = 'query_failed'",
+            "UPDATE vehicles SET last_queried_at = datetime('now','localtime'), status_code = CASE WHEN status_code = 'query_failed' THEN '' ELSE status_code END WHERE plate_number = ? AND company_id = ?",
             (plate, company_id))
         conn.commit()
         conn.close()

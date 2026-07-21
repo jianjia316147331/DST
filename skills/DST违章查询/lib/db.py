@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS vehicles (
     inspection_date TEXT,
     unprocessed_count INTEGER DEFAULT 0,
     query_date TEXT NOT NULL,
-    created_at TEXT DEFAULT (datetime('now','localtime'))
+    created_at TEXT DEFAULT (datetime('now','localtime')),
+    last_queried_at TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS violations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,6 +73,7 @@ ALTER TABLE profiles ADD COLUMN is_logged_in INTEGER DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_violations_query_date ON violations(query_date);
 ALTER TABLE vehicles ADD COLUMN tag TEXT DEFAULT '';
 ALTER TABLE vehicles ADD COLUMN tag_batch_id TEXT DEFAULT '';
+ALTER TABLE vehicles ADD COLUMN last_queried_at TEXT DEFAULT '';
 """
 def _get_db_path():
     return os.path.join(_get_data_dir(), "violations.db")
