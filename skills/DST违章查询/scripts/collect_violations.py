@@ -233,6 +233,13 @@ def _query_one_vehicle(plate, unprocessed_count, search_start):
         conn.close()
     except json.JSONDecodeError:
         print(f"    -> parse error: {violations_out[:200]}")
+        # Still record attempt time even on parse failure
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "UPDATE vehicles SET last_queried_at = datetime('now','localtime') WHERE plate_number = ? AND company_id = ?",
+            (plate, company_id))
+        conn.commit()
+        conn.close()
 
     # Back to list
     h(['go-back'])
