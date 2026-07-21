@@ -28,6 +28,7 @@ from lib.profiles import (cmd_profile_lookup, cmd_profile_list, cmd_profile_regi
                           cmd_ensure_keepalive, cmd_save_notify)
 from lib.login    import (cmd_poll_login, cmd_check_login_state, cmd_check_login_valid,
                           cmd_get_login_type)
+from lib.sync     import cmd_sync_now, cmd_db_export_sync
 from lib.query    import (cmd_list_vehicles, cmd_get_page_vehicles, cmd_open_vehicle,
                           cmd_collect_violations, cmd_go_back, cmd_click_page,
                           cmd_save_detail_progress, cmd_load_detail_progress,
@@ -51,6 +52,8 @@ SUBCOMMANDS = {
     # db
     "init-db": cmd_init_db, "db-insert-company": cmd_db_insert_company,
     "db-insert-vehicle": cmd_db_insert_vehicle, "db-insert-violation": cmd_db_insert_violation,
+    # sync
+    "sync-now": cmd_sync_now, "db-export-sync": cmd_db_export_sync,
     # feishu
     "gen-qr-msg": cmd_gen_qr_msg, "gen-qr-fallback": cmd_gen_qr_fallback,
     "gen-result-msg": cmd_gen_result_msg, "upload-image": cmd_upload_image,

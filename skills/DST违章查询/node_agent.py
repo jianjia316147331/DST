@@ -41,7 +41,8 @@ from session_bridge import SessionBridge
 WEBSOCKET_RECONNECT_DELAY = 5   # seconds
 HEARTBEAT_INTERVAL = 10          # seconds
 KEEPALIVE_REPORT_INTERVAL = 300  # 5 minutes
-SYNC_INTERVAL = 1800             # 30 minutes periodic sync fallback
+SYNC_INTERVAL = 1800             # 30 minutes periodic sync fallback (deprecated, use SYNC_SCHEDULE)
+SYNC_SCHEDULE = [(6, 0)]  # 06:00 daily (兜底全量同步)
 CLAUDE_PATH = "/home/openclaw/.npm-global/bin/claude"
 
 
@@ -409,10 +410,6 @@ class NodeAgent:
         # Initialize SessionBridge
         self.bridge = SessionBridge(ws_send=self._ws_send, claude_path=CLAUDE_PATH)
 
-        # Start reporting schedule checker
-        import threading
-        t = threading.Thread(target=self._reporting_schedule_check_loop, daemon=True)
-        t.start()
 
     # ── Message Handler ─────────────────────────────────────
 
@@ -448,9 +445,6 @@ class NodeAgent:
 
         elif msg_type == "trigger_sync":
             asyncio.ensure_future(self._run_sync())
-
-        elif msg_type == "reporting_schedule_config":
-            self._handle_reporting_schedule_config(msg)
 
         elif msg_type == "sync_ack":
             status = msg.get("ok") and "成功" or "失败"
@@ -1218,36 +1212,6 @@ class NodeAgent:
             "reason": "timeout",
         })
 
-    def _handle_reporting_schedule_config(self, msg):
-        """Handle reporting schedule config from cloud server."""
-        schedules = msg.get("schedules", [])
-        self._reporting_schedules = schedules
-        print(f"[node_agent] 收到定时上报配置: {len(schedules)} 个计划")
-
-    def _reporting_schedule_check_loop(self):
-        """Check every 30s if any schedule time matches current time."""
-        while self._running:
-            time.sleep(30)
-            schedules = getattr(self, '_reporting_schedules', [])
-            if not schedules:
-                continue
-
-            now = datetime.now()
-            current_time = now.strftime("%H:%M")
-
-            for sched in schedules:
-                if not sched.get("enabled"):
-                    continue
-                times = sched.get("times", [])
-                if isinstance(times, str):
-                    try:
-                        times = json.loads(times)
-                    except Exception:
-                        continue
-                if current_time in times:
-                    print(f"[node_agent] 定时上报触发: {current_time}")
-                    asyncio.ensure_future(self._run_sync())
-
     # ── Process Output ────────────────────────────────────────
 
     async def _read_process_output(self, task_id, proc):
@@ -1371,8 +1335,75 @@ class NodeAgent:
         conn.close()
 
         for name in company_names:
-            await self._sync_company(name)
+            try:
+                await self._sync_company(name)
+            except Exception as e:
+                print(f"[node_agent] 同步 {name} 异常: {e}")
+                import traceback
+                traceback.print_exc()
             await asyncio.sleep(5)  # throttle
+
+    def _get_sync_triggers_dir(self):
+        """Return path to sync trigger files directory."""
+        from lib.core import _get_data_dir
+        return os.path.join(_get_data_dir(), "sync_triggers")
+
+    # If a scheduled full sync is imminent, skip trigger-based sync —
+    # the scheduled sync will cover all companies momentarily.
+    TRIGGER_SCHEDULE_PROXIMITY = 600  # 10 minutes
+
+    async def _process_sync_triggers(self):
+        """Check for sync trigger files and process them via the existing WebSocket.
+
+        Trigger files are written by sync-now (called from collect_violations.py).
+        Each file is <company>.json containing {"company": "...", "triggered_at": "..."}.
+        After successful sync, the trigger file is deleted.
+
+        Skips syncing if a scheduled full sync is imminent (within
+        TRIGGER_SCHEDULE_PROXIMITY seconds) — the scheduled sync will cover it.
+        """
+        triggers_dir = self._get_sync_triggers_dir()
+        if not os.path.isdir(triggers_dir):
+            return
+
+        try:
+            files = sorted(os.listdir(triggers_dir))
+        except OSError:
+            return
+
+        for fname in files:
+            if not fname.endswith(".json"):
+                continue
+            fpath = os.path.join(triggers_dir, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    trigger = json.load(f)
+                company_name = trigger.get("company", "")
+                if not company_name:
+                    os.remove(fpath)
+                    continue
+
+                # If scheduled sync is imminent, skip — it'll sync everything anyway
+                wait_s = _seconds_until_next_schedule(SYNC_SCHEDULE)
+                if wait_s <= self.TRIGGER_SCHEDULE_PROXIMITY:
+                    print(f"[node_agent] 定时同步即将启动 ({wait_s}s), "
+                          f"跳过触发文件并清理: {company_name}")
+                    os.remove(fpath)
+                    continue
+
+                print(f"[node_agent] 触发同步: {company_name} (来自 sync-now)")
+                await self._sync_company(company_name)
+                # Remove trigger file after successful sync
+                os.remove(fpath)
+                print(f"[node_agent] 触发同步完成: {company_name}")
+            except json.JSONDecodeError:
+                # Corrupt trigger file, remove it
+                try:
+                    os.remove(fpath)
+                except OSError:
+                    pass
+            except OSError:
+                pass
 
     # ── Periodic Loops ────────────────────────────────────────
 
@@ -1515,9 +1546,13 @@ class NodeAgent:
         return processes
 
     async def _keepalive_report_loop(self):
-        """Report keepalive status for all companies every KEEPALIVE_REPORT_INTERVAL."""
+        """Report keepalive status for all companies every KEEPALIVE_REPORT_INTERVAL.
+        First report is sent immediately on startup, then every KEEPALIVE_REPORT_INTERVAL."""
+        first_report = True
         while self._running:
-            await asyncio.sleep(KEEPALIVE_REPORT_INTERVAL)
+            if not first_report:
+                await asyncio.sleep(KEEPALIVE_REPORT_INTERVAL)
+            first_report = False
             companies_status = self._gather_keepalive_status()
             if companies_status:
                 summary = ", ".join(
@@ -1616,9 +1651,57 @@ class NodeAgent:
                     keepalive_alive = False
                     is_logged_in = False
 
+            # ── Graceful degradation: when the keepalive daemon's health
+            # file is stale, don't immediately report "offline".  The daemon
+            # may have crashed (exit 42 on transient CDP failures, OOM,
+            # systemd restart prevention, etc.) while the underlying Chrome
+            # session is still perfectly valid — which is why queries still
+            # work even though the console shows "offline".
+            #
+            # Fallback check: if the PinchTab instance port is reachable
+            # AND the DB shows is_logged_in=1 with a recent last_login
+            # (< 24 h), report degraded-online.  This is a best-effort
+            # heuristic — it's not as reliable as a live health file, but
+            # it's dramatically better than blindly reporting "offline"
+            # for a company that is actively being queried.
+            if not keepalive_alive and not is_logged_in:
+                db_fallback_logged_in = bool(p.get("is_logged_in", 0))
+                db_fallback_port = p.get("instance_port")
+                db_fallback_last_login = p.get("last_login", "")
+                if db_fallback_logged_in and db_fallback_port and db_fallback_last_login:
+                    try:
+                        last_login_dt = datetime.strptime(
+                            db_fallback_last_login, "%Y-%m-%d %H:%M:%S"
+                        )
+                        login_age_hours = (datetime.now() - last_login_dt).total_seconds() / 3600
+                        if login_age_hours < 24:
+                            # Quick TCP check: is the PinchTab instance alive?
+                            try:
+                                sock = socket.create_connection(
+                                    ("127.0.0.1", db_fallback_port), timeout=1
+                                )
+                                sock.close()
+                                # Instance reachable + DB says logged in
+                                # + login is recent → daemon crash, not
+                                # real logout.  Report as online.
+                                keepalive_alive = True
+                                is_logged_in = True
+                                health_state = "degraded"
+                                print(
+                                    f"[node_agent] 保活降级: {p['company_name']} "
+                                    f"health stale but instance:{db_fallback_port} "
+                                    f"alive, login_age={login_age_hours:.1f}h"
+                                )
+                            except (OSError, Exception):
+                                pass
+                    except (ValueError, Exception):
+                        pass
+
             status = {"name": p["company_name"], "is_logged_in": is_logged_in}
             status["keepalive_alive"] = keepalive_alive
             status["last_cycle"] = last_cycle
+            if health_state:
+                status["health_state"] = health_state
 
             # ── Sync corrected is_logged_in back to DB ──
             # If our ground-truth check disagrees with the cached DB value,
@@ -1646,11 +1729,61 @@ class NodeAgent:
         return result
 
     async def _periodic_sync_loop(self):
-        """Periodic full sync fallback every SYNC_INTERVAL seconds."""
+        """Scheduled full sync once daily at 06:00 as fallback.
+
+        On startup, processes any pending trigger files within 60s.
+        Then sleeps until the next scheduled daily full sync.
+        Primary sync mechanism: task-completion trigger (sync-now).
+        """
         while self._running:
-            await asyncio.sleep(SYNC_INTERVAL)
+            # Calculate seconds until next scheduled time
+            wait_s = _seconds_until_next_schedule(SYNC_SCHEDULE)
+            print(f"[node_agent] 下次定时同步: {_format_next_schedule(SYNC_SCHEDULE)} ({wait_s}s)")
+            # Sleep in 60s chunks to respond promptly to shutdown
+            while wait_s > 0 and self._running:
+                chunk = min(wait_s, 60)
+                await asyncio.sleep(chunk)
+                wait_s -= chunk
+                # Check for sync-now trigger files between sleep chunks
+                await self._process_sync_triggers()
+            if not self._running:
+                break
             print("[node_agent] 定时全量同步...")
-            await self._run_sync()
+            try:
+                await self._run_sync()
+            except Exception as e:
+                print(f"[node_agent] 全量同步异常: {e}")
+                import traceback
+                traceback.print_exc()
+
+
+def _seconds_until_next_schedule(schedule):
+    """Return seconds until the next upcoming scheduled (hour, minute) in local time."""
+    from datetime import datetime, timedelta
+    now = datetime.now()
+    today = now.date()
+    # Sort today's remaining slots
+    candidates = []
+    for h, m in schedule:
+        t = datetime(today.year, today.month, today.day, h, m)
+        if t > now:
+            candidates.append(t)
+    if candidates:
+        next_dt = min(candidates)
+    else:
+        # All today's slots have passed — first slot tomorrow
+        h, m = schedule[0]
+        tomorrow = today + timedelta(days=1)
+        next_dt = datetime(tomorrow.year, tomorrow.month, tomorrow.day, h, m)
+    return max(0, int((next_dt - now).total_seconds()))
+
+
+def _format_next_schedule(schedule):
+    """Return a human-readable string for the next scheduled sync time."""
+    from datetime import datetime, timedelta
+    s = _seconds_until_next_schedule(schedule)
+    dt = datetime.now() + timedelta(seconds=s)
+    return dt.strftime("%Y-%m-%d %H:%M")
 
 
 def _province_to_url(province):

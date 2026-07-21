@@ -318,6 +318,18 @@ print(f"  New points:     {new_points_total}")
 print(f"  New fine:       {new_fine_total}")
 print(f"  Missing (不存在): {missing_count}")
 
+# === Sync to central console via Node Agent (铁律 #0 complement) ===
+print("Triggering sync via Node Agent...")
+sync_result = h(['sync-now', '--company', company])
+try:
+    sr = json.loads(sync_result)
+    if sr.get('sync_triggered'):
+        print(f"  Sync triggered: {sr.get('company')} (via {sr.get('via', 'node_agent')})")
+    else:
+        print(f"  Sync trigger failed: {sr.get('error', 'unknown')}")
+except json.JSONDecodeError:
+    print(f"  Sync trigger: parse error: {sync_result[:200]}")
+
 # === Auto-cleanup: mark done + release tab (铁律 #18) ===
 h(['mark-task-done', '--company', company, '--query-type', 'batch',
     '--vehicles-queried', str(success_count),
