@@ -4,7 +4,7 @@ import pool from '../db/index.js';
 export default async function vehicleRoutes(app: FastifyInstance) {
   // GET /api/vehicles — list vehicles with filters
   app.get('/api/vehicles', { preHandler: [app.authenticate] }, async (request) => {
-    const { page = '1', pageSize = '50', company_id, plate_number } = request.query as Record<string, string>;
+    const { page = '1', pageSize = '50', company_id, plate_number, status_label } = request.query as Record<string, string>;
     const limit = Math.min(parseInt(pageSize, 10) || 50, 200);
     const offset = (Math.max(parseInt(page, 10), 1) - 1) * limit;
 
@@ -19,11 +19,15 @@ export default async function vehicleRoutes(app: FastifyInstance) {
       conditions.push('v.plate_number LIKE ?');
       params.push(`%${plate_number}%`);
     }
+    if (status_label) {
+      conditions.push('v.status_label = ?');
+      params.push(status_label);
+    }
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
     const [rows] = await pool.query(
-      `SELECT v.*, c.short_name as company_name
+      `SELECT v.*, COALESCE(c.short_name, c.name) as company_name
        FROM vehicles v
        LEFT JOIN companies c ON c.id = v.company_id
        ${where}
@@ -42,7 +46,7 @@ export default async function vehicleRoutes(app: FastifyInstance) {
   app.get('/api/vehicles/:id', { preHandler: [app.authenticate] }, async (request, reply) => {
     const { id } = request.params as { id: string };
     const [rows] = await pool.query(
-      `SELECT v.*, c.short_name as company_name
+      `SELECT v.*, COALESCE(c.short_name, c.name) as company_name
        FROM vehicles v
        LEFT JOIN companies c ON c.id = v.company_id
        WHERE v.id = ?`,

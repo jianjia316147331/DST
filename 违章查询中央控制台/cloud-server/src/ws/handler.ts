@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { WebSocket } from 'ws';
 import pool from '../db/index.js';
-import { upsertCompaniesList, upsertVehicle, upsertViolations, validateCompanies, getKnownCompanyNames } from '../db/sync.js';
+import { upsertCompaniesList, upsertVehicle, upsertViolations, getKnownCompanyNames, getCompanyNameToIdMap } from '../db/sync.js';
 
 // Connected tray nodes: Map<node_id, WebSocket>
 const nodes = new Map<string, WebSocket>();
@@ -182,25 +182,31 @@ async function handleMessage(ws: WebSocket, raw: string) {
       try {
         let stats = { companies: 0, vehicles: 0, violations_ins: 0, violations_upd: 0 };
 
-        // ── Validate companies before processing ──
+        // ── Resolve node_name → node.id ──
+        let nodeDbId: number | null = null;
+        if (node_id) {
+          const [nodeRows] = await pool.query(
+            'SELECT id FROM nodes WHERE node_name = ?', [node_id]
+          ) as any[];
+          if (nodeRows.length > 0) {
+            nodeDbId = nodeRows[0].id;
+          }
+        }
+
+        // ── Collect all company names from the payload ──
         const allCompanyNames = new Set<string>();
         if (Array.isArray(companies)) companies.forEach((c: any) => allCompanyNames.add(c.name));
         if (Array.isArray(vehicles)) vehicles.forEach((v: any) => allCompanyNames.add(v.company_name));
         if (Array.isArray(violations)) violations.forEach((v: any) => allCompanyNames.add(v.company_name));
 
+        // ── Validate: only accept data for known companies ──
         const knownCompanies = await getKnownCompanyNames([...allCompanyNames]);
         const unknownCompanies = [...allCompanyNames].filter(n => !knownCompanies.has(n));
 
         if (unknownCompanies.length > 0) {
           console.warn(`[Sync] 数据上报企业未匹配: ${unknownCompanies.join(', ')} (跳过 ${unknownCompanies.length} 个企业)`);
-          await pool.query(
-            `INSERT INTO logs (level, category, message)
-             VALUES ('WARN', 'system', ?)`,
-            [`数据上报企业未匹配: ${unknownCompanies.join(', ')} (跳过 ${unknownCompanies.length} 个企业)`]
-          );
         }
 
-        // If ALL companies are unknown, reject sync
         if (allCompanyNames.size > 0 && knownCompanies.size === 0) {
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
@@ -211,22 +217,30 @@ async function handleMessage(ws: WebSocket, raw: string) {
           break;
         }
 
+        // ── Resolve company_name → MySQL company_id ──
+        const companyIdMap = await getCompanyNameToIdMap([...knownCompanies]);
+
+        // ── Upsert companies ──
         if (Array.isArray(companies) && companies.length > 0) {
           const known = companies.filter((c: any) => knownCompanies.has(c.name));
-          stats.companies = await upsertCompaniesList(known);
+          // upsertCompaniesList is async but returns void; count known entries
+          await upsertCompaniesList(known);
+          stats.companies = known.length;
         }
 
+        // ── Upsert vehicles ──
         if (Array.isArray(vehicles) && vehicles.length > 0) {
           for (const v of vehicles) {
             if (!knownCompanies.has(v.company_name)) continue;
-            await upsertVehicle(node_id || null, v);
+            await upsertVehicle(v, companyIdMap, nodeDbId);
             stats.vehicles++;
           }
         }
 
+        // ── Upsert violations ──
         if (Array.isArray(violations) && violations.length > 0) {
           const knownViolations = violations.filter((v: any) => knownCompanies.has(v.company_name));
-          const result = await upsertViolations(node_id || null, task_id || null, knownViolations);
+          const result = await upsertViolations(knownViolations, companyIdMap, task_id || null);
           stats.violations_ins = result.inserted;
           stats.violations_upd = result.updated;
         }
@@ -241,13 +255,14 @@ async function handleMessage(ws: WebSocket, raw: string) {
 
         // Log sync
         const totalViolations = stats.violations_ins + stats.violations_upd;
-        await pool.query(
-          `INSERT INTO sync_logs (node_id, sync_type, task_id, companies, vehicles,
-             violations_ins, violations_upd, status)
-           SELECT id, 'task_complete', ?, ?, ?, ?, ?, 'success'
-           FROM nodes WHERE node_name = ? LIMIT 1`,
-          [task_id || null, stats.companies, stats.vehicles, stats.violations_ins, stats.violations_upd, node_id]
-        );
+        if (nodeDbId) {
+          await pool.query(
+            `INSERT INTO sync_logs (node_id, sync_type, task_id, companies, vehicles,
+               violations_ins, violations_upd, status)
+             VALUES (?, 'task_complete', ?, ?, ?, ?, ?, 'success')`,
+            [nodeDbId, task_id || null, stats.companies, stats.vehicles, stats.violations_ins, stats.violations_upd]
+          );
+        }
 
         await pool.query(
           `INSERT INTO logs (task_id, level, category, message, detail)

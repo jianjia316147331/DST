@@ -8,7 +8,6 @@ interface Company {
   name: string;
   short_name: string | null;
   province: string;
-  feishu_contact_id: string | null;
   contact_name: string;
   contact_phone: string;
   account_status: string;
@@ -289,7 +288,7 @@ export default function Companies() {
 
   const columns = [
     { title: 'ID', dataIndex: 'id', width: 60 },
-    { title: '公司名称', dataIndex: 'name', ellipsis: true },
+    { title: '公司名称', dataIndex: 'name', width: 260, ellipsis: true },
     { title: '简称', dataIndex: 'short_name', width: 120 },
     { title: '省份', dataIndex: 'province', width: 80 },
     {
@@ -483,7 +482,6 @@ export default function Companies() {
           <Form.Item name="contact_phone" label="联系电话" rules={[{ required: true, message: '请输入联系电话' }]}>
             <Input />
           </Form.Item>
-          <Form.Item name="feishu_contact_id" label="飞书联系人ID"><Input /></Form.Item>
           <Form.Item name="notify_chat_name" label="通知群名称" help="扫码通知发送到群，并@联系人；留空则发送给联系人个人">
             <Input placeholder="例如：违章通知群" />
           </Form.Item>

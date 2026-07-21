@@ -27,7 +27,7 @@ export default async function violationsRoutes(app: FastifyInstance) {
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
     const [rows] = await pool.query(
-      `SELECT v.*, c.short_name as company_name, n.node_name
+      `SELECT v.*, COALESCE(c.short_name, c.name) as company_name, n.node_name
        FROM violations v
        LEFT JOIN companies c ON c.id = v.company_id
        LEFT JOIN tasks t ON t.id = v.task_id

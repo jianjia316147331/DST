@@ -8,6 +8,7 @@ No detail page access. No JSON manifest. No page navigation in Phase 2.
 Automatically resumes from the current browser page (续跑).
 """
 import subprocess, json, time, random, sys, os, sqlite3
+from datetime import datetime
 
 # === Force unbuffered output (Rule: 批量脚本完成判定铁律) ===
 sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
@@ -159,7 +160,8 @@ while True:
             '--unprocessed-count', str(unprocessed),
             '--query-date', date,
             '--tag', tag,
-            '--tag-batch-id', batch_id if tag else ''])
+            '--tag-batch-id', batch_id if tag else '',
+            '--last-query-time', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
 
         total_vehicles += 1
         if unprocessed > 0:
