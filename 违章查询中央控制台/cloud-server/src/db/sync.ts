@@ -1,6 +1,6 @@
 import pool from './index.js';
 
-export async function upsertCompaniesList(companies: any[], nodeId?: string): Promise<void> {
+export async function upsertCompaniesList(companies: any[]): Promise<void> {
   if (!Array.isArray(companies) || companies.length === 0) return;
 
   const conn = await pool.getConnection();
@@ -70,7 +70,7 @@ export async function upsertViolations(violations: any[], companyIdMap: Map<stri
           `UPDATE violations SET fine_amount=?, points=?, handling_status=?, payment_status=?, province=?,
            last_query_time=COALESCE(?, last_query_time)
            WHERE id=?`,
-          [v.fine_amount || null, v.points || null, v.handling_status || null,
+          [v.fine_amount ?? null, v.points ?? null, v.handling_status || null,
            v.payment_status || null, v.province || null,
            v.last_query_time || null, existing[0].id]
         );
@@ -81,8 +81,8 @@ export async function upsertViolations(violations: any[], companyIdMap: Map<stri
            violation_behavior, fine_amount, points, handling_status, payment_status, province, query_date, last_query_time)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [taskId, companyId, v.plate_number, v.violation_time || null,
-           v.violation_location || null, v.violation_behavior || null, v.fine_amount || null,
-           v.points || null, v.handling_status || null, v.payment_status || null,
+           v.violation_location || null, v.violation_behavior || null, v.fine_amount ?? null,
+           v.points ?? null, v.handling_status || null, v.payment_status || null,
            v.province || null, v.query_date || new Date().toISOString().slice(0, 10),
            v.last_query_time || null]
         );
