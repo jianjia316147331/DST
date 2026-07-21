@@ -195,7 +195,7 @@ def _query_one_vehicle(plate, unprocessed_count, search_start):
         # Mark query failure + record attempt time
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
-            "UPDATE vehicles SET status_code = 'query_failed', last_queried_at = datetime('now','localtime') WHERE plate_number = ? AND company_id = ?",
+            "UPDATE vehicles SET status_code = 'query_failed', last_query_time = datetime('now','localtime') WHERE plate_number = ? AND company_id = ?",
             (plate, company_id))
         conn.commit()
         conn.close()
@@ -227,7 +227,7 @@ def _query_one_vehicle(plate, unprocessed_count, search_start):
         # Record query completion time + clear failure status on recovery
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
-            "UPDATE vehicles SET last_queried_at = datetime('now','localtime'), status_code = CASE WHEN status_code = 'query_failed' THEN '' ELSE status_code END WHERE plate_number = ? AND company_id = ?",
+            "UPDATE vehicles SET last_query_time = datetime('now','localtime'), status_code = CASE WHEN status_code = 'query_failed' THEN '' ELSE status_code END WHERE plate_number = ? AND company_id = ?",
             (plate, company_id))
         conn.commit()
         conn.close()
@@ -236,7 +236,7 @@ def _query_one_vehicle(plate, unprocessed_count, search_start):
         # Still record attempt time even on parse failure
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
-            "UPDATE vehicles SET last_queried_at = datetime('now','localtime') WHERE plate_number = ? AND company_id = ?",
+            "UPDATE vehicles SET last_query_time = datetime('now','localtime') WHERE plate_number = ? AND company_id = ?",
             (plate, company_id))
         conn.commit()
         conn.close()
