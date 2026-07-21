@@ -23,3 +23,9 @@ __pycache__/
 # Dependencies
 node_modules/
 package-lock.json
+
+# Claude local config
+.claude/
+
+# Data files (runtime)
+violation_query/data/
