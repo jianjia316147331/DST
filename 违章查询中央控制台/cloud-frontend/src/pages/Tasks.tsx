@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Card, Tabs, Tag, Button, Space, message, Modal, Progress, Empty, Descriptions, Select } from 'antd';
-import { PauseCircleOutlined, PlayCircleOutlined, StopOutlined, ExpandAltOutlined, PlusOutlined } from '@ant-design/icons';
+import { Card, Tabs, Tag, Button, Space, message, Modal, Progress, Empty, Descriptions, Select, Input } from 'antd';
+import { PauseCircleOutlined, PlayCircleOutlined, StopOutlined, ExpandAltOutlined, PlusOutlined, WechatOutlined, SendOutlined } from '@ant-design/icons';
 import api from '../api';
 
 interface Task {
@@ -24,7 +24,7 @@ interface Task {
 
 const PROGRESS_STEPS = ['入口导航', '登录中', '查询准备', '查询中', '已完成'];
 
-function TaskCard({ task, onRefresh }: { task: Task; onRefresh: () => void }) {
+function TaskCard({ task, onRefresh, onOpenChat }: { task: Task; onRefresh: () => void; onOpenChat: (task: Task) => void }) {
   const [streamOpen, setStreamOpen] = useState(false);
   const [streamLines, setStreamLines] = useState<string[]>([]);
   const [ws, setWs] = useState<WebSocket | null>(null);
@@ -55,7 +55,10 @@ function TaskCard({ task, onRefresh }: { task: Task; onRefresh: () => void }) {
       await api.post(`/api/tasks/${task.id}/${action}`);
       message.success('指令已下发');
       onRefresh();
-    } catch { message.error('操作失败'); }
+    } catch (err: unknown) {
+      const res = (err as { response?: { data?: { error?: string } } })?.response?.data;
+      message.error(res?.error || '操作失败');
+    }
   };
 
   const pct = task.total_vehicles > 0 ? Math.round((task.processed_vehicles / task.total_vehicles) * 100) : 0;
@@ -81,6 +84,9 @@ function TaskCard({ task, onRefresh }: { task: Task; onRefresh: () => void }) {
           )}
           {task.status === '暂停' && (
             <Button size="small" type="primary" icon={<PlayCircleOutlined />} onClick={() => handleAction('resume')}>继续</Button>
+          )}
+          {task.status === '进行中' && task.claude_session_id && (
+            <Button size="small" icon={<WechatOutlined />} onClick={() => onOpenChat(task)}>对话</Button>
           )}
           <Button size="small" icon={<ExpandAltOutlined />} onClick={toggleStream}>{streamOpen ? '收起输出' : '实时输出'}</Button>
         </Space>
@@ -141,6 +147,12 @@ export default function Tasks() {
   const [selectedCompanyId, setSelectedCompanyId] = useState<number | null>(null);
   const [createLoading, setCreateLoading] = useState(false);
 
+  // Chat state
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatTask, setChatTask] = useState<Task | null>(null);
+  const [chatMessages, setChatMessages] = useState<{ text: string; isUser?: boolean }[]>([]);
+  const [chatInput, setChatInput] = useState('');
+
   const handleCreateTask = async () => {
     if (!selectedCompanyId) { message.warning('请选择公司'); return; }
     setCreateLoading(true);
@@ -151,7 +163,7 @@ export default function Tasks() {
       setSelectedCompanyId(null);
       fetchAll();
     } catch (err: unknown) {
-      const res = (err as { response?: { data?: { error?: string; existingTask?: { id: number } } } })?.response?.data;
+      const res = (err as { response?: { data?: { error?: string; message?: string; existingTask?: { id: number } } } })?.response?.data;
       if (res?.error === 'ACTIVE_TASK_EXISTS') {
         Modal.confirm({
           title: '该公司已有查询任务进行中',
@@ -168,7 +180,7 @@ export default function Tasks() {
           },
         });
       } else {
-        message.error(res?.error || '创建失败');
+        message.error(res?.message || res?.error || '创建失败');
       }
     } finally {
       setCreateLoading(false);
@@ -196,6 +208,86 @@ export default function Tasks() {
     return () => clearInterval(t);
   }, [fetchAll]);
 
+  // Global WebSocket listener for session_chunk (chat updates)
+  useEffect(() => {
+    const wsUrl = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws?client=frontend`;
+    const socket = new WebSocket(wsUrl);
+    socket.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'session_chunk' && chatOpen && chatTask) {
+          // Support both formats: direct msg.text (from node_agent.py) and msg.event (stream-json format)
+          let text = msg.text || '';
+          if (!text && msg.event) {
+            const event = msg.event as any;
+            if (event.type === 'assistant') {
+              const blocks = event.message?.content || [];
+              for (const b of blocks) {
+                if (b.type === 'text' && b.text) text += b.text;
+                else if (b.type === 'tool_use') text += `[调用工具: ${b.name}]`;
+              }
+            } else if (event.type === 'user') {
+              const blocks = event.message?.content || [];
+              for (const b of blocks) {
+                if (b.type === 'tool_result') {
+                  const content = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
+                  text = `[结果] ${content.substring(0, 100)}`;
+                }
+              }
+            }
+          }
+          if (text) {
+            setChatMessages(prev => [...prev, { text }]);
+          }
+        }
+      } catch { /* ignore */ }
+    };
+    return () => socket.close();
+  }, [chatOpen, chatTask]);
+
+  const openChat = async (task: Task) => {
+    setChatTask(task);
+    setChatMessages([]);
+    // Fetch session history
+    if (task.claude_session_id) {
+      try {
+        const { data: history } = await api.get(`/api/sync/session-history-by-session/${task.claude_session_id}`);
+        const msgs = (history.data || []).map((m: any) => ({
+          text: m.content,
+          isUser: m.role === 'user',
+        }));
+        setChatMessages(msgs);
+      } catch { /* ignore */ }
+    } else {
+      // Try by task ID
+      try {
+        const { data: history } = await api.get(`/api/sync/session-history/${task.id}`);
+        const msgs = (history.data || []).map((m: any) => ({
+          text: m.content,
+          isUser: m.role === 'user',
+        }));
+        setChatMessages(msgs);
+      } catch { /* ignore */ }
+    }
+    setChatOpen(true);
+  };
+
+  const sendChatMessage = async () => {
+    if (!chatInput.trim() || !chatTask) return;
+    const text = chatInput.trim();
+    setChatMessages(prev => [...prev, { text, isUser: true }]);
+    setChatInput('');
+    try {
+      await api.post('/api/sync/session-message', {
+        task_id: chatTask.id,
+        session_id: chatTask.claude_session_id || '',
+        text,
+      });
+    } catch {
+      setChatMessages(prev => [...prev, { text: '[发送失败]' }]);
+    }
+  };
+
   const openCreate = () => {
     setCreateOpen(true);
     api.get('/api/companies', { params: { pageSize: 500 } }).then(({ data }) => setCompanies(data.data));
@@ -211,7 +303,7 @@ export default function Tasks() {
         key: 'active', label: `进行中 (${activeTasks.length})`,
         children: (
           <div>
-            {activeTasks.map((t) => <TaskCard key={t.id} task={t} onRefresh={fetchAll} />)}
+            {activeTasks.map((t) => <TaskCard key={t.id} task={t} onRefresh={fetchAll} onOpenChat={openChat} />)}
             {!loading && activeTasks.length === 0 && <Empty description="暂无进行中的任务" />}
           </div>
         ),
@@ -220,7 +312,7 @@ export default function Tasks() {
         key: 'paused', label: `暂停中 (${pausedTasks.length})`,
         children: (
           <div>
-            {pausedTasks.map((t) => <TaskCard key={t.id} task={t} onRefresh={fetchAll} />)}
+            {pausedTasks.map((t) => <TaskCard key={t.id} task={t} onRefresh={fetchAll} onOpenChat={openChat} />)}
             {!loading && pausedTasks.length === 0 && <Empty description="暂无暂停的任务" />}
           </div>
         ),
@@ -258,6 +350,49 @@ export default function Tasks() {
         onChange={setSelectedCompanyId}
         options={companies.map((c) => ({ label: c.name, value: c.id }))}
       />
+    </Modal>
+
+    {/* Chat modal for active task sessions */}
+    <Modal
+      title={`${chatTask?.company_name || ''} - 查询对话${chatTask ? ` (任务 #${chatTask.id})` : ''}`}
+      open={chatOpen}
+      onCancel={() => { setChatOpen(false); setChatTask(null); setChatMessages([]); }}
+      footer={null}
+      width={500}
+    >
+      <div style={{ height: 300, overflowY: 'auto', border: '1px solid #f0f0f0', borderRadius: 8, padding: 12, marginBottom: 12, background: '#fafafa' }}>
+        {chatMessages.map((m, i) => (
+          <div key={i} style={{
+            marginBottom: 8,
+            textAlign: m.isUser ? 'right' : 'left',
+          }}>
+            <div style={{
+              display: 'inline-block',
+              padding: '6px 12px',
+              borderRadius: 8,
+              background: m.isUser ? '#1677ff' : '#fff',
+              color: m.isUser ? '#fff' : '#333',
+              maxWidth: '85%',
+              wordBreak: 'break-word',
+              border: m.isUser ? 'none' : '1px solid #e8e8e8',
+            }}>
+              {m.text}
+            </div>
+          </div>
+        ))}
+        {chatMessages.length === 0 && (
+          <div style={{ textAlign: 'center', color: '#999', paddingTop: 40 }}>等待 Claude 响应...</div>
+        )}
+      </div>
+      <Space.Compact style={{ width: '100%' }}>
+        <Input
+          placeholder="输入消息..."
+          value={chatInput}
+          onChange={e => setChatInput(e.target.value)}
+          onPressEnter={sendChatMessage}
+        />
+        <Button type="primary" icon={<SendOutlined />} onClick={sendChatMessage}>发送</Button>
+      </Space.Compact>
     </Modal>
   </div>
   );

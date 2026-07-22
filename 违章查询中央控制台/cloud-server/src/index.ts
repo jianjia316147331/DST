@@ -17,6 +17,7 @@ import vehicleRoutes from './routes/vehicles.js';
 import violationsRoutes from './routes/violations.js';
 import reportingScheduleRoutes from './routes/reporting-schedules.js';
 import wsHandler from './ws/handler.js';
+import { startScheduler, stopScheduler } from './scheduler.js';
 import { authGuard } from './middleware/auth.js';
 
 const app = Fastify({ logger: true });
@@ -47,6 +48,9 @@ await app.register(reportingScheduleRoutes);
 // WebSocket
 await app.register(wsHandler);
 
+// Start schedule checker
+startScheduler();
+
 // Health check
 app.get('/api/health', async () => ({ status: 'ok', timestamp: new Date().toISOString() }));
 
@@ -61,3 +65,13 @@ try {
   app.log.error(err);
   process.exit(1);
 }
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  stopScheduler();
+  app.close();
+});
+process.on('SIGINT', () => {
+  stopScheduler();
+  app.close();
+});

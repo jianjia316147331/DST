@@ -136,6 +136,18 @@ const schema = [
 
   // ── companies: notify_chat_name ──
   `ALTER TABLE companies ADD COLUMN notify_chat_name VARCHAR(200)`,
+
+  // ── task_session_messages: persist Claude chat history ──
+  `CREATE TABLE IF NOT EXISTS task_session_messages (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    task_id     INT,
+    session_id  VARCHAR(100) NOT NULL,
+    role        VARCHAR(20) NOT NULL,
+    content     TEXT NOT NULL,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_tsm_session (session_id),
+    INDEX idx_tsm_task (task_id)
+  )`,
 ];
 
 async function migrate() {

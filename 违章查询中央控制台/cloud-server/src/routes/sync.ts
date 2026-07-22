@@ -150,18 +150,51 @@ export default async function syncRoutes(app: FastifyInstance) {
 
   // POST /api/sync/session-message — forward chat message to active Claude session via node
   app.post('/api/sync/session-message', { preHandler: [app.authenticate] }, async (request, reply) => {
-    const { company_id, text } = request.body as { company_id: number; text: string };
+    const { company_id, task_id, session_id: providedSessionId, text } = request.body as {
+      company_id?: number; task_id?: number; session_id?: string; text: string;
+    };
 
-    if (!company_id || !text) {
-      return reply.status(400).send({ error: 'company_id and text are required' });
+    if (!text) {
+      return reply.status(400).send({ error: 'text is required' });
     }
 
+    // Resolve session_id: from request, from task, or fallback
+    let sessionId = providedSessionId || '';
+    let resolvedTaskId = task_id || null;
+    let resolvedCompanyId = company_id || null;
+
+    if (!sessionId && task_id) {
+      const [tasks] = await pool.query(
+        'SELECT claude_session_id, company_id FROM tasks WHERE id = ?', [task_id]
+      ) as any[];
+      const task = tasks[0];
+      if (task) {
+        sessionId = task.claude_session_id || '';
+        if (!resolvedCompanyId) resolvedCompanyId = task.company_id;
+      }
+    }
+
+    // Resolve company_id from task even when session_id is provided
+    if (!resolvedCompanyId && task_id) {
+      const [tasks] = await pool.query(
+        'SELECT company_id FROM tasks WHERE id = ?', [task_id]
+      ) as any[];
+      if (tasks[0]) {
+        resolvedCompanyId = tasks[0].company_id;
+      }
+    }
+
+    if (!resolvedCompanyId) {
+      return reply.status(400).send({ error: 'company_id or task_id is required to identify the node' });
+    }
+
+    // Find binding by company_id
     const [bindings] = await pool.query(
       `SELECT b.*, n.node_name, n.status as node_status
        FROM company_node_bindings b
        JOIN nodes n ON b.node_id = n.id
        WHERE b.company_id = ? AND b.is_active = 1`,
-      [company_id]
+      [resolvedCompanyId]
     );
 
     const binding = (bindings as any[])[0];
@@ -174,13 +207,52 @@ export default async function syncRoutes(app: FastifyInstance) {
       return reply.status(400).send({ error: '设备 WebSocket 未连接' });
     }
 
+    // Persist user message to task_session_messages
+    if (sessionId) {
+      try {
+        await pool.query(
+          `INSERT INTO task_session_messages (task_id, session_id, role, content)
+           VALUES (?, ?, 'user', ?)`,
+          [resolvedTaskId, sessionId, text]
+        );
+      } catch (e: any) {
+        console.error('[sync] session-message persist error:', e.message);
+      }
+    }
+
+    // Forward to node with session_id for SessionBridge routing
     nodeWs.send(JSON.stringify({
       type: 'session_message',
-      company_id: String(company_id),
+      session_id: sessionId,
+      company_id: String(resolvedCompanyId),
       text: text,
     }));
 
     return { ok: true };
+  });
+
+  // GET /api/sync/session-history/:taskId — load chat history for a task
+  app.get('/api/sync/session-history/:taskId', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { taskId } = request.params as { taskId: string };
+    const [rows] = await pool.query(
+      `SELECT * FROM task_session_messages
+       WHERE task_id = ? OR session_id = (
+         SELECT claude_session_id FROM tasks WHERE id = ?
+       )
+       ORDER BY created_at ASC`,
+      [taskId, taskId]
+    );
+    return { data: rows };
+  });
+
+  // GET /api/sync/session-history-by-session/:sessionId — load chat history by session ID
+  app.get('/api/sync/session-history-by-session/:sessionId', { preHandler: [app.authenticate] }, async (request, reply) => {
+    const { sessionId } = request.params as { sessionId: string };
+    const [rows] = await pool.query(
+      `SELECT * FROM task_session_messages WHERE session_id = ? ORDER BY created_at ASC`,
+      [sessionId]
+    );
+    return { data: rows };
   });
 
   // GET /api/sync/status/:nodeId — check node sync status

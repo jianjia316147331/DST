@@ -58,14 +58,17 @@ JSON_BLOCK_START = re.compile(r'^\s*[{[]\s*$')
 class SessionHandle:
     """Represents one active Claude session."""
     def __init__(self, session_id: str, proc: subprocess.Popen,
-                 filter_mode: str, markers: list, created_at: float):
+                 filter_mode: str, markers: list, created_at: float,
+                 interactive: bool = False, metadata: dict = None):
         self.session_id = session_id
         self.proc = proc
         self.filter_mode = filter_mode
         self.markers = markers or []
         self.created_at = created_at
         self.last_activity = created_at
-        self._stdin = proc.stdin
+        self.interactive = interactive
+        self.metadata = metadata or {}
+        self._stdin = proc.stdin  # Only valid when interactive=True
 
 
 # ── SessionBridge ──────────────────────────────────────────────
@@ -98,13 +101,17 @@ class SessionBridge:
 
     async def create(self, session_id: str, prompt: str,
                      filter_mode: str = "text_only",
-                     markers: list = None):
+                     markers: list = None,
+                     interactive: bool = False,
+                     metadata: dict = None):
         """新建或续接 Claude 会话。
 
         session_id:  唯一会话标识（由调用方生成）
         prompt:      初始提示词
         filter_mode: "text_only" | "keep_thinking" | "full"
         markers:     可选标记列表，如 ["QR_READY", "LOGIN_OK"]
+        interactive: True=交互式（stdin PIPE + stream-json），False=一次性
+        metadata:    透传到每条 WS 消息的额外字段（task_id, company_id 等）
         """
         # Check concurrent limit
         if len(self._sessions) >= self._max_sessions:
@@ -121,6 +128,7 @@ class SessionBridge:
             return
 
         markers = markers or []
+        metadata = metadata or {}
 
         # Claude CLI: `claude -p <prompt>` = non-interactive, print and exit
         # For continued conversations: `claude -p --continue <prompt>`
@@ -128,17 +136,31 @@ class SessionBridge:
         if session_id and len(session_id) > 30:  # Looks like a UUID
             is_resume = True
 
-        cmd = [self._claude_path, "-p"]
-        if is_resume:
-            cmd.append("--continue")
-        cmd.append(prompt)
+        print(f"[session_bridge] 创建会话: {session_id} (mode={filter_mode}, markers={markers}, resume={is_resume}, interactive={interactive})")
 
-        print(f"[session_bridge] 创建会话: {session_id} (mode={filter_mode}, markers={markers}, resume={is_resume})")
+        if interactive:
+            # Interactive mode: start Claude in stream-json REPL mode.
+            # Send prompt as first user message via stdin.
+            # --verbose is REQUIRED with --output-format=stream-json
+            cmd = [self._claude_path,
+                   "--input-format", "stream-json",
+                   "--output-format", "stream-json",
+                   "--include-partial-messages",
+                   "--verbose",
+                   "--permission-mode", "auto"]
+        else:
+            # Non-interactive one-shot mode
+            cmd = [self._claude_path, "-p", prompt]
+            if is_resume:
+                cmd.append("--continue")
+
+        stdin_val = subprocess.PIPE if interactive else subprocess.DEVNULL
+
         try:
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
+                stdin=stdin_val,
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
                 bufsize=1,
@@ -148,6 +170,20 @@ class SessionBridge:
                        error=f"Claude CLI 未找到 ({self._claude_path})")
             return
 
+        # For interactive mode: send prompt as first user message
+        if interactive and proc.stdin:
+            import json as _json
+            first_msg = _json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": [{"type": "text", "text": prompt}]}
+            }) + "\n"
+            try:
+                proc.stdin.write(first_msg)
+                proc.stdin.flush()
+                print(f"[session_bridge] 已发送首条消息到 Claude (interactive)")
+            except (BrokenPipeError, OSError) as e:
+                print(f"[session_bridge] 首条消息写入失败: {e}")
+
         # Create handle
         now = time.time()
         handle = SessionHandle(
@@ -156,6 +192,8 @@ class SessionBridge:
             filter_mode=filter_mode,
             markers=markers,
             created_at=now,
+            interactive=interactive,
+            metadata=metadata,
         )
         self._sessions[session_id] = handle
 
@@ -180,13 +218,23 @@ class SessionBridge:
             self._emit("session_error", session_id=session_id,
                        error=f"会话 {session_id} 不存在")
             return
+        if not handle.interactive:
+            self._emit("session_error", session_id=session_id,
+                       error="非交互式会话不支持发送消息")
+            return
         if handle.proc.poll() is not None:
             self._emit("session_error", session_id=session_id,
                        error="Claude 进程已退出")
             return
 
         try:
-            handle._stdin.write(text + "\n")
+            # Claude expects stream-json format on stdin
+            import json as _json
+            user_msg = _json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": [{"type": "text", "text": text}]}
+            }, ensure_ascii=False) + "\n"
+            handle._stdin.write(user_msg)
             handle._stdin.flush()
             handle.last_activity = time.time()
         except (BrokenPipeError, OSError) as e:
@@ -242,8 +290,14 @@ class SessionBridge:
     # ── Internal ───────────────────────────────────────────────
 
     def _emit(self, msg_type: str, **kwargs):
-        """发送 WebSocket 消息。"""
+        """发送 WebSocket 消息。自动合并当前 session 的 metadata。"""
         msg = {"type": msg_type}
+        # Merge session metadata if available
+        session_id = kwargs.get("session_id", "")
+        if session_id:
+            handle = self._sessions.get(session_id)
+            if handle and handle.metadata:
+                msg.update(handle.metadata)
         msg.update(kwargs)
         try:
             self._ws_send(msg)
@@ -251,14 +305,22 @@ class SessionBridge:
             print(f"[session_bridge] 发送失败: {e}")
 
     def _read_loop(self, handle: SessionHandle):
-        """后台线程：逐行读取 Claude stdout，过滤后发送到 WS。"""
+        """后台线程：逐行读取 Claude stdout，过滤后发送到 WS。
+
+        For interactive (stream-json) sessions: parse JSON lines, extract
+        text from event.message.content[].text blocks, skip tool_use blocks.
+        For non-interactive sessions: use filter_mode text-line approach.
+        """
         session_id = handle.session_id
         proc = handle.proc
         filter_mode = handle.filter_mode
         markers = handle.markers
+        interactive = handle.interactive
 
-        # Track JSON block state for text_only / keep_thinking modes
+        # Track JSON block state for text_only / keep_thinking modes (non-interactive)
         in_json_block = False
+        # For stream-json: track partial message accumulation
+        partial_text = ""
 
         try:
             for line in proc.stdout:
@@ -267,6 +329,80 @@ class SessionBridge:
                     continue
 
                 handle.last_activity = time.time()
+
+                # ── Interactive stream-json output parsing ──
+                if interactive:
+                    try:
+                        event = json.loads(line)
+                    except (json.JSONDecodeError, ValueError):
+                        # Non-JSON line — plain text output from Claude, emit directly
+                        stripped = line.strip()
+                        if stripped:
+                            self._emit("session_chunk", session_id=session_id, text=stripped)
+                        continue
+
+                    etype = event.get("type", "")
+
+                    # Extract text from assistant message blocks
+                    if etype == "assistant":
+                        blocks = event.get("message", {}).get("content", [])
+                        for b in blocks:
+                            if b.get("type") == "text" and b.get("text"):
+                                text = b["text"]
+                                # Marker detection inside text blocks
+                                if markers:
+                                    for marker in markers:
+                                        pattern = f"__{marker}__"
+                                        if pattern in text:
+                                            payload = None
+                                            parts = text.split(f"__{marker}__", 1)
+                                            if len(parts) > 1 and parts[1].startswith(":"):
+                                                payload = parts[1][1:].strip()
+                                            marker_data = {
+                                                "session_id": session_id,
+                                                "marker": marker,
+                                                "payload": payload,
+                                            }
+                                            # QR_READY: read image file and base64-encode
+                                            if marker == "QR_READY" and payload:
+                                                try:
+                                                    qr_path = payload
+                                                    if not os.path.isabs(qr_path):
+                                                        qr_path = os.path.join(os.getcwd(), payload)
+                                                    if os.path.exists(qr_path):
+                                                        with open(qr_path, "rb") as f:
+                                                            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+                                                        marker_data["image_base64"] = img_b64
+                                                        print(f"[session_bridge] QR loaded: {qr_path} ({len(img_b64)} bytes b64)")
+                                                    else:
+                                                        print(f"[session_bridge] QR file not found: {qr_path}")
+                                                except Exception as e:
+                                                    print(f"[session_bridge] QR read error: {e}")
+                                            self._emit("session_marker", **marker_data)
+                                # Emit text chunk
+                                self._emit("session_chunk", session_id=session_id, text=text)
+                            elif b.get("type") == "tool_use":
+                                if filter_mode == "full":
+                                    self._emit("session_chunk", session_id=session_id,
+                                              text=f"[调用工具: {b.get('name', '')}]")
+
+                    elif etype == "user":
+                        # User message blocks (tool results)
+                        if filter_mode == "full":
+                            blocks = event.get("message", {}).get("content", [])
+                            for b in blocks:
+                                if b.get("type") == "tool_result":
+                                    content = b.get("content", "")
+                                    if isinstance(content, str):
+                                        text = f"[结果] {content[:200]}"
+                                    else:
+                                        text = f"[结果] {json.dumps(content)[:200]}"
+                                    self._emit("session_chunk", session_id=session_id, text=text)
+
+                    # Skip other event types (system, ping, etc.)
+                    continue
+
+                # ── Non-interactive text-line output parsing (original logic) ──
 
                 # ── Marker detection (independent of filter_mode) ──
                 if markers:

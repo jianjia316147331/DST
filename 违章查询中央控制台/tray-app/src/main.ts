@@ -135,6 +135,45 @@ function connectWs() {
         break;
       }
 
+      case 'session_create': {
+        // Same as assign_task but from cloud server (node_agent.py compat)
+        const sc = msg as unknown as {
+          task_id: number; company_id: number; company_name: string; session_id: string; prompt?: string;
+        };
+
+        if (processManager.hasCompanySession(sc.company_id)) {
+          send({ type: 'log', task_id: sc.task_id, level: 'WARN', category: 'system',
+            message: `公司 ${sc.company_name}(id=${sc.company_id}) 已有活跃会话，先终止旧进程` });
+          for (const [tid, proc] of processManager['processes'] as Map<number, { companyId: number; child: { kill: (s: string) => void } }>) {
+            if (proc.companyId === sc.company_id) {
+              processManager.terminate(tid);
+              break;
+            }
+          }
+        }
+
+        if (processManager.isFull) {
+          send({ type: 'log', task_id: sc.task_id, level: 'WARN', category: 'system',
+            message: `进程池已满(${processManager.activeCountInfo})，任务排队` });
+          return;
+        }
+
+        send({ type: 'log', task_id: sc.task_id, level: 'INFO', category: 'task',
+          message: `启动查询: ${sc.company_name} (session_create)` });
+
+        // Use server-provided prompt for richer query instructions
+        processManager.launch(sc.task_id, sc.company_id, sc.company_name, '', sc.session_id, CLAUDE_PATH, sc.prompt);
+
+        send({
+          type: 'status_ack', task_id: sc.task_id,
+          status: '进行中',
+          message: `Claude Code 已启动, pid=${processManager.get(sc.task_id)?.pid}, session=${sc.session_id}`,
+        });
+
+        updateTrayMenu();
+        break;
+      }
+
       case 'pause_task': {
         const taskId = msg.task_id as number;
         const result = processManager.pause(taskId);
@@ -230,6 +269,33 @@ function connectWs() {
         });
 
         updateTrayMenu();
+        break;
+      }
+
+      case 'session_message': {
+        // Forward chat message to the Claude process's stdin
+        const sm = msg as unknown as {
+          session_id?: string; company_id?: string; task_id?: number; text: string;
+        };
+        let proc: ReturnType<typeof processManager.get> | undefined;
+        if (sm.task_id) {
+          proc = processManager.get(sm.task_id);
+        } else if (sm.company_id) {
+          proc = processManager.getByCompanyId(parseInt(sm.company_id, 10));
+        }
+        if (proc && sm.text) {
+          const sent = processManager.sendStdin(proc.taskId, sm.text);
+          send({
+            type: 'log', task_id: proc.taskId, level: 'INFO', category: 'chat',
+            message: sent ? `转发用户消息到会话 ${proc.sessionId}: ${sm.text.substring(0, 80)}`
+              : `转发失败: stdin 不可用`,
+          });
+        } else {
+          send({
+            type: 'log', level: 'WARN', category: 'chat',
+            message: `session_message 无法路由: task_id=${sm.task_id}, company_id=${sm.company_id}`,
+          });
+        }
         break;
       }
 

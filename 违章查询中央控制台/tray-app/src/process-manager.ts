@@ -37,14 +37,21 @@ export class ProcessManager extends EventEmitter {
     return this.companySessionMap.get(companyId);
   }
 
-  launch(taskId: number, companyId: number, companyName: string, province: string, sessionId: string, claudePath = 'claude'): ManagedProcess {
-    const prompt = `查询${companyName}的车辆违章，省份${province}`;
+  launch(taskId: number, companyId: number, companyName: string, province: string, sessionId: string, claudePath = 'claude', promptOverride?: string): ManagedProcess {
+    let prompt: string;
+    if (promptOverride) {
+      prompt = promptOverride;
+    } else if (province) {
+      prompt = `查询${companyName}的车辆违章，省份${province}`;
+    } else {
+      prompt = `查询${companyName}的车辆违章`;
+    }
 
     // On Windows, Claude Code may be invoked as 'claude.cmd' or via full path
     const cmd = isWindows ? (claudePath.endsWith('.cmd') ? claudePath : `${claudePath}.cmd`) : claudePath;
 
     const child = spawn(cmd, ['--session', sessionId, '--prompt', prompt], {
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env },
       shell: isWindows, // Use shell on Windows for .cmd batch files
     });
@@ -156,5 +163,23 @@ export class ProcessManager extends EventEmitter {
 
   get(taskId: number): ManagedProcess | undefined {
     return this.processes.get(taskId);
+  }
+
+  getByCompanyId(companyId: number): ManagedProcess | undefined {
+    for (const proc of this.processes.values()) {
+      if (proc.companyId === companyId) return proc;
+    }
+    return undefined;
+  }
+
+  sendStdin(taskId: number, text: string): boolean {
+    const proc = this.processes.get(taskId);
+    if (!proc || !proc.child.stdin || proc.child.stdin.destroyed) return false;
+    try {
+      proc.child.stdin.write(text + '\n');
+      return true;
+    } catch {
+      return false;
+    }
   }
 }

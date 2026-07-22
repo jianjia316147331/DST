@@ -1,5 +1,5 @@
 {
-  "node_id": "test-node-01",
+  "node_id": "本地测试节点",
   "cloud_ws_url": "ws://localhost:3001/ws?client=node",
   "setup_at": "2026-07-16T15:00:00"
 }

@@ -38,10 +38,16 @@ export default function Companies() {
   const [loginConfirmOpen, setLoginConfirmOpen] = useState(false);
   const [loginCompany, setLoginCompany] = useState<Company | null>(null);
   const [loginLoading, setLoginLoading] = useState(false);
+  const [queryConfirmOpen, setQueryConfirmOpen] = useState(false);
+  const [queryCompany, setQueryCompany] = useState<Company | null>(null);
+  const [queryLoading, setQueryLoading] = useState(false);
+  const [pendingLoginCompanies, setPendingLoginCompanies] = useState<Set<string>>(new Set());
   const [loginPath, setLoginPath] = useState<string>(''); // 'keepalive' | 'session'
   const [sessionId, setSessionId] = useState('');
   const [chatMessages, setChatMessages] = useState<{ text: string; isUser?: boolean }[]>([]);
   const [chatInput, setChatInput] = useState('');
+  const [chatTaskId, setChatTaskId] = useState<number | null>(null);
+  const [chatSessionId, setChatSessionId] = useState<string>('');
   const [keepaliveSteps, setKeepaliveSteps] = useState<{ step: string; status: string }[]>([]);
 
   const fetch = (p = page, pf = provinceFilter, sf = statusFilter) => {
@@ -84,6 +90,7 @@ export default function Companies() {
           setQrModalOpen(true);
         } else if (msg.type === 'login_ok') {
           message.success(`${msg.company_name} 登录成功`);
+          setPendingLoginCompanies(prev => { const next = new Set(prev); next.delete(msg.company_name); return next; });
           setQrModalOpen(false);
           setQrImage('');
           setLoginPath('');
@@ -92,6 +99,7 @@ export default function Companies() {
           fetch();
         } else if (msg.type === 'login_failed') {
           message.error(`${msg.company_name} 登录失败: ${msg.reason}`);
+          setPendingLoginCompanies(prev => { const next = new Set(prev); next.delete(msg.company_name); return next; });
         } else if (msg.type === 'keepalive_status') {
           fetch();
         } else if (msg.type === 'keepalive_login_progress') {
@@ -110,22 +118,24 @@ export default function Companies() {
             message.warning(`${msg.company_name} 保活登录失败: ${msg.reason}，请尝试手动登录`);
           }
         } else if (msg.type === 'session_chunk') {
-          const event = msg.event || {};
-          const etype = event.type || '';
-          // Extract readable text from stream-json event
-          let text = '';
-          if (etype === 'assistant') {
-            const blocks = event.message?.content || [];
-            for (const b of blocks) {
-              if (b.type === 'text' && b.text) text += b.text;
-              else if (b.type === 'tool_use') text += `[调用工具: ${b.name}]`;
-            }
-          } else if (etype === 'user') {
-            const blocks = event.message?.content || [];
-            for (const b of blocks) {
-              if (b.type === 'tool_result') {
-                const content = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
-                text = `[结果] ${content.substring(0, 100)}`;
+          // Support both formats: msg.text (node_agent.py plain text) and msg.event (stream-json)
+          let text = (msg.text as string) || '';
+          if (!text) {
+            const event = msg.event || {};
+            const etype = event.type || '';
+            if (etype === 'assistant') {
+              const blocks = event.message?.content || [];
+              for (const b of blocks) {
+                if (b.type === 'text' && b.text) text += b.text;
+                else if (b.type === 'tool_use') text += `[调用工具: ${b.name}]`;
+              }
+            } else if (etype === 'user') {
+              const blocks = event.message?.content || [];
+              for (const b of blocks) {
+                if (b.type === 'tool_result') {
+                  const content = typeof b.content === 'string' ? b.content : JSON.stringify(b.content);
+                  text = `[结果] ${content.substring(0, 100)}`;
+                }
               }
             }
           }
@@ -162,16 +172,21 @@ export default function Companies() {
     return () => socket.close();
   }, []);
 
-  // Step 1: Check if there's already an active login session for this company
+  // Handle login button click: reuse active session or show confirmation
   const handleLogin = (record: Company) => {
-    // If QR/chat modal already open for this company, just show it
+    // Already showing QR/chat modal for this company — just bring to front (modal is open)
     if (qrModalOpen && qrCompanyName === record.name) {
-      return; // already showing
+      return;
     }
-    // If we have an active session for this company (from WS events), open directly
-    if (loginPath && loginCompany?.name === record.name && qrModalOpen) {
-      return; // already in progress
+    // Login already in progress for this company — reopen the modal directly
+    if (pendingLoginCompanies.has(record.name)) {
+      setLoginCompany(record);
+      setQrCompanyName(record.name);
+      setLoginConfirmOpen(false);
+      setQrModalOpen(true);
+      return;
     }
+    // No active login — show confirmation first
     setLoginCompany(record);
     setLoginConfirmOpen(true);
   };
@@ -200,6 +215,7 @@ export default function Companies() {
   const startLogin = async () => {
     if (!loginCompany) return;
     setLoginLoading(true);
+    setPendingLoginCompanies(prev => new Set(prev).add(loginCompany.name));
     try {
       const { data: result } = await api.post('/api/sync/trigger-login', { company_name: loginCompany.name, company_id: loginCompany.id });
       const serverMode = result.path || 'keepalive';
@@ -225,7 +241,12 @@ export default function Companies() {
     setChatMessages(prev => [...prev, { text, isUser: true }]);
     setChatInput('');
     try {
-      await api.post('/api/sync/session-message', { company_id: loginCompany.id, text });
+      await api.post('/api/sync/session-message', {
+        company_id: loginCompany.id,
+        task_id: chatTaskId,
+        session_id: chatSessionId,
+        text,
+      });
     } catch {
       setChatMessages(prev => [...prev, { text: '[发送失败]' }]);
     }
@@ -262,26 +283,74 @@ export default function Companies() {
     fetch();
   };
 
+  // Query button click: check for active task first, then decide
+  const handleQueryClick = async (record: Company) => {
+    // Check if there's already an active task for this company
+    try {
+      const { data } = await api.get('/api/tasks', { params: { company_id: record.id, status: '进行中', pageSize: 1 } });
+      if (data.data && data.data.length > 0) {
+        // Active task exists — open session dialog directly
+        const task = data.data[0];
+        setLoginCompany(record);
+        setLoginPath('session');
+        setQrCompanyName(record.name);
+        setChatTaskId(task.id);
+        setChatSessionId(task.claude_session_id || '');
+        setQrModalOpen(true);
+        // Load session history
+        if (task.claude_session_id) {
+          try {
+            const { data: history } = await api.get(`/api/sync/session-history-by-session/${task.claude_session_id}`);
+            setChatMessages((history.data || []).map((m: any) => ({ text: m.content, isUser: m.role === 'user' })));
+          } catch { /* ignore */ }
+        }
+        message.info(`已连接到任务 #${task.id} 的会话`);
+        return;
+      }
+    } catch { /* fall through to confirmation */ }
+    // No active task — show confirmation dialog
+    setQueryCompany(record);
+    setQueryConfirmOpen(true);
+  };
+
   const handleStartQuery = async (record: Company) => {
     try {
-      await api.post('/api/tasks', { company_id: record.id });
-      message.success('任务已创建');
+      const { data: newTask } = await api.post('/api/tasks', { company_id: record.id });
+      message.success('查询任务已创建并分发');
+      // Open chat dialog for the new task
+      setLoginCompany(record);
+      setLoginPath('session');
+      setQrCompanyName(record.name);
+      setChatTaskId(newTask.id);
+      setChatSessionId(newTask.claude_session_id || '');
+      setChatMessages([]);
+      setQrModalOpen(true);
     } catch (err: unknown) {
-      const res = (err as { response?: { data?: { error?: string; existingTask?: { id: number } } } })?.response?.data;
+      const res = (err as { response?: { data?: { error?: string; message?: string; existingTask?: { id: number; claude_session_id?: string } } } })?.response?.data;
       if (res?.error === 'ACTIVE_TASK_EXISTS') {
-        Modal.confirm({
-          title: '该公司已有查询任务进行中',
-          content: `检测到任务 #${res.existingTask!.id} 正在进行中。是否终止前序任务并启动新任务？`,
-          okText: '终止并启动',
-          cancelText: '取消',
-          okType: 'danger',
-          onOk: async () => {
-            await api.post('/api/tasks/force-start', { company_id: record.id });
-            message.success('新任务已创建');
-          },
-        });
+        // Reuse existing session — open chat dialog with history
+        const existingTask = res.existingTask!;
+        setLoginCompany(record);
+        setLoginPath('session');
+        setQrCompanyName(record.name);
+        setChatTaskId(existingTask.id);
+        const sid = existingTask.claude_session_id || '';
+        setChatSessionId(sid);
+        setQrModalOpen(true);
+        // Load session history
+        if (sid) {
+          try {
+            const { data: history } = await api.get(`/api/sync/session-history-by-session/${sid}`);
+            const msgs = (history.data || []).map((m: any) => ({
+              text: m.content,
+              isUser: m.role === 'user',
+            }));
+            setChatMessages(msgs);
+          } catch { /* ignore */ }
+        }
+        message.info(`已连接到任务 #${existingTask.id} 的会话`);
       } else {
-        message.error(res?.error || '创建失败');
+        message.error(res?.message || res?.error || '创建失败');
       }
     }
   };
@@ -345,7 +414,7 @@ export default function Companies() {
       title: '操作', width: 280,
       render: (_: unknown, record: Company) => (
         <Space>
-          <Button size="small" icon={<PlayCircleOutlined />} onClick={() => handleStartQuery(record)}>查询</Button>
+          <Button size="small" icon={<PlayCircleOutlined />} onClick={() => handleQueryClick(record)}>查询</Button>
           {record.account_status === 'offline' && (
             <Button size="small" icon={<QrcodeOutlined />} onClick={() => handleLogin(record)}>登录</Button>
           )}
@@ -371,6 +440,53 @@ export default function Companies() {
 
       <Table rowKey="id" columns={columns} dataSource={data} loading={loading}
         pagination={{ current: page, total, pageSize: 20, onChange: (p) => { setPage(p); fetch(p); } }} />
+
+      {/* Query confirmation modal */}
+      <Modal
+        title={`${queryCompany?.name || ''} - 开始违章查询`}
+        open={queryConfirmOpen}
+        onCancel={() => { setQueryConfirmOpen(false); setQueryCompany(null); }}
+        footer={null}
+        width={400}
+      >
+        <div style={{ textAlign: 'center', padding: '20px 0' }}>
+          <p style={{ fontSize: 14, color: '#666', marginBottom: 20 }}>
+            将为 <strong>{queryCompany?.name}</strong> 启动违章查询任务
+          </p>
+          <p style={{ fontSize: 12, color: '#999', marginBottom: 8 }}>
+            系统将通过绑定的设备自动执行 12123 查询
+          </p>
+          {queryCompany && bindings[queryCompany.id] && (
+            <p style={{ fontSize: 12, color: '#1677ff', marginBottom: 16 }}>
+              设备：{bindings[queryCompany.id].node_name}
+            </p>
+          )}
+          {queryCompany && !bindings[queryCompany.id] && (
+            <p style={{ fontSize: 12, color: '#ff4d4f', marginBottom: 16 }}>
+              ⚠️ 该公司未绑定设备，请先在控制台中绑定
+            </p>
+          )}
+          <Button
+            type="primary"
+            size="large"
+            icon={<PlayCircleOutlined />}
+            loading={queryLoading}
+            onClick={async () => {
+              if (!queryCompany) return;
+              setQueryLoading(true);
+              setQueryConfirmOpen(false);
+              try {
+                await handleStartQuery(queryCompany);
+              } finally {
+                setQueryLoading(false);
+              }
+            }}
+            block
+          >
+            开始查询
+          </Button>
+        </div>
+      </Modal>
 
       {/* Step 1: Login confirm modal with "开始登录流程" button */}
       <Modal
@@ -402,9 +518,11 @@ export default function Companies() {
 
       {/* Step 2: Login dialog — QR (keepalive) or Chat (session) */}
       <Modal
-        title={loginPath === 'session' ? `${qrCompanyName || loginCompany?.name} - 手动登录` : `${qrCompanyName} - 扫码登录`}
+        title={loginPath === 'session'
+          ? `${qrCompanyName || loginCompany?.name} - 查询对话${chatTaskId ? ` (任务 #${chatTaskId})` : ''}`
+          : `${qrCompanyName} - 扫码登录`}
         open={qrModalOpen}
-        onCancel={() => { setQrModalOpen(false); setQrImage(''); setLoginPath(''); setChatMessages([]); setKeepaliveSteps([]); }}
+        onCancel={() => { setQrModalOpen(false); setQrImage(''); setLoginPath(''); setChatMessages([]); setKeepaliveSteps([]); setChatTaskId(null); setChatSessionId(''); }}
         footer={null}
         width={loginPath === 'session' ? 500 : 400}
       >

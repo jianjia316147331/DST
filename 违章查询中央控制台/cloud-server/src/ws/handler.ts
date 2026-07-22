@@ -110,13 +110,17 @@ async function handleMessage(ws: WebSocket, raw: string) {
 
     case 'stream_output': {
       const taskId = msg.task_id as number;
-      // Forward stream to frontend subscribers
+      // Forward stream to frontend subscribers (both task-specific and general)
+      const payload = JSON.stringify(msg);
       const subs = taskSubscribers.get(taskId);
       if (subs) {
-        const payload = JSON.stringify(msg);
         for (const client of subs) {
           if (client.readyState === WebSocket.OPEN) client.send(payload);
         }
+      }
+      // Also broadcast to general frontend clients (e.g. Companies page)
+      for (const client of frontendClients) {
+        if (client.readyState === WebSocket.OPEN) client.send(payload);
       }
       break;
     }
@@ -292,6 +296,8 @@ async function handleMessage(ws: WebSocket, raw: string) {
     // ── Keepalive status report ──
     case 'keepalive_status': {
       const { companies: keepaliveCompanies } = msg as { companies?: Array<{ name: string; is_logged_in: boolean; keepalive_alive: boolean }> };
+      const reportingNodeName = (msg.node_id as string) || '';
+
       if (Array.isArray(keepaliveCompanies)) {
         // Validate companies
         const names = keepaliveCompanies.map((c: any) => c.name);
@@ -301,8 +307,31 @@ async function handleMessage(ws: WebSocket, raw: string) {
           console.warn(`[Keepalive] 未知企业: ${unknownNames.join(', ')}`);
         }
 
+        // Fetch active bindings to verify which node is authorized for each company
+        const [bindingRows] = await pool.query(
+          `SELECT b.company_id, b.node_id, c.name as company_name
+           FROM company_node_bindings b
+           JOIN companies c ON b.company_id = c.id
+           JOIN nodes n ON b.node_id = n.id
+           WHERE b.is_active = 1`
+        ) as any[];
+        const bindingByCompany: Record<string, string> = {}; // company_name → node_name
+        for (const row of bindingRows) {
+          bindingByCompany[row.company_name] = row.node_name || row.node_id;
+        }
+
         for (const c of keepaliveCompanies) {
           if (!known.has(c.name)) continue; // Skip unknown
+
+          // Only accept keepalive status from the BOUND node
+          const boundNode = bindingByCompany[c.name];
+          if (boundNode && boundNode !== reportingNodeName) {
+            console.warn(
+              `[Keepalive] 忽略非绑定节点状态: ${c.name} bound=${boundNode} reporter=${reportingNodeName}`
+            );
+            continue;
+          }
+
           const newStatus = (c.is_logged_in && c.keepalive_alive) ? 'online' : 'offline';
           await pool.query(
             `UPDATE companies SET account_status = ? WHERE name = ?`,
@@ -310,7 +339,7 @@ async function handleMessage(ws: WebSocket, raw: string) {
           );
         }
       }
-      // Forward to frontend
+      // Forward to frontend (only from bound nodes, or always forward for debugging)
       const broadcastPayload = JSON.stringify(msg);
       for (const client of frontendClients) {
         if (client.readyState === WebSocket.OPEN) client.send(broadcastPayload);
@@ -362,9 +391,56 @@ async function handleMessage(ws: WebSocket, raw: string) {
     }
 
     // ── Session bridge relay (node → frontend) ──
+    case 'session_chunk': {
+      const relayPayload = JSON.stringify(msg);
+      for (const client of frontendClients) {
+        if (client.readyState === WebSocket.OPEN) client.send(relayPayload);
+      }
+      for (const [, subs] of taskSubscribers) {
+        for (const client of subs) {
+          if (client.readyState === WebSocket.OPEN) client.send(relayPayload);
+        }
+      }
+      // Persist to task_session_messages if task_id present
+      if (msg.task_id) {
+        const text = (msg as any).text || '';
+        if (text) {
+          pool.query(
+            `INSERT INTO task_session_messages (task_id, session_id, role, content)
+             VALUES (?, ?, 'assistant', ?)`,
+            [msg.task_id, (msg as any).session_id || '', text]
+          ).catch((e: any) => console.error('[ws] session_chunk persist error:', e.message));
+        }
+      }
+      break;
+    }
+
+    case 'session_marker': {
+      const relayPayload = JSON.stringify(msg);
+      for (const client of frontendClients) {
+        if (client.readyState === WebSocket.OPEN) client.send(relayPayload);
+      }
+      for (const [, subs] of taskSubscribers) {
+        for (const client of subs) {
+          if (client.readyState === WebSocket.OPEN) client.send(relayPayload);
+        }
+      }
+      // Persist significant markers as system messages
+      if (msg.task_id) {
+        const marker = (msg as any).marker || '';
+        const payload = (msg as any).payload || '';
+        if (marker) {
+          pool.query(
+            `INSERT INTO task_session_messages (task_id, session_id, role, content)
+             VALUES (?, ?, 'system', ?)`,
+            [msg.task_id, (msg as any).session_id || '', `[${marker}] ${payload}`]
+          ).catch((e: any) => console.error('[ws] session_marker persist error:', e.message));
+        }
+      }
+      break;
+    }
+
     case 'session_created':
-    case 'session_chunk':
-    case 'session_marker':
     case 'session_done':
     case 'session_error':
     case 'session_list_result': {

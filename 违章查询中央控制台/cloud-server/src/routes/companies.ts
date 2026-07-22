@@ -131,6 +131,13 @@ export default async function companyRoutes(app: FastifyInstance) {
     const [nodeRows] = await pool.query('SELECT id, status FROM nodes WHERE id = ?', [node_id]);
     if (nodeRows.length === 0) return reply.status(404).send({ error: 'Node not found' });
 
+    // When binding switches to a new node, clear account_status immediately.
+    // The old node's stale keepalive_status reports must not keep showing "online".
+    await pool.query(
+      `UPDATE companies SET account_status = 'offline' WHERE id = ?`,
+      [id]
+    );
+
     // Upsert binding: deactivate old, then insert-or-update
     await pool.query(
       `UPDATE company_node_bindings SET is_active = 0, unbound_at = NOW()
