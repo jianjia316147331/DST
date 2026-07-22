@@ -55,19 +55,31 @@ def _parse_datetime(s):
       - Space-separated:         "2026-07-16 09:21:22"
 
     Returns datetime or None on failure.
+
+    Compatible with Python 3.6 (avoids datetime.fromisoformat, added in 3.7).
     """
     if not s or not isinstance(s, str):
         return None
-    try:
-        # fromisoformat handles both with and without microseconds
-        return datetime.fromisoformat(s)
-    except (ValueError, TypeError):
-        pass
-    try:
-        # Fallback: space-separated format (used by keepalive health files)
-        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-    except (ValueError, TypeError):
-        return None
+    s = s.strip()
+    # Normalize T → space
+    if "T" in s:
+        s = s.replace("T", " ")
+    # Strip trailing timezone info if present (e.g. +00:00, Z)
+    if "+" in s and s.rfind("+") > s.rfind(":"):
+        s = s[:s.rfind("+")].strip()
+    if s.endswith("Z"):
+        s = s[:-1].strip()
+    # Try formats from most to least precise
+    formats = [
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(s, fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 def _file_age_hours(path):

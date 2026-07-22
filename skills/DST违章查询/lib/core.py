@@ -1080,6 +1080,124 @@ def _touch_tab_activity(tab_id):
         pass
 
 
+def _parse_datetime(s):
+    """Parse a datetime string robustly, handling multiple formats.
+
+    Formats supported:
+      - ISO with microseconds:  "2026-07-16T09:21:22.824543"
+      - ISO without microseconds: "2026-07-16T09:21:22"
+      - Space-separated:         "2026-07-16 09:21:22"
+
+    Returns datetime or None on failure.
+
+    Compatible with Python 3.6 (avoids datetime.fromisoformat, added in 3.7).
+    """
+    if not s or not isinstance(s, str):
+        return None
+    s = s.strip()
+    # Normalize T → space
+    if "T" in s:
+        s = s.replace("T", " ")
+    # Strip trailing timezone info if present (e.g. +00:00, Z)
+    if "+" in s and s.rfind("+") > s.rfind(":"):
+        s = s[:s.rfind("+")].strip()
+    if s.endswith("Z"):
+        s = s[:-1].strip()
+    # Try formats from most to least precise
+    formats = [
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(s, fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _safe_name(company):
+    """Sanitize company name for use in filenames."""
+    return re.sub(r"[^a-zA-Z0-9一-鿿_-]", "_", company)
+
+
+def build_tab_whitelist(instance_port, data_dir, query_idle_minutes):
+    """Build a set of tab_ids that should be PRESERVED on the given instance.
+
+    Whitelisted tabs:
+      1. Keepalive tabs bound to this instance (from keepalive_tab_*.txt)
+      2. Active query tabs on this instance (last_activity or created_at
+         within query_idle_minutes)
+
+    Args:
+        instance_port: PinchTab instance port (int or str)
+        data_dir: path to violation_query/data/
+        query_idle_minutes: query tabs with activity within this window are kept
+
+    Returns:
+        set of tab_id strings that should NOT be closed
+    """
+    keep = set()
+    now = datetime.now()
+    port_str = str(instance_port)
+
+    # ── 1. Keepalive tabs on this instance ──
+    registry_path = os.path.join(data_dir, "tab_registry.json")
+    registry = {}
+    if os.path.exists(registry_path):
+        try:
+            with open(registry_path, "r", encoding="utf-8") as f:
+                registry = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Iterate keepalive entries in registry matching this instance_port
+    for key, info in registry.items():
+        if not key.startswith("keepalive_"):
+            continue
+        if str(info.get("instance_port", "")) != port_str:
+            continue
+        # Extract company name from registry key and find its tab file
+        company = key[len("keepalive_"):]
+        safe = _safe_name(company)
+        tab_file = os.path.join(data_dir, f"keepalive_tab_{safe}.txt")
+        if os.path.exists(tab_file):
+            try:
+                with open(tab_file, "r", encoding="utf-8") as f:
+                    tab_id = f.read().strip()
+                if tab_id:
+                    keep.add(tab_id)
+            except OSError:
+                pass
+
+    # ── 2. Active query tabs on this instance ──
+    for key, info in registry.items():
+        if key.startswith("keepalive_"):
+            continue
+        if str(info.get("instance_port", "")) != port_str:
+            continue
+        tab_id = info.get("tab_id")
+        if not tab_id:
+            continue
+
+        # Check last_activity first, fall back to created_at
+        last_activity = info.get("last_activity")
+        created_at = info.get("created_at")
+
+        active = False
+        for ts in (last_activity, created_at):
+            if ts:
+                dt = _parse_datetime(ts)
+                if dt and (now - dt).total_seconds() < query_idle_minutes * 60:
+                    active = True
+                    break
+
+        if active:
+            keep.add(tab_id)
+
+    return keep
+
+
 def cmd_cleanup():
     """Run the cleanup daemon (oneshot mode). Delegates to cleanup_daemon.py."""
     cleanup_script = os.path.join(

@@ -51,6 +51,7 @@ from lib.core import (
     UNIT_LOGIN_URL,
     RATE_LIMIT_KEYWORDS,
     _parse_tab_ids,
+    build_tab_whitelist,
 )
 
 # ── constants ──────────────────────────────────────────────────
@@ -62,6 +63,7 @@ POPUP_DISMISS_WAIT = 3               # wait after dismiss
 MAX_CONSECUTIVE_FAILURES = 3         # consecutive reload failures → exit
 MAX_CONSECUTIVE_UNKNOWN = 3         # consecutive unknown states → exit (CDP broken?)
 MAX_CONSECUTIVE_HEARTBEAT_FAILS = 5  # consecutive heartbeat fails → treat as potential stall
+BROWSER_ERROR_RETRIES = 2            # max reload retries when renderer crashes (chrome-error://)
 
 # ── exit codes (for systemd RestartPreventExitStatus) ─────────
 # systemd Restart=always will NOT restart on these exit codes
@@ -188,9 +190,29 @@ def _get_health_file(project_root, company):
     return os.path.join(data_dir, f"keepalive_health_{safe}.json")
 
 
-def _touch_health(health_file, state, tab_id, cycle_count, instance_port, log):
-    """Write health status for external consumers (query processes)."""
+def _touch_health(health_file, state, tab_id, cycle_count, instance_port, log,
+                  cycle_start_ts=None):
+    """Write health status for external consumers (query processes).
+
+    cycle_start_ts: optional epoch float marking the start of the current
+    keepalive cycle.  Only passed at cycle boundaries (start/end), NOT during
+    heartbeat/watchdog touches — so external tools can calculate the next
+    reload time without being confused by heartbeat-driven last_check updates.
+    """
     try:
+        # Preserve cycle_start from existing health file when the caller
+        # doesn't provide one (heartbeats, watchdog touches).  This keeps
+        # the field stable across the 55-min cycle so the daily restart
+        # script can accurately calculate the next reload time.
+        if cycle_start_ts is None:
+            try:
+                if os.path.exists(health_file):
+                    with open(health_file, "r", encoding="utf-8") as f:
+                        old = json.load(f)
+                        cycle_start_ts = old.get("cycle_start_ts")
+            except Exception:
+                pass
+
         data = {
             "state": state,               # "logged_in" | "login_expired" | "rate_limited"
             "tab_id": tab_id,             # current keepalive tab (hex)
@@ -198,6 +220,10 @@ def _touch_health(health_file, state, tab_id, cycle_count, instance_port, log):
             "instance_port": instance_port,
             "last_check": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
+        if cycle_start_ts is not None:
+            data["cycle_start"] = datetime.fromtimestamp(cycle_start_ts).strftime(
+                "%Y-%m-%d %H:%M:%S")
+            data["cycle_start_ts"] = cycle_start_ts
         with open(health_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
     except Exception as e:
@@ -413,16 +439,20 @@ def _load_tab_id(tab_file):
         return None
 
 
-def _cleanup_stale_tabs(instance_port, keep_tab_id, log):
-    """Close stale login-page tabs, keep the platform-page tab.
+def _cleanup_non_whitelisted_tabs(instance_port, data_dir, query_idle_minutes, log):
+    """Close all tabs on this instance that are NOT in the whitelist.
 
-    Stale tabs (gab.122.gov.cn/m/login, deptLoginNext) accumulate from
-    repeated restarts.  Closing them is safe — cookies are per-profile,
-    not per-tab.  The platform-page tab (fj/sc/gd.122.gov.cn/*) MUST be
-    kept — closing the last tab breaks the 12123 session.
+    Whitelist is built from:
+      1. Keepalive tab bound to this instance (from keepalive_tab_*.txt)
+      2. Active query tabs (last_activity or created_at within query_idle_minutes)
+
+    All other tabs — stale vehlist pages, about:blank, /m/login leftovers —
+    are closed.  The whitelist guarantees at least the keepalive tab survives
+    so the 12123 session is never broken by closing the last tab.
     """
     if not instance_port:
         return
+    # List all tabs on this instance
     try:
         result = _run_pinchtab(["tab", "--json"], instance_port=instance_port, timeout=10)
         tabs = json.loads(result.stdout)
@@ -432,25 +462,32 @@ def _cleanup_stale_tabs(instance_port, keep_tab_id, log):
         log.debug(f"Cleanup: cannot list tabs: {e}")
         return
 
-    stale_patterns = [
-        "gab.122.gov.cn/m/login",
-        "gab.122.gov.cn/m/deptLoginNext",
-    ]
+    if not tabs:
+        return
+
+    # Build whitelist for this instance
+    keep_ids = build_tab_whitelist(instance_port, data_dir, query_idle_minutes)
+    log.debug(f"Cleanup: whitelist={keep_ids}, instance_tabs={[t.get('id','')[:16] for t in tabs]}")
+
     closed = 0
     for tab in tabs:
-        url = tab.get("url", "")
         tid = tab.get("id", "")
-        if tid == keep_tab_id:
-            continue  # never close the keepalive tab
-        if any(p in url for p in stale_patterns):
-            try:
-                _run_pinchtab(["close", tid], instance_port=instance_port, timeout=10)
-                log.info(f"Cleanup: closed stale tab {tid[:16]}... ({url[:50]})")
-                closed += 1
-            except Exception as e:
-                log.debug(f"Cleanup: close tab {tid[:16]}... failed: {e}")
+        url = tab.get("url", "")[:60]
+        if not tid:
+            continue
+        if tid in keep_ids:
+            continue  # whitelisted — keepalive tab or active query tab
+        try:
+            _run_pinchtab(["close", tid], instance_port=instance_port, timeout=10)
+            log.info(f"Cleanup: closed non-whitelisted tab {tid[:16]}... ({url})")
+            closed += 1
+        except Exception as e:
+            log.debug(f"Cleanup: close tab {tid[:16]}... failed: {e}")
+
     if closed:
-        log.info(f"Cleanup: closed {closed} stale login tab(s) on instance {instance_port}")
+        log.info(f"Cleanup: closed {closed} non-whitelisted tab(s) on instance {instance_port}")
+    else:
+        log.debug(f"Cleanup: no non-whitelisted tabs to close on instance {instance_port}")
 
 
 def _cleanup_tab_registry(project_root, company, log):
@@ -474,6 +511,152 @@ def _cleanup_tab_registry(project_root, company, log):
             log.info(f"Cleanup: removed '{key}' from tab_registry.json")
         except Exception as e:
             log.debug(f"Cleanup: write tab_registry.json failed: {e}")
+
+
+def _register_keepalive_in_registry(project_root, company, tab_id, instance_port, log):
+    """Ensure the keepalive entry exists in tab_registry.json.
+
+    Called on startup when reusing an existing tab — the registry entry
+    may have been cleaned by a previous exit's _cleanup_tab_registry.
+    build_tab_whitelist depends on this entry to map company→instance_port.
+    """
+    registry_path = os.path.join(project_root, "violation_query", "data", "tab_registry.json")
+    try:
+        registry = {}
+        if os.path.exists(registry_path):
+            with open(registry_path, "r", encoding="utf-8") as f:
+                registry = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        registry = {}
+
+    key = f"keepalive_{company}"
+    existing = registry.get(key, {})
+    # Only update if the tab_id or instance_port changed (or entry is missing)
+    if (key not in registry or
+            existing.get("tab_id") != tab_id or
+            str(existing.get("instance_port", "")) != str(instance_port)):
+        registry[key] = {
+            "tab_id": tab_id,
+            "pid": os.getpid(),
+            "created_at": datetime.now().isoformat(),
+            "instance_port": str(instance_port),
+        }
+        try:
+            os.makedirs(os.path.dirname(registry_path), exist_ok=True)
+            with open(registry_path, "w", encoding="utf-8") as f:
+                json.dump(registry, f, indent=2, ensure_ascii=False)
+            log.debug(f"Registered keepalive tab in registry: {key} → {tab_id}")
+        except OSError as e:
+            log.debug(f"Failed to write registry: {e}")
+
+
+def _find_chromium_pid(instance_port):
+    """Find Chromium browser PID by remote-debugging-port.
+
+    PinchTab convention: Chromium debug_port = instance_port + 1.
+    Returns the lowest matching PID (main browser process), or None.
+    """
+    debug_port = int(instance_port) + 1
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", f"remote-debugging-port={debug_port}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, timeout=5
+        )
+        pids = [int(p) for p in result.stdout.strip().split() if p.strip()]
+        if pids:
+            return min(pids)  # main process has the lowest PID
+    except Exception:
+        pass
+    return None
+
+
+def _kill_chromium(instance_port, log):
+    """Kill the Chromium browser for this instance and verify it's dead.
+
+    Uses SIGKILL on the browser process found by debug port, then
+    pkill -9 as a fallback for any orphaned child processes.
+    """
+    pid = _find_chromium_pid(instance_port)
+    if pid:
+        log.info(f"Killing Chromium PID={pid} (instance_port={instance_port})")
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            log.debug(f"Chromium PID {pid} already gone")
+        time.sleep(2)
+
+    # Fallback: clean any remaining processes on this debug port
+    debug_port = int(instance_port) + 1
+    try:
+        subprocess.run(
+            ["pkill", "-9", "-f", f"remote-debugging-port={debug_port}"],
+            timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass
+
+    # Verify
+    remaining = _find_chromium_pid(instance_port)
+    if remaining:
+        log.warning(f"Chromium PID {remaining} still alive after kill attempts")
+    else:
+        log.info(f"Chromium on instance_port={instance_port} confirmed dead")
+
+
+def _has_active_query_tabs(instance_port, data_dir, idle_minutes, log):
+    """Check if there are active query tabs on this instance.
+
+    "Active" means non-keepalive tabs with recent activity or recent creation.
+    This prevents killing a browser that has an ongoing query task.
+
+    Returns True if any non-keepalive, non-about:blank tab is active.
+    """
+    # List all tabs on the instance
+    try:
+        result = _run_pinchtab(["tab", "--json"], instance_port=instance_port, timeout=10)
+        tabs = json.loads(result.stdout)
+        if isinstance(tabs, dict):
+            tabs = tabs.get("tabs", [])
+    except Exception:
+        return False  # can't verify, assume no active query tabs
+
+    # Collect keepalive tab IDs to exclude from query-tab check
+    keepalive_ids = set()
+    try:
+        for name in os.listdir(data_dir):
+            if name.startswith("keepalive_tab_") and name.endswith(".txt"):
+                txt_path = os.path.join(data_dir, name)
+                try:
+                    with open(txt_path, "r", encoding="utf-8") as f:
+                        kid = f.read().strip()
+                    if kid:
+                        keepalive_ids.add(kid)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+    # Build whitelist — with the wider 2h window used for browser-kill decisions
+    keep_ids = build_tab_whitelist(instance_port, data_dir, idle_minutes)
+
+    # Check if any non-keepalive, non-about:blank tab is active
+    for tab in tabs:
+        tid = tab.get("id", "")
+        url = tab.get("url", "")
+        if not tid:
+            continue
+        if tid in keepalive_ids:
+            continue  # keepalive tab, not a query tab
+        if url == "about:blank":
+            continue  # blank tab, not a meaningful query tab
+        if tid in keep_ids:
+            # This is a non-keepalive, non-blank tab with recent activity
+            # in the whitelist — it's an active query tab.
+            log.info(f"Active query tab found: {tid[:16]}... url={url[:60]}")
+            return True
+
+    return False
 
 
 def _create_keepalive_tab(instance_port, platform_url, project_root, company, log):
@@ -680,22 +863,51 @@ def _check_page_state(instance_port, platform_url, log):
         log.debug(f"Snap rate-limit check skipped (non-fatal): {e}")
 
     # ── URL check: must be on the platform, not anywhere else ──
-    try:
-        url_result = _run_pinchtab(
-            ["eval", "window.location.href"],
-            instance_port=instance_port, timeout=5
-        )
-        url = (url_result.stdout or "").strip()
-        if url.startswith(platform_url) and "vehlist" in url and "/m/login" not in url:
-            log.info(f"Session OK (URL={url[:80]})")
-            return ("logged_in", url[:80])
-        log.warning(f"Session expired: not on 我的主页 (URL={url[:80]})")
-        return ("login_expired", f"not on 我的主页: {url[:80]}")
-    except Exception as e:
-        # URL eval failed — instance may be slow/busy, don't mark as
-        # login_expired (that would trigger false auto-recovery).
-        log.warning(f"URL check failed (transient, retry next cycle): {e}")
-        return ("unknown", f"URL check failed: {e}")
+    # Retry up to 3 times to tolerate transient CDP communication failures.
+    # A single eval timeout should NOT count as "unknown" — only persistent
+    # failures across multiple retries within the same check indicate a real
+    # problem.  This prevents the "Session OK + Transient failure" paradox
+    # where a brief PinchTab↔Chrome hiccup was counted as consecutive_unknown
+    # and eventually caused the daemon to exit with "CDP likely broken".
+    URL_CHECK_MAX_RETRIES = 3
+    URL_CHECK_RETRY_DELAY = 2  # seconds between retries
+
+    last_error = ""
+    for attempt in range(1, URL_CHECK_MAX_RETRIES + 1):
+        try:
+            url_result = _run_pinchtab(
+                ["eval", "window.location.href"],
+                instance_port=instance_port, timeout=5
+            )
+            url = (url_result.stdout or "").strip()
+            if url.startswith(platform_url) and "vehlist" in url and "/m/login" not in url:
+                log.info(f"Session OK (URL={url[:80]})")
+                return ("logged_in", url[:80])
+            # chrome-error://chromewebdata/ means the renderer process crashed
+            # during page load — this is a browser fault, NOT a session expiry.
+            # Distinguish it from /m/login (real session expiry) so we retry
+            # instead of triggering QR recovery immediately.
+            if url.startswith("chrome-error://"):
+                log.warning(f"Browser renderer crash (URL={url[:80]}) — NOT session expiry")
+                return ("browser_error", url[:80])
+            log.warning(f"Session expired: not on 我的主页 (URL={url[:80]})")
+            return ("login_expired", f"not on 我的主页: {url[:80]}")
+        except Exception as e:
+            last_error = str(e)
+            if attempt < URL_CHECK_MAX_RETRIES:
+                log.warning(
+                    f"URL check transient failure "
+                    f"(attempt {attempt}/{URL_CHECK_MAX_RETRIES}, "
+                    f"retry in {URL_CHECK_RETRY_DELAY}s): {e}"
+                )
+                time.sleep(URL_CHECK_RETRY_DELAY)
+            else:
+                log.warning(
+                    f"URL check failed after {URL_CHECK_MAX_RETRIES} attempts: {e}"
+                )
+
+    return ("unknown",
+            f"URL check failed after {URL_CHECK_MAX_RETRIES} retries: {last_error}")
 
 
 # ── heartbeat ──────────────────────────────────────────────────
@@ -1248,6 +1460,36 @@ def _auto_recover_login(company, instance_port, platform_url, project_root, log,
             _ensure_unit_login_tab(instance_port, log)
             time.sleep(PAGE_LOAD_WAIT)
 
+            # Step 2.5: Verify tab still exists before screenshot.
+            # The tab can disappear between navigation and screenshot due to
+            # PinchTab restart, Chrome crash, or GC cleanup.  If the tab is
+            # gone, recreate it so the screenshot doesn't fail with 404.
+            if not _verify_tab(tab_id, instance_port, log):
+                log.warning("Tab lost before QR screenshot — recreating tab...")
+                new_tab_id = _create_keepalive_tab(
+                    instance_port, UNIT_LOGIN_URL,
+                    project_root, company, log
+                )
+                if new_tab_id:
+                    # Update state for all subsequent operations in this cycle
+                    tab_id = new_tab_id
+                    tab_file = os.path.join(_get_data_dir(project_root),
+                                            f"keepalive_tab_{_safe_name(company)}.txt")
+                    _save_tab_id(tab_file, new_tab_id)
+                    # Re-navigate + ensure unit tab after recreation
+                    _run_pinchtab(
+                        ["nav", UNIT_LOGIN_URL],
+                        instance_port=instance_port, timeout=30
+                    )
+                    time.sleep(PAGE_LOAD_WAIT)
+                    _ensure_unit_login_tab(instance_port, log)
+                    time.sleep(PAGE_LOAD_WAIT)
+                    log.info(f"Tab recreated as {new_tab_id}, proceeding with screenshot")
+                else:
+                    log.error("Failed to recreate tab — skipping this QR attempt")
+                    time.sleep(10)
+                    continue
+
             # Step 3: Take QR screenshot
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             data_dir = _get_data_dir(project_root)
@@ -1561,6 +1803,10 @@ def _run_daemon(company, project_root, auto_recover=False,
         log.info(f"Found persisted tab {tab_id}, verifying...")
         if _verify_tab(tab_id, instance_port, log):
             log.info(f"Reusing existing keepalive tab {tab_id}")
+            # Re-register in tab_registry.json in case it was cleaned by a
+            # previous exit — build_tab_whitelist needs this entry to map
+            # the company to its instance_port and find the txt file.
+            _register_keepalive_in_registry(project_root, company, tab_id, instance_port, log)
         else:
             log.warning(f"Persisted tab {tab_id} is stale, creating new tab")
             tab_id = None
@@ -1589,6 +1835,10 @@ def _run_daemon(company, project_root, auto_recover=False,
     # targeting the keepalive tab without switching the global active tab.
     os.environ["VIOLATION_TAB_ID"] = tab_id
 
+    # ── startup cleanup: remove stale tabs accumulated from previous runs ──
+    data_dir = os.path.join(project_root, "violation_query", "data")
+    _cleanup_non_whitelisted_tabs(instance_port, data_dir, 10, log)
+
     consecutive_failures = 0
     consecutive_unknown = 0
     cycle_count = 0
@@ -1602,7 +1852,8 @@ def _run_daemon(company, project_root, auto_recover=False,
         # nav + dismiss + check (20-30s of pinchtab calls)
         # can't push us past WatchdogSec if the last heartbeat was >90s ago.
         _sd_notify("WATCHDOG=1", log)
-        _touch_health(health_file, "logged_in", tab_id, cycle_count, instance_port, log)
+        _touch_health(health_file, "logged_in", tab_id, cycle_count, instance_port, log,
+                      cycle_start_ts=cycle_start)
         log.info(f"=== Keepalive cycle #{cycle_count} (tab={tab_id}) ===")
 
         # ── pre-flight: check is_logged_in ──
@@ -1683,6 +1934,45 @@ def _run_daemon(company, project_root, auto_recover=False,
 
         # ── step 3: verify session (URL must be on vehlist page) ──
         state, detail = _check_page_state(instance_port, platform_url, log)
+
+        # ── browser error retry: renderer crash ≠ session expiry ──
+        # When Chromium's renderer process crashes during page load, the
+        # page shows chrome-error://chromewebdata/.  This is transient —
+        # Chromium automatically spawns a fresh renderer.  Reload the page
+        # so the new renderer can pick it up, then re-check.
+        #
+        # If the session is TRULY expired, the reload will load /m/login
+        # and _check_page_state will return "login_expired", which falls
+        # through to the QR recovery branch below.
+        browser_error_retries = 0
+        while state == "browser_error" and browser_error_retries < BROWSER_ERROR_RETRIES:
+            browser_error_retries += 1
+            log.info(
+                f"Renderer crash — reloading page "
+                f"(attempt {browser_error_retries}/{BROWSER_ERROR_RETRIES})"
+            )
+            try:
+                _run_pinchtab(
+                    ["nav", vehlist_url],
+                    instance_port=instance_port, timeout=30
+                )
+                time.sleep(PAGE_LOAD_WAIT)
+                _dismiss_popup(instance_port, log)
+                state, detail = _check_page_state(instance_port, platform_url, log)
+            except Exception as e:
+                log.error(f"Reload after browser error failed: {e}")
+                break
+
+        if state == "browser_error":
+            # Retries exhausted — escalate to "unknown" so the existing
+            # consecutive_unknown counter handles it.  Persistent browser
+            # errors may indicate a deeper CDP/Chromium issue.
+            log.error(
+                f"Browser error persists after {BROWSER_ERROR_RETRIES} reload "
+                f"attempts — escalating to unknown"
+            )
+            state = "unknown"
+            detail = f"browser_error persisted after {BROWSER_ERROR_RETRIES} retries: {detail}"
 
         if state == "rate_limited":
             log.critical(f"Rate-limited! {detail}")
@@ -1823,16 +2113,38 @@ def _run_daemon(company, project_root, auto_recover=False,
     # ── cleanup ──
     log.info(f"Keepalive daemon exiting (code={exit_code}).")
 
-    # Close stale login-page tabs on this instance to prevent tab accumulation.
-    # Keep the platform-page tab (fj/sc/gd.122.gov.cn/*) — closing it would
-    # lose the session (verified: 12123 session breaks when all tabs closed).
-    _cleanup_stale_tabs(instance_port, tab_id, log)
+    # Close all non-whitelisted tabs on this instance.
+    # Whitelist: keepalive tab + active query tabs (10min window).
+    data_dir = os.path.join(project_root, "violation_query", "data")
+    _cleanup_non_whitelisted_tabs(instance_port, data_dir, 10, log)
 
-    # Clean up tab_registry.json entry so stale entries don't accumulate
-    _cleanup_tab_registry(project_root, company, log)
+    # Only remove registry entry on permanent exit (42/43) — on normal exit
+    # (SIGTERM→systemd restart) we keep it so build_tab_whitelist can find
+    # the keepalive tab on the next startup.
+    if exit_code in (EXIT_LOGGED_OUT, EXIT_RATE_LIMITED):
+        _cleanup_tab_registry(project_root, company, log)
 
     _touch_health(health_file, "exited", tab_id, cycle_count, instance_port, log)
     _remove_pid(pid_file)
+
+    # ── browser lifecycle: kill Chromium on permanent exit if no active queries ──
+    # Permanent exit codes (42=LOGGED_OUT, 43=RATE_LIMITED) mean the daemon
+    # won't be restarted by systemd (RestartPreventExitStatus).  The browser
+    # would become a zombie if left running.  But we must NOT kill it if there
+    # are active query tabs from other sessions — those queries are still
+    # in progress and depend on the browser staying alive.
+    #
+    # We use a 2-hour window here (matching cleanup_daemon's IDLE_HOURS)
+    # because a query task that hasn't touched its tab in 10 minutes is
+    # likely still alive — the 10-minute keepalive-daemon window is for
+    # tab GC, not for browser-kill decisions.
+    if exit_code in (EXIT_LOGGED_OUT, EXIT_RATE_LIMITED):
+        if not _has_active_query_tabs(instance_port, data_dir, 120, log):
+            log.info("No active query tabs — killing Chromium browser.")
+            _kill_chromium(instance_port, log)
+        else:
+            log.info("Active query tabs detected — keeping Chromium alive.")
+
     # Note: we do NOT remove the tab_file — the tab persists in Chrome
     # and can be reused if the daemon is restarted.
     sys.exit(exit_code)
