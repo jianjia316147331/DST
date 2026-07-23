@@ -1,9 +1,0 @@
-[Unit]
-Description=Keepalive Pull-Watchdog Timer (成都新创绿能)
-
-[Timer]
-OnUnitActiveSec=60s
-Unit=keepalive-watchdog-profile_003.service
-
-[Install]
-WantedBy=timers.target
