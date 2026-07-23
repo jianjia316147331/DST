@@ -22,6 +22,7 @@ import base64
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -31,8 +32,8 @@ from datetime import datetime
 
 DEFAULT_CLAUDE_PATH = "claude"
 DEFAULT_MAX_SESSIONS = 3
-DEFAULT_IDLE_TIMEOUT = 600       # 10 分钟
-DEFAULT_MAX_TURN_TIME = 1800     # 30 分钟
+DEFAULT_IDLE_TIMEOUT = 0          # 禁用 — 仅明确异常才关闭
+DEFAULT_MAX_TURN_TIME = 0         # 禁用 — 查询任务可能很长
 CLEANUP_INTERVAL = 30            # 清理检查间隔
 
 # ── Output filter patterns ────────────────────────────────────
@@ -93,6 +94,7 @@ class SessionBridge:
 
         self._sessions: dict[str, SessionHandle] = {}
         self._running = True
+        self._tool_map: dict[str, dict] = {}  # tool_use_id → {name, command}
 
         # Start cleanup loop
         self._cleanup_task = None
@@ -164,6 +166,7 @@ class SessionBridge:
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
                 bufsize=1,
+                start_new_session=True,
             )
         except FileNotFoundError:
             self._emit("session_error", session_id=session_id,
@@ -243,19 +246,36 @@ class SessionBridge:
             await self._cleanup_one(session_id, reason="broken_pipe")
 
     async def cancel(self, session_id: str):
-        """终止会话（kill 进程）。"""
+        """终止会话（kill 整个进程组，确保子进程一起死）。
+
+        使用 os.killpg() 杀 Claude 所在的进程组（start_new_session=True）。
+        保活 daemon 和 node_agent 在不同的进程组，不受影响。
+        """
         handle = self._sessions.get(session_id)
         if handle is None:
             return
 
         try:
-            handle.proc.terminate()
-            # Schedule kill after 10s
             pid = handle.proc.pid
+            # SIGTERM the entire process group
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except OSError:
+                # Process group may already be gone, fall back to single process
+                try:
+                    handle.proc.terminate()
+                except Exception:
+                    pass
+            # Schedule SIGKILL after 10s as safety net
             def _force_kill():
                 try:
                     if handle.proc.poll() is None:
+                        os.killpg(pid, signal.SIGKILL)
+                except OSError:
+                    try:
                         handle.proc.kill()
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             threading.Timer(10, _force_kill).start()
@@ -278,11 +298,15 @@ class SessionBridge:
         self._emit("session_list_result", sessions=sessions)
 
     def shutdown(self):
-        """关闭桥接器，终止所有会话。"""
+        """关闭桥接器，终止所有会话（含子进程）。"""
         self._running = False
         for sid in list(self._sessions.keys()):
             try:
-                self._sessions[sid].proc.terminate()
+                pid = self._sessions[sid].proc.pid
+                try:
+                    os.killpg(pid, signal.SIGTERM)
+                except OSError:
+                    self._sessions[sid].proc.terminate()
             except Exception:
                 pass
         self._sessions.clear()
@@ -382,22 +406,39 @@ class SessionBridge:
                                 # Emit text chunk
                                 self._emit("session_chunk", session_id=session_id, text=text)
                             elif b.get("type") == "tool_use":
-                                if filter_mode == "full":
-                                    self._emit("session_chunk", session_id=session_id,
-                                              text=f"[调用工具: {b.get('name', '')}]")
+                                tool_id = b.get("id", "")
+                                tool_name = b.get("name", "")
+                                tool_input = b.get("input", {})
+                                tool_command = tool_input.get("command", tool_input.get("description", ""))
+                                # Track for tool_result correlation
+                                if tool_id:
+                                    self._tool_map[tool_id] = {"name": tool_name, "command": tool_command}
+                                # Forward tool call metadata (console decides what to show)
+                                self._emit("session_chunk", session_id=session_id, source="tool",
+                                          tool_name=tool_name, tool_command=tool_command,
+                                          text=f"[调用: {tool_name}]")
 
                     elif etype == "user":
-                        # User message blocks (tool results)
-                        if filter_mode == "full":
-                            blocks = event.get("message", {}).get("content", [])
-                            for b in blocks:
-                                if b.get("type") == "tool_result":
-                                    content = b.get("content", "")
-                                    if isinstance(content, str):
-                                        text = f"[结果] {content[:200]}"
-                                    else:
-                                        text = f"[结果] {json.dumps(content)[:200]}"
-                                    self._emit("session_chunk", session_id=session_id, text=text)
+                        blocks = event.get("message", {}).get("content", [])
+                        for b in blocks:
+                            if b.get("type") == "tool_result":
+                                tool_use_id = b.get("tool_use_id", "")
+                                tool_info = self._tool_map.get(tool_use_id, {})
+                                content = b.get("content", "")
+                                if isinstance(content, str):
+                                    text = content
+                                elif isinstance(content, list):
+                                    text = "\n".join(
+                                        c.get("text", "") if isinstance(c, dict) else str(c)
+                                        for c in content
+                                    )
+                                else:
+                                    text = str(content)
+                                # Forward full result with tool metadata, no truncation
+                                self._emit("session_chunk", session_id=session_id, source="result",
+                                          tool_name=tool_info.get("name", ""),
+                                          tool_command=tool_info.get("command", ""),
+                                          text=text)
 
                     # Skip other event types (system, ping, etc.)
                     continue
@@ -493,13 +534,17 @@ class SessionBridge:
         self._sessions.pop(session_id, None)
 
     async def _cleanup_one(self, session_id: str, reason: str):
-        """Clean up a single session."""
+        """Clean up a single session (超时/idle 触发，含子进程)。"""
         handle = self._sessions.pop(session_id, None)
         if handle is None:
             return
         try:
             if handle.proc.poll() is None:
-                handle.proc.terminate()
+                pid = handle.proc.pid
+                try:
+                    os.killpg(pid, signal.SIGTERM)
+                except OSError:
+                    handle.proc.terminate()
         except Exception:
             pass
         self._emit("session_done", session_id=session_id, reason=reason)
